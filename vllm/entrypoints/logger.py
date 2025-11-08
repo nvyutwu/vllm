@@ -65,20 +65,17 @@ class RequestLogger:
             if outputs is not None:
                 outputs = outputs[:max_log_len]
 
-            if output_token_ids is not None:
-                # Convert to list and apply truncation
-                output_token_ids = list(output_token_ids)[:max_log_len]
+            # We no longer log output_token_ids to reduce log volume
+            # but we keep the parameter for backward compatibility with callers.
 
         stream_info = ""
         if is_streaming:
             stream_info = " (streaming delta)" if delta else " (streaming complete)"
 
         logger.info(
-            "Generated response %s%s: output: %r, "
-            "output_token_ids: %s, finish_reason: %s",
+            "Generated response %s%s: output: %r, finish_reason: %s",
             request_id,
             stream_info,
             outputs,
-            output_token_ids,
             finish_reason,
         )

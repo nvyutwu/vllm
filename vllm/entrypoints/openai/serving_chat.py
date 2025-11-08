@@ -7,6 +7,8 @@ import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import Final
+import os
+import logging
 
 import jinja2
 import partial_json_parser
@@ -71,6 +73,7 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -185,6 +188,38 @@ class OpenAIServingChat(OpenAIServing):
             )
 
             model_name = self.models.model_name(lora_request)
+
+            # Log request payload BEFORE any chat template is applied
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                # Collect all incoming headers unfiltered
+                headers_json = ""
+                try:
+                    if raw_request is not None:
+                        headers_to_log = {k: v for k, v in raw_request.headers.items()}
+                        headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+                except Exception:
+                    headers_json = ""
+                try:
+                    req_dump = request.model_dump()
+                except Exception:
+                    req_dump = None
+                try:
+                    req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
+                except Exception:
+                    req_str = ""
+                rid_hint = self._base_request_id(raw_request, getattr(request, "request_id", None))
+                try:
+                    payload_logger.info(
+                        "openai.request",
+                        extra={
+                            "rid": rid_hint or "",
+                            "endpoint": self.__class__.__name__,
+                            "payload": req_str,
+                            "headers": headers_json,
+                        },
+                    )
+                except Exception:
+                    pass
 
             tokenizer = await self.engine_client.get_tokenizer()
 
@@ -529,6 +564,7 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -1072,24 +1108,9 @@ class OpenAIServingChat(OpenAIServing):
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
                         delta_content = ""
-                        if delta_message.content:
-                            delta_content = delta_message.content
-                        elif delta_message.tool_calls:
-                            delta_content = "".join(
-                                tc.function.arguments
-                                for tc in delta_message.tool_calls
-                                if tc.function and tc.function.arguments
-                            )
-
-                        if delta_content:
-                            self.request_logger.log_outputs(
-                                request_id=request_id,
-                                outputs=delta_content,
-                                output_token_ids=as_list(output.token_ids),
-                                finish_reason=output.finish_reason,
-                                is_streaming=True,
-                                delta=True,
-                            )
+                        # Skip logging individual streaming deltas to reduce log volume
+                        # We'll log the complete response at the end instead
+                        pass
 
                     if output.finish_reason is None:
                         # Send token-by-token response for each request.n
@@ -1255,6 +1276,41 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
+            # Emit a single streaming summary payload log
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    usage_dict = (
+                        request_metadata.final_usage_info.model_dump()
+                        if request_metadata.final_usage_info
+                        else None
+                    )
+                except Exception:
+                    usage_dict = None
+                resp_summary = {
+                    "id": rid_hint,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [],
+                    "usage": usage_dict,
+                    "stream": True,
+                }
+                try:
+                    payload_str = json.dumps(resp_summary, ensure_ascii=False)
+                except Exception:
+                    payload_str = ""
+                try:
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": rid_hint,
+                            "endpoint": self.__class__.__name__,
+                            "payload": payload_str,
+                        },
+                    )
+                except Exception:
+                    pass
+
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
@@ -1292,6 +1348,7 @@ class OpenAIServingChat(OpenAIServing):
         request_metadata: RequestResponseMetadata,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
         final_res: RequestOutput | None = None
 
         try:
@@ -1575,6 +1632,37 @@ class OpenAIServingChat(OpenAIServing):
             kv_transfer_params=final_res.kv_transfer_params,
         )
 
+        # Emit a single non-streaming summary payload log
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                usage_dict = usage.model_dump() if usage else None
+            except Exception:
+                usage_dict = None
+            resp_summary = {
+                "id": rid_hint,
+                "object": "chat.completion",
+                "created": created_time,
+                "model": model_name,
+                "choices": [],
+                "usage": usage_dict,
+                "stream": False,
+            }
+            try:
+                payload_str = json.dumps(resp_summary, ensure_ascii=False)
+            except Exception:
+                payload_str = ""
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid_hint,
+                        "endpoint": self.__class__.__name__,
+                        "payload": payload_str,
+                    },
+                )
+            except Exception:
+                pass
+
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
@@ -1595,15 +1683,11 @@ class OpenAIServingChat(OpenAIServing):
                     output_text = f"[tool_calls: {tool_calls_str}]"
 
                 if output_text:
-                    # Get the corresponding output token IDs
-                    output_token_ids = None
-                    if choice.index < len(final_res.outputs):
-                        output_token_ids = final_res.outputs[choice.index].token_ids
-
+                    # Don't log output_token_ids to reduce log volume
                     self.request_logger.log_outputs(
                         request_id=request_id,
                         outputs=output_text,
-                        output_token_ids=output_token_ids,
+                        output_token_ids=None,
                         finish_reason=choice.finish_reason,
                         is_streaming=False,
                         delta=False,

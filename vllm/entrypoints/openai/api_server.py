@@ -6,6 +6,7 @@ import importlib
 import inspect
 import json
 import multiprocessing
+import logging
 import multiprocessing.forkserver as forkserver
 import os
 import secrets
@@ -16,6 +17,7 @@ import uuid
 from argparse import Namespace
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+import os
 from http import HTTPStatus
 from typing import Annotated, Any, Literal
 
@@ -1948,6 +1950,59 @@ async def run_server_worker(
     listen_address, sock, args, client_config=None, **uvicorn_kwargs
 ) -> None:
     """Run a single API server worker."""
+
+    # Initialize OpenTelemetry (logs/metrics/traces) if configured
+    try:
+        from vllm.otel_instrumentation import init_otel, start_prom_to_otel_bridge
+        meter, _, _otel_handler = init_otel({
+            "service.name": os.getenv("OTEL_SERVICE_NAME", "vllm"),
+            "service.instance.id": os.getenv("OTEL_SERVICE_INSTANCE_ID",
+                                              os.getenv("HOSTNAME", "instance-0")),
+            "service.version": VLLM_VERSION,
+            "service.namespace": "vllm.openai.api_server",
+        })
+        if _otel_handler is not None:
+            # Add filter to exclude engine stats and other high-volume logs from OTEL
+            class OtelLogFilter(logging.Filter):
+                def filter(self, record):
+                    # Exclude engine throughput stats (show on console only)
+                    if 'Avg prompt throughput' in record.getMessage():
+                        return False
+                    # Exclude other high-volume internal logs
+                    if record.name.startswith('vllm.v1.metrics'):
+                        return False
+                    return True
+            
+            _otel_handler.addFilter(OtelLogFilter())
+            
+            # Attach OTEL handler to root vllm logger to capture request/response logs
+            vllm_root_logger = logging.getLogger("vllm")
+            # Avoid duplicate handlers if reinitialized
+            if not any(isinstance(h, type(_otel_handler))
+                      for h in vllm_root_logger.handlers):
+                vllm_root_logger.addHandler(_otel_handler)
+                logger.info("OpenTelemetry logging handler attached to vllm root logger")
+        
+        # Start Prometheus -> OTEL metrics bridge if meter available/env configured
+        if meter is not None or os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
+            scrape_target = os.getenv("VLLM_SCRAPE_TARGET")
+            if not scrape_target:
+                # Fallback to the current server host:port. Replace wildcard binds with loopback.
+                host = args.host or "127.0.0.1"
+                if host in ("0.0.0.0", "::"):
+                    host = "127.0.0.1"
+                scrape_target = f"{host}:{args.port}"
+            scrape_url = f"http://{scrape_target}/metrics"
+            interval_s = float(os.getenv("VLLM_PROM_SCRAPE_INTERVAL", "30"))
+            try:
+                start_prom_to_otel_bridge(scrape_url, interval_seconds=interval_s)
+                logger.info("OpenTelemetry Prometheus bridge started (scraping %s every %ds)", 
+                           scrape_url, int(interval_s))
+            except Exception as e:
+                logger.warning("Failed to start Prometheus bridge: %s", e)
+    except Exception as e:
+        # Do not fail server startup on OTEL init issues
+        logger.warning("OTEL initialization skipped: %s", e)
 
     if args.tool_parser_plugin and len(args.tool_parser_plugin) > 3:
         ToolParserManager.import_tool_parser(args.tool_parser_plugin)
