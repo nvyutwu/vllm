@@ -1982,6 +1982,22 @@ async def run_server_worker(
                       for h in vllm_root_logger.handlers):
                 vllm_root_logger.addHandler(_otel_handler)
                 logger.info("OpenTelemetry logging handler attached to vllm root logger")
+            
+            # Add filter to console handlers to exclude request/response logs (OTEL only)
+            class ConsoleLogFilter(logging.Filter):
+                def filter(self, record):
+                    msg = record.getMessage()
+                    # Exclude request/response logs from console (OTEL only)
+                    if 'openai.request' in msg or 'openai.response' in msg:
+                        return False
+                    if 'Generated response' in msg and 'chatcmpl-' in msg:
+                        return False
+                    return True
+            
+            # Apply filter to all existing console/stream handlers
+            for handler in vllm_root_logger.handlers:
+                if isinstance(handler, logging.StreamHandler) and not isinstance(handler, type(_otel_handler)):
+                    handler.addFilter(ConsoleLogFilter())
         
         # Start Prometheus -> OTEL metrics bridge if meter available/env configured
         if meter is not None or os.getenv("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"):
