@@ -1666,6 +1666,17 @@ class OpenAIServingChat(OpenAIServing):
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
+                # Log reasoning 
+                if hasattr(choice.message, 'reasoning') and choice.message.reasoning:
+                    self.request_logger.log_outputs(
+                        request_id=request_id,
+                        outputs=f"[reasoning] {choice.message.reasoning}",
+                        output_token_ids=None,
+                        finish_reason=None,  
+                        is_streaming=False,
+                        delta=False,
+                    )
+
                 output_text = ""
                 if choice.message.content:
                     output_text = choice.message.content
