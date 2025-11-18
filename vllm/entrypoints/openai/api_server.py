@@ -160,8 +160,23 @@ async def lifespan(app: FastAPI):
             if task is not None:
                 task.cancel()
     finally:
+        # Explicitly shutdown the engine to cleanup xgrammar objects
+        # before Python starts module cleanup (prevents nanobind leaks)
+        if hasattr(app.state, "engine_client"):
+            try:
+                engine_client: EngineClient = app.state.engine_client
+                if hasattr(engine_client, "shutdown"):
+                    engine_client.shutdown()
+            except Exception as e:
+                logger.warning("Error during engine shutdown: %s", e)
+        
         # Ensure app state including engine ref is gc'd
         del app.state
+        
+        # Force garbage collection to ensure xgrammar objects are cleaned up
+        # before Python module cleanup
+        import gc
+        gc.collect()
 
 
 @asynccontextmanager
