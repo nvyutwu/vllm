@@ -600,9 +600,10 @@ class OpenAIServingChat(OpenAIServing):
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
         
-        # Track reasoning and content separately for proper logging
+        # Track reasoning, content and tool calls separately for proper logging
         previous_reasoning_texts = [""] * num_choices
         previous_content_texts = [""] * num_choices
+        previous_tool_calls: list[list[DeltaToolCall]] = [[] for _ in range(num_choices)]
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1092,12 +1093,34 @@ class OpenAIServingChat(OpenAIServing):
                         previous_texts[i] = current_text
                         all_previous_token_ids[i] = current_token_ids
                         
-                        # Track reasoning and content separately for logging
+                        # Track reasoning, content, and tool calls separately for logging
                         if delta_message:
                             if delta_message.reasoning:
                                 previous_reasoning_texts[i] += delta_message.reasoning
                             if delta_message.content:
                                 previous_content_texts[i] += delta_message.content
+                            if delta_message.tool_calls:
+                                # Track tool calls - merge or add new ones
+                                for delta_tc in delta_message.tool_calls:
+                                    if delta_tc.index is not None:
+                                        # Ensure we have enough slots
+                                        while len(previous_tool_calls[i]) <= delta_tc.index:
+                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
+                                        # Merge with existing tool call at this index
+                                        existing_tc = previous_tool_calls[i][delta_tc.index]
+                                        if delta_tc.id is not None:
+                                            existing_tc.id = delta_tc.id
+                                        if delta_tc.type is not None:
+                                            existing_tc.type = delta_tc.type
+                                        if delta_tc.function is not None:
+                                            if existing_tc.function is None:
+                                                existing_tc.function = DeltaFunctionCall()
+                                            if delta_tc.function.name is not None:
+                                                existing_tc.function.name = delta_tc.function.name
+                                            if delta_tc.function.arguments is not None:
+                                                if existing_tc.function.arguments is None:
+                                                    existing_tc.function.arguments = ""
+                                                existing_tc.function.arguments += delta_tc.function.arguments
                     else:
                         # Update for comprehensive logging even in simple case
                         assert previous_texts is not None
@@ -1109,6 +1132,28 @@ class OpenAIServingChat(OpenAIServing):
                                 previous_reasoning_texts[i] += delta_message.reasoning
                             if delta_message.content:
                                 previous_content_texts[i] += delta_message.content
+                            if delta_message.tool_calls:
+                                # Track tool calls - merge or add new ones
+                                for delta_tc in delta_message.tool_calls:
+                                    if delta_tc.index is not None:
+                                        # Ensure we have enough slots
+                                        while len(previous_tool_calls[i]) <= delta_tc.index:
+                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
+                                        # Merge with existing tool call at this index
+                                        existing_tc = previous_tool_calls[i][delta_tc.index]
+                                        if delta_tc.id is not None:
+                                            existing_tc.id = delta_tc.id
+                                        if delta_tc.type is not None:
+                                            existing_tc.type = delta_tc.type
+                                        if delta_tc.function is not None:
+                                            if existing_tc.function is None:
+                                                existing_tc.function = DeltaFunctionCall()
+                                            if delta_tc.function.name is not None:
+                                                existing_tc.function.name = delta_tc.function.name
+                                            if delta_tc.function.arguments is not None:
+                                                if existing_tc.function.arguments is None:
+                                                    existing_tc.function.arguments = ""
+                                                existing_tc.function.arguments += delta_tc.function.arguments
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
@@ -1335,10 +1380,11 @@ class OpenAIServingChat(OpenAIServing):
                 for i in range(num_choices):
                     reasoning_text = previous_reasoning_texts[i]
                     content_text = previous_content_texts[i]
+                    tool_calls_list = previous_tool_calls[i]
                     
                     logger.debug(
-                        "Streaming complete for request %s, choice %d: reasoning_length=%d, content_length=%d",
-                        request_id, i, len(reasoning_text), len(content_text)
+                        "Streaming complete for request %s, choice %d: reasoning_length=%d, content_length=%d, tool_calls=%d",
+                        request_id, i, len(reasoning_text), len(content_text), len(tool_calls_list)
                     )
                     
                     if reasoning_text:
@@ -1369,15 +1415,39 @@ class OpenAIServingChat(OpenAIServing):
                             delta=False,
                         )
                     
-                    # If neither reasoning nor content, log a fallback message
-                    if not reasoning_text and not content_text:
+                    # Log tool calls if present (similar to non-streaming mode)
+                    if tool_calls_list:
+                        tool_call_descriptions = []
+                        for tc in tool_calls_list:
+                            if tc.function and tc.function.name and tc.function.arguments:
+                                tool_call_descriptions.append(
+                                    f"{tc.function.name}({tc.function.arguments})"
+                                )
+                        if tool_call_descriptions:
+                            tool_calls_str = ", ".join(tool_call_descriptions)
+                            tool_calls_output = f"[tool_calls: {tool_calls_str}]"
+                            logger.debug(
+                                "Logging tool calls for request %s: %s",
+                                request_id, tool_calls_output[:200]
+                            )
+                            self.request_logger.log_outputs(
+                                request_id=request_id,
+                                outputs=tool_calls_output,
+                                output_token_ids=None,
+                                finish_reason="streaming_complete",
+                                is_streaming=True,
+                                delta=False,
+                            )
+                    
+                    # If neither reasoning nor content nor tool calls, log a fallback message
+                    if not reasoning_text and not content_text and not tool_calls_list:
                         full_text = (
                             previous_texts[i]
                             if previous_texts and i < len(previous_texts)
                             else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
                         )
                         logger.debug(
-                            "No separate reasoning/content tracked, logging full text for request %s",
+                            "No separate reasoning/content/tool_calls tracked, logging full text for request %s",
                             request_id
                         )
                         self.request_logger.log_outputs(
