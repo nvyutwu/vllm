@@ -46,7 +46,7 @@ class XgrammarBackend(StructuredOutputBackend):
             # not self.tokenizer.vocab_size as self.tokenizer.vocab
             # collapses all decoded errors into a single token.
             self.vocab_size = len(self.tokenizer.vocab)
-            self.tokenizer_info = xgr.TokenizerInfo(  # type: ignore
+            tokenizer_info = xgr.TokenizerInfo(  # type: ignore
                 encoded_vocab=self.tokenizer.vocab,
                 # NOTE: https://github.com/mlc-ai/xgrammar/blob/5e141f6ff1ca02bc31f9e512e68b61f2a8ae88e5/tests/python/test_tokenizer_info.py#L43 # noqa: E501
                 vocab_type=xgr.VocabType.RAW
@@ -57,12 +57,12 @@ class XgrammarBackend(StructuredOutputBackend):
                 add_prefix_space=True,
             )
         else:
-            self.tokenizer_info = xgr.TokenizerInfo.from_huggingface(
+            tokenizer_info = xgr.TokenizerInfo.from_huggingface(
                 self.tokenizer,
                 vocab_size=self.vocab_size,
             )
         self.compiler = xgr.GrammarCompiler(
-            self.tokenizer_info,
+            tokenizer_info,
             max_threads=8,
             cache_enabled=True,
             cache_limit_bytes=vllm.envs.VLLM_XGRAMMAR_CACHE_MB * 1024 * 1024,
@@ -125,29 +125,7 @@ class XgrammarBackend(StructuredOutputBackend):
         return xgr.allocate_token_bitmask(max_num_seqs, self.vocab_size)
 
     def destroy(self):
-        # Clear the xgrammar cache before deleting the compiler
-        # to ensure proper cleanup of nanobind objects
-        import gc
-        try:
-            if hasattr(self, "compiler") and self.compiler is not None:
-                # Clear the compiler's internal cache
-                xgr.GrammarCompiler.clear_cache()
-                # Explicitly delete the compiler and break references
-                compiler = self.compiler
-                self.compiler = None  # type: ignore
-                del compiler
-                # Force garbage collection after deleting compiler
-                gc.collect()
-            
-            # Delete tokenizer_info
-            if hasattr(self, "tokenizer_info") and self.tokenizer_info is not None:
-                tokenizer_info = self.tokenizer_info
-                self.tokenizer_info = None  # type: ignore
-                del tokenizer_info
-                gc.collect()
-        except Exception:
-            # Suppress any errors during cache clearing
-            pass
+        del self.compiler
 
 
 @dataclass
@@ -166,11 +144,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
     _is_terminated: bool = field(default=False, repr=False, hash=False)
-
-    def __del__(self):
-        """Explicit cleanup of xgrammar objects to prevent nanobind leaks."""
-        # Call the cleanup method to ensure proper cleanup
-        self.cleanup()
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -224,27 +197,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
     def reset(self):
         self.num_processed_tokens = 0
         self.matcher.reset()
-    
-    def cleanup(self):
-        """Explicitly cleanup xgrammar objects to prevent nanobind leaks.
-        
-        This method should be called before the grammar object is deleted
-        to ensure proper cleanup of nanobind resources.
-        """
-        try:
-            # First set to None to break references, then delete
-            # Delete in reverse order of creation (matcher uses ctx)
-            if hasattr(self, "matcher"):
-                matcher = self.matcher
-                self.matcher = None  # type: ignore
-                del matcher
-            if hasattr(self, "ctx"):
-                ctx = self.ctx
-                self.ctx = None  # type: ignore
-                del ctx
-        except Exception:
-            # Suppress any errors during cleanup
-            pass
 
 
 # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc
@@ -331,9 +283,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
 
     if so_params.regex:
         try:
-            # Create grammar for validation, then explicitly delete it
-            grammar = xgr.Grammar.from_regex(so_params.regex)
-            del grammar
+            xgr.Grammar.from_regex(so_params.regex)
         except Exception as err:
             raise ValueError(
                 f"Failed to transform regex into a grammar: {err}"
@@ -342,9 +292,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
     if so_params.choice:
         choice_grammar = choice_as_grammar(so_params.choice)
         try:
-            # Create grammar for validation, then explicitly delete it
-            grammar = xgr.Grammar.from_ebnf(choice_grammar)
-            del grammar
+            xgr.Grammar.from_ebnf(choice_grammar)
         except Exception as err:
             raise ValueError(
                 "Failed to transform choices into a grammar: {err}"
@@ -363,9 +311,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
             schema = so_params.json
 
         try:
-            # Create grammar for validation, then explicitly delete it
-            grammar = xgr.Grammar.from_json_schema(schema)
-            del grammar
+            xgr.Grammar.from_json_schema(schema)
         except Exception as err:
             raise ValueError(
                 f"Failed to transform json schema into a grammar: {err}"
@@ -390,9 +336,7 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
         # Test parsing EBNF grammar, possibly already converted from Lark
         try:
             # parse the grammar, but we aren't compiling it.
-            # Create grammar for validation, then explicitly delete it
-            grammar = xgr.Grammar.from_ebnf(so_params.grammar)
-            del grammar
+            xgr.Grammar.from_ebnf(so_params.grammar)
         except Exception as e:
             raise ValueError("Invalid grammar specification.") from e
         return
@@ -411,12 +355,8 @@ def validate_xgrammar_grammar(sampling_params: SamplingParams) -> None:
                     )
                     for s in s_tag["structures"]
                 ]
-                # Create grammar for validation, then explicitly delete it
-                grammar = xgr.Grammar.from_structural_tag(tags, s_tag["triggers"])
-                del grammar
+                xgr.Grammar.from_structural_tag(tags, s_tag["triggers"])
             else:
-                # Create grammar for validation, then explicitly delete it
-                grammar = xgr.Grammar.from_structural_tag(so_params.structural_tag)
-                del grammar
+                xgr.Grammar.from_structural_tag(so_params.structural_tag)
         except Exception as e:
             raise ValueError("Invalid structural tag specification.") from e

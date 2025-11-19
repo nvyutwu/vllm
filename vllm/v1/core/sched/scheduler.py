@@ -1285,51 +1285,6 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
-        # Clean up structured output grammar objects from all requests
-        # to prevent nanobind memory leaks
-        from concurrent.futures import Future
-        import gc
-        
-        for request in list(self.requests.values()):
-            if (
-                request.structured_output_request is not None
-                and request.structured_output_request._grammar is not None
-            ):
-                # Call cleanup method if available (for xgrammar)
-                grammar = request.structured_output_request._grammar
-                
-                # If it's a Future, try to get the result and clean it up
-                if isinstance(grammar, Future):
-                    try:
-                        # Try to get the result without waiting long
-                        actual_grammar = grammar.result(timeout=0.001)
-                        if hasattr(actual_grammar, "cleanup"):
-                            actual_grammar.cleanup()
-                        del actual_grammar
-                    except Exception:
-                        # Future not ready or already cancelled
-                        pass
-                elif hasattr(grammar, "cleanup"):
-                    try:
-                        grammar.cleanup()
-                    except Exception:
-                        pass
-                
-                # Explicitly delete the grammar object
-                request.structured_output_request._grammar = None
-                try:
-                    del grammar
-                except Exception:
-                    pass
-            
-            # Clear the entire structured output request
-            if request.structured_output_request is not None:
-                request.structured_output_request = None
-        
-        # Force garbage collection multiple times after cleaning up all grammars
-        for _ in range(3):
-            gc.collect()
-        
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

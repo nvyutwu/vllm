@@ -468,18 +468,11 @@ class EngineCore:
         return engine_core_outputs, model_executed
 
     def shutdown(self):
-        # CRITICAL: Shutdown scheduler FIRST to cleanup grammar objects in requests
-        # BEFORE clearing the backend (which destroys the compiler)
-        if self.scheduler:
-            self.scheduler.shutdown()
-            # Force garbage collection to ensure grammar objects are deleted
-            # before we clear the backend
-            import gc
-            gc.collect()
+        self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
-        # Clear backend LAST after all grammars are cleaned up
-        self.structured_output_manager.clear_backend()
+        if self.scheduler:
+            self.scheduler.shutdown()
 
     def profile(self, is_start: bool = True):
         self.model_executor.profile(is_start)

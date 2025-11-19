@@ -334,34 +334,5 @@ class StructuredOutputManager:
         return False
 
     def clear_backend(self) -> None:
-        # Clear the grammar bitmask tensor which may hold references
-        if self._grammar_bitmask is not None:
-            del self._grammar_bitmask
-            self._grammar_bitmask = None
-        
-        # Shutdown thread pool executors
-        if hasattr(self, "executor"):
-            try:
-                self.executor.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        
-        if hasattr(self, "executor_for_fillmask"):
-            try:
-                self.executor_for_fillmask.shutdown(wait=False, cancel_futures=True)
-            except Exception:
-                pass
-        
-        # Destroy backend
         if self.backend is not None:
             self.backend.destroy()
-            self.backend = None
-        
-        # Clear tokenizer reference
-        if hasattr(self, "tokenizer"):
-            self.tokenizer = None
-        
-        # Force garbage collection to ensure xgrammar objects are cleaned up
-        # This helps prevent nanobind memory leaks
-        import gc
-        gc.collect()
