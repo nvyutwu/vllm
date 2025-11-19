@@ -599,6 +599,10 @@ class OpenAIServingChat(OpenAIServing):
 
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
+        
+        # Track reasoning and content separately for proper logging
+        previous_reasoning_texts = [""] * num_choices
+        previous_content_texts = [""] * num_choices
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1087,10 +1091,24 @@ class OpenAIServingChat(OpenAIServing):
                         assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
                         all_previous_token_ids[i] = current_token_ids
+                        
+                        # Track reasoning and content separately for logging
+                        if delta_message:
+                            if delta_message.reasoning:
+                                previous_reasoning_texts[i] += delta_message.reasoning
+                            if delta_message.content:
+                                previous_content_texts[i] += delta_message.content
                     else:
                         # Update for comprehensive logging even in simple case
                         assert previous_texts is not None
                         previous_texts[i] += delta_text
+                        
+                        # Track reasoning and content separately for logging
+                        if delta_message:
+                            if delta_message.reasoning:
+                                previous_reasoning_texts[i] += delta_message.reasoning
+                            if delta_message.content:
+                                previous_content_texts[i] += delta_message.content
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
@@ -1315,19 +1333,61 @@ class OpenAIServingChat(OpenAIServing):
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
                 for i in range(num_choices):
-                    full_text = (
-                        previous_texts[i]
-                        if previous_texts and i < len(previous_texts)
-                        else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                    reasoning_text = previous_reasoning_texts[i]
+                    content_text = previous_content_texts[i]
+                    
+                    logger.debug(
+                        "Streaming complete for request %s, choice %d: reasoning_length=%d, content_length=%d",
+                        request_id, i, len(reasoning_text), len(content_text)
                     )
-                    self.request_logger.log_outputs(
-                        request_id=request_id,
-                        outputs=full_text,
-                        output_token_ids=None,  # Consider also logging all token IDs
-                        finish_reason="streaming_complete",
-                        is_streaming=True,
-                        delta=False,
-                    )
+                    
+                    if reasoning_text:
+                        logger.debug(
+                            "Logging reasoning part for request %s: [reasoning] %s...",
+                            request_id, reasoning_text[:100]
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=f"[reasoning] {reasoning_text}",
+                            output_token_ids=None,
+                            finish_reason=None,
+                            is_streaming=True,
+                            delta=False,
+                        )
+                    
+                    if content_text:
+                        logger.debug(
+                            "Logging content part for request %s: %s...",
+                            request_id, content_text[:100]
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=content_text,
+                            output_token_ids=None,
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
+                    
+                    # If neither reasoning nor content, log a fallback message
+                    if not reasoning_text and not content_text:
+                        full_text = (
+                            previous_texts[i]
+                            if previous_texts and i < len(previous_texts)
+                            else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                        )
+                        logger.debug(
+                            "No separate reasoning/content tracked, logging full text for request %s",
+                            request_id
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=full_text,
+                            output_token_ids=None,
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
 
         except Exception as e:
             # TODO: Use a vllm-specific Validation Error
