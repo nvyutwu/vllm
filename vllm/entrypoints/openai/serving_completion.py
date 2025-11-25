@@ -40,6 +40,16 @@ from vllm.v1.sample.logits_processor import validate_logits_processors_parameter
 
 logger = init_logger(__name__)
 
+# Import Harmony utilities for gpt-oss models
+try:
+    from vllm.entrypoints.harmony_utils import (
+        get_stop_tokens_for_assistant_actions,
+    )
+    HARMONY_AVAILABLE = True
+except ImportError:
+    HARMONY_AVAILABLE = False
+    logger.warning("Harmony utilities not available. gpt-oss models will not be supported in Completion API.")
+
 
 class OpenAIServingCompletion(OpenAIServing):
     def __init__(
@@ -74,6 +84,17 @@ class OpenAIServingCompletion(OpenAIServing):
                 "Using default completion sampling params from %s: %s",
                 source,
                 self.default_sampling_params,
+            )
+        
+        # Check if model is gpt-oss and needs Harmony format
+        self.use_harmony = HARMONY_AVAILABLE and self.model_config.hf_config.model_type == "gpt_oss"
+        if self.use_harmony:
+            logger.info("Enabling Harmony format for gpt-oss model in Completion API")
+            # Add stop tokens for Harmony assistant actions
+            if "stop_token_ids" not in self.default_sampling_params:
+                self.default_sampling_params["stop_token_ids"] = []
+            self.default_sampling_params["stop_token_ids"].extend(
+                get_stop_tokens_for_assistant_actions()
             )
 
     async def create_completion(
@@ -126,13 +147,52 @@ class OpenAIServingCompletion(OpenAIServing):
                 tokenizer = None
             else:
                 tokenizer = await self.engine_client.get_tokenizer()
-            renderer = self._get_renderer(tokenizer)
-
-            engine_prompts = await renderer.render_prompt_and_embeds(
-                prompt_or_prompts=request.prompt,
-                prompt_embeds=request.prompt_embeds,
-                config=self._build_render_config(request),
-            )
+            
+            # Use Harmony format for gpt-oss models (similar to Ollama)
+            if self.use_harmony:
+                from vllm.entrypoints.chat_utils import apply_hf_chat_template, ConversationMessage
+                
+                logger.info("Using Harmony format for gpt-oss model in Completion API")
+                
+                # Convert prompt to messages and use chat template (like Ollama does)
+                prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
+                engine_prompts = []
+                
+                for prompt_text in prompts:
+                    # Convert to simple user message  
+                    conversation = [ConversationMessage(role="user", content=prompt_text)]
+                    
+                    # Apply chat template to get Harmony-formatted prompt string
+                    # This produces: <|start|>system<|message|>...<|end|>
+                    #                <|start|>user<|message|>{prompt}<|end|>
+                    #                <|start|>assistant
+                    prompt_str = apply_hf_chat_template(
+                        tokenizer=tokenizer,
+                        conversation=conversation,
+                        chat_template=None,  # Use model's default chat template
+                        tools=None,  # No tools for basic completion
+                        model_config=self.model_config,
+                        add_generation_prompt=True,  # Adds <|start|>assistant
+                    )
+                    
+                    # Log the rendered prompt for debugging
+                    logger.debug(f"[Harmony Input] Rendered prompt:\n{prompt_str}")
+                    
+                    # Tokenize the chat-templated string
+                    # Special tokens are already in the template, so don't add them again
+                    prompt_token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
+                    
+                    engine_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+                    if request.cache_salt is not None:
+                        engine_prompt["cache_salt"] = request.cache_salt
+                    engine_prompts.append(engine_prompt)
+            else:
+                renderer = self._get_renderer(tokenizer)
+                engine_prompts = await renderer.render_prompt_and_embeds(
+                    prompt_or_prompts=request.prompt,
+                    prompt_embeds=request.prompt_embeds,
+                    config=self._build_render_config(request),
+                )
         except ValueError as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
@@ -406,9 +466,14 @@ class OpenAIServingCompletion(OpenAIServing):
                         has_echoed[i] = True
                     else:
                         # return just the delta
+                        # Return raw model output without parsing (for now)
                         delta_text = output.text
                         delta_token_ids = output.token_ids
                         out_logprobs = output.logprobs
+                        
+                        # Log raw output for Harmony models to verify format
+                        if self.use_harmony and tokenizer:
+                            logger.info(f"[Harmony Output] Raw delta: {delta_text}")
 
                         # has_echoed[i] is reused here to indicate whether
                         # we have already returned the prompt token IDs.
@@ -442,25 +507,26 @@ class OpenAIServingCompletion(OpenAIServing):
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
 
+                    # Prepare the choice (raw output without parsing)
+                    choice = CompletionResponseStreamChoice(
+                        index=i,
+                        text=delta_text,
+                        logprobs=logprobs,
+                        finish_reason=finish_reason,
+                        stop_reason=stop_reason,
+                        prompt_token_ids=prompt_token_ids_to_return,
+                        token_ids=(
+                            as_list(output.token_ids)
+                            if request.return_token_ids
+                            else None
+                        ),
+                    )
+
                     chunk = CompletionStreamResponse(
                         id=request_id,
                         created=created_time,
                         model=model_name,
-                        choices=[
-                            CompletionResponseStreamChoice(
-                                index=i,
-                                text=delta_text,
-                                logprobs=logprobs,
-                                finish_reason=finish_reason,
-                                stop_reason=stop_reason,
-                                prompt_token_ids=prompt_token_ids_to_return,
-                                token_ids=(
-                                    as_list(output.token_ids)
-                                    if request.return_token_ids
-                                    else None
-                                ),
-                            )
-                        ],
+                        choices=[choice],
                     )
                     if include_continuous_usage:
                         prompt_tokens = num_prompt_tokens[prompt_idx]
@@ -561,7 +627,13 @@ class OpenAIServingCompletion(OpenAIServing):
                 else:
                     token_ids = output.token_ids
                     out_logprobs = output.logprobs
+                    
+                    # Return raw model output without parsing (for now)
                     output_text = output.text
+                    
+                    # Log raw output for Harmony models to verify format
+                    if self.use_harmony and tokenizer:
+                        logger.info(f"[Harmony Output] Raw output: {output_text}")
 
                 if request.logprobs is not None:
                     assert out_logprobs is not None, "Did not output logprobs"
