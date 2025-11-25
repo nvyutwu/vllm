@@ -1104,6 +1104,24 @@ class CompletionRequest(OpenAIBaseModel):
     temperature: float | None = None
     top_p: float | None = None
     user: str | None = None
+    
+    # vLLM-specific fields for gpt-oss models
+    reasoning_effort: Literal["low", "medium", "high"] | None = Field(
+        default=None,
+        description=(
+            "Controls the reasoning effort level for gpt-oss models. "
+            "Only applicable to models that support reasoning. "
+            "Defaults to 'medium' if not specified."
+        ),
+    )
+    builtin_tools: list[Literal["browser", "python"]] | None = Field(
+        default=None,
+        description=(
+            "Built-in tools available to gpt-oss models. "
+            "Enables the model to use browser (for web search) or python (for code execution). "
+            "Only applicable to gpt-oss models with Harmony format."
+        ),
+    )
 
     # --8<-- [start:completion-sampling-params]
     use_beam_search: bool = False

@@ -20,8 +20,10 @@ from vllm.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
+    FunctionCall,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ToolCall,
     UsageInfo,
 )
 from vllm.entrypoints.openai.serving_engine import OpenAIServing, clamp_prompt_logprobs
@@ -44,6 +46,8 @@ logger = init_logger(__name__)
 try:
     from vllm.entrypoints.harmony_utils import (
         get_stop_tokens_for_assistant_actions,
+        get_streamable_parser_for_assistant,
+        parse_chat_output,
     )
     HARMONY_AVAILABLE = True
 except ImportError:
@@ -162,17 +166,27 @@ class OpenAIServingCompletion(OpenAIServing):
                     # Convert to simple user message  
                     conversation = [ConversationMessage(role="user", content=prompt_text)]
                     
+                    # Prepare chat template kwargs for gpt-oss
+                    chat_template_kwargs = {}
+                    if request.reasoning_effort is not None:
+                        chat_template_kwargs["reasoning_effort"] = request.reasoning_effort
+                    if request.builtin_tools is not None:
+                        chat_template_kwargs["builtin_tools"] = request.builtin_tools
+                        logger.debug(f"Enabling built-in tools: {request.builtin_tools}")
+                    
                     # Apply chat template to get Harmony-formatted prompt string
                     # This produces: <|start|>system<|message|>...<|end|>
                     #                <|start|>user<|message|>{prompt}<|end|>
                     #                <|start|>assistant
+                    # With builtin_tools, also includes browser/python tool definitions
                     prompt_str = apply_hf_chat_template(
                         tokenizer=tokenizer,
                         conversation=conversation,
                         chat_template=None,  # Use model's default chat template
-                        tools=None,  # No tools for basic completion
+                        tools=None,  # No custom tools for basic completion
                         model_config=self.model_config,
                         add_generation_prompt=True,  # Adds <|start|>assistant
+                        **chat_template_kwargs,
                     )
                     
                     # Log the rendered prompt for debugging
@@ -406,6 +420,19 @@ class OpenAIServingCompletion(OpenAIServing):
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
+        
+        # Initialize Harmony parsers for streaming (similar to serving_chat.py)
+        harmony_parsers = None
+        # Track accumulated tool call content per choice (parsed at the end)
+        accumulated_tool_content: dict[int, str] = {}
+        current_tool_recipient: dict[int, str | None] = {}
+        
+        if self.use_harmony:
+            harmony_parsers = [
+                get_streamable_parser_for_assistant() 
+                for _ in range(num_choices * num_prompts)
+            ]
+            logger.info(f"Initialized {len(harmony_parsers)} Harmony parsers for streaming")
 
         try:
             async for prompt_idx, res in result_generator:
@@ -466,14 +493,93 @@ class OpenAIServingCompletion(OpenAIServing):
                         has_echoed[i] = True
                     else:
                         # return just the delta
-                        # Return raw model output without parsing (for now)
-                        delta_text = output.text
+                        delta_text = ""
+                        delta_thinking = ""
+                        delta_tool_calls: list[ToolCall] = []
+                        
+                        # Parse Harmony output (serving_chat.py lines 761-853)
+                        if self.use_harmony and harmony_parsers is not None:
+                            harmony_parser = harmony_parsers[i]
+                            prev_recipient = harmony_parser.current_recipient
+                            
+                            for token_id in output.token_ids:
+                                harmony_parser.process(token_id)
+                                content_delta = harmony_parser.last_content_delta or ""
+                                
+                                # Route content based on channel (like Ollama's AddContent)
+                                cur_channel = harmony_parser.current_channel
+                                cur_recipient = harmony_parser.current_recipient
+                                
+                                if cur_channel == "final":
+                                    delta_text += content_delta
+                                elif cur_channel == "analysis":
+                                    # Check if it's a tool call on analysis channel (python can be on analysis)
+                                    if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
+                                        # Built-in tool on analysis channel
+                                        if i not in accumulated_tool_content:
+                                            accumulated_tool_content[i] = ""
+                                            current_tool_recipient[i] = cur_recipient
+                                        accumulated_tool_content[i] += content_delta
+                                    else:
+                                        # Regular reasoning content
+                                        delta_thinking += content_delta
+                                elif cur_channel == "commentary" and cur_recipient:
+                                    # Tool call content - accumulate for both custom and built-in tools
+                                    # Custom tools: functions.*
+                                    # Built-in tools: browser.*, python
+                                    if (cur_recipient.startswith("functions.") or 
+                                        cur_recipient.startswith("browser.") or 
+                                        cur_recipient == "python"):
+                                        if i not in accumulated_tool_content:
+                                            accumulated_tool_content[i] = ""
+                                            current_tool_recipient[i] = cur_recipient
+                                        accumulated_tool_content[i] += content_delta
+                            
+                            # Parse tool calls only when done (use output.finish_reason)
+                            if output.finish_reason is not None:
+                                if i in accumulated_tool_content and current_tool_recipient.get(i):
+                                    # Drain and parse the accumulated tool call
+                                    recipient = current_tool_recipient[i]
+                                    tool_content = accumulated_tool_content[i]
+                                    
+                                    # Extract function name based on recipient format
+                                    function_name = None
+                                    if recipient and recipient.startswith("functions."):
+                                        # Custom tools: functions.calc → "calc"
+                                        function_name = recipient.split("functions.", 1)[1]
+                                    elif recipient and recipient.startswith("browser."):
+                                        # Built-in browser tools: browser.search → "browser.search"
+                                        function_name = recipient
+                                    elif recipient == "python":
+                                        # Built-in python tool: python → "python"
+                                        function_name = "python"
+                                    
+                                    if function_name:
+                                        delta_tool_calls.append(
+                                            ToolCall(
+                                                function=FunctionCall(
+                                                    name=function_name,
+                                                    arguments=tool_content,
+                                                )
+                                            )
+                                        )
+                                        tool_type = "built-in" if not recipient.startswith("functions.") else "custom"
+                                        logger.debug(
+                                            f"[Harmony Output] {tool_type.capitalize()} tool call in final chunk: "
+                                            f"{function_name}({tool_content[:50]}...)"
+                                        )
+                            
+                            if delta_text or delta_thinking:
+                                logger.debug(
+                                    f"[Harmony Output] Delta - content: {repr(delta_text)}, "
+                                    f"thinking: {repr(delta_thinking)}, "
+                                    f"channel: {harmony_parser.current_channel}"
+                                )
+                        else:
+                            delta_text = output.text
+                        
                         delta_token_ids = output.token_ids
                         out_logprobs = output.logprobs
-                        
-                        # Log raw output for Harmony models to verify format
-                        if self.use_harmony and tokenizer:
-                            logger.info(f"[Harmony Output] Raw delta: {delta_text}")
 
                         # has_echoed[i] is reused here to indicate whether
                         # we have already returned the prompt token IDs.
@@ -507,7 +613,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
 
-                    # Prepare the choice (raw output without parsing)
+                    # Prepare the choice with parsed Harmony content
                     choice = CompletionResponseStreamChoice(
                         index=i,
                         text=delta_text,
@@ -521,6 +627,14 @@ class OpenAIServingCompletion(OpenAIServing):
                             else None
                         ),
                     )
+                    
+                    # Add thinking field if we have reasoning content (Harmony models)
+                    if self.use_harmony and delta_thinking:
+                        choice.thinking = delta_thinking
+                    
+                    # Add tool_calls only in final chunk when done 
+                    if self.use_harmony and delta_tool_calls:
+                        choice.tool_calls = delta_tool_calls
 
                     chunk = CompletionStreamResponse(
                         id=request_id,
@@ -628,12 +742,78 @@ class OpenAIServingCompletion(OpenAIServing):
                     token_ids = output.token_ids
                     out_logprobs = output.logprobs
                     
-                    # Return raw model output without parsing (for now)
-                    output_text = output.text
+                    # Parse Harmony output for non-streaming (similar to serving_chat.py)
+                    output_thinking = None
+                    output_tool_calls = None
                     
-                    # Log raw output for Harmony models to verify format
-                    if self.use_harmony and tokenizer:
-                        logger.info(f"[Harmony Output] Raw output: {output_text}")
+                    if self.use_harmony:
+                        # Use parse_chat_output to extract reasoning and content
+                        # Similar to serving_chat.py line 1520
+                        reasoning, content, _ = parse_chat_output(token_ids)
+                        output_thinking = reasoning
+                        output_text = content or ""
+                        
+                        # Parse tool calls from the token IDs
+                        # Similar to Ollama's approach - parse at completion
+                        parser = get_streamable_parser_for_assistant()
+                        for token_id in token_ids:
+                            parser.process(token_id)
+                        
+                        # Extract tool calls from completed messages
+                        # Built-in tools can be on commentary OR analysis channel
+                        tool_calls_list = []
+                        for msg in parser.messages:
+                            is_tool_call = False
+                            function_name = None
+                            
+                            # Check commentary channel for all tools
+                            if msg.channel == "commentary" and msg.recipient:
+                                is_tool_call = True
+                            # Check analysis channel for built-in tools (python, browser)
+                            elif msg.channel == "analysis" and msg.recipient:
+                                if msg.recipient.startswith("browser.") or msg.recipient == "python":
+                                    is_tool_call = True
+                            
+                            if is_tool_call and msg.recipient:
+                                # Parse both custom and built-in tools
+                                if msg.recipient.startswith("functions."):
+                                    # Custom tools: functions.calc → "calc"
+                                    function_name = msg.recipient.split("functions.", 1)[1]
+                                elif msg.recipient.startswith("browser."):
+                                    # Built-in browser tools: browser.search → "browser.search"
+                                    function_name = msg.recipient
+                                elif msg.recipient == "python":
+                                    # Built-in python tool: python → "python"
+                                    function_name = "python"
+                                
+                                if function_name:
+                                    arguments = msg.content[0].text if msg.content else ""
+                                    tool_calls_list.append(
+                                        ToolCall(
+                                            function=FunctionCall(
+                                                name=function_name,
+                                                arguments=arguments,
+                                            )
+                                        )
+                                    )
+                        
+                        if tool_calls_list:
+                            output_tool_calls = tool_calls_list
+                        
+                        if tool_calls_list:
+                            tool_names = [tc.function.name for tc in tool_calls_list]
+                            logger.debug(
+                                f"[Harmony Output] Parsed - content: {repr(output_text)}, "
+                                f"thinking: {repr(reasoning if reasoning else None)}, "
+                                f"tool_calls: {tool_names}"
+                            )
+                        else:
+                            logger.debug(
+                                f"[Harmony Output] Parsed - content: {repr(output_text)}, "
+                                f"thinking: {repr(reasoning if reasoning else None)}"
+                            )
+                    else:
+                        output_text = output.text
 
                 if request.logprobs is not None:
                     assert out_logprobs is not None, "Did not output logprobs"
@@ -660,6 +840,9 @@ class OpenAIServingCompletion(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
+                    # Add Harmony-specific fields
+                    thinking=output_thinking,
+                    tool_calls=output_tool_calls,
                 )
                 choices.append(choice_data)
 
