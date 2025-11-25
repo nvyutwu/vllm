@@ -10,6 +10,7 @@ from typing import cast
 import jinja2
 from fastapi import Request
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (
@@ -94,6 +95,10 @@ class OpenAIServingCompletion(OpenAIServing):
         self.use_harmony = HARMONY_AVAILABLE and self.model_config.hf_config.model_type == "gpt_oss"
         if self.use_harmony:
             logger.info("Enabling Harmony format for gpt-oss model in Completion API")
+            if envs.VLLM_PARSE_HARMONY_OUTPUT:
+                logger.info("Harmony output parsing is ENABLED (thinking, content, tool_calls will be separated)")
+            else:
+                logger.warning("Harmony output parsing is DISABLED - raw model output will be returned")
             # Add stop tokens for Harmony assistant actions
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []
@@ -498,7 +503,8 @@ class OpenAIServingCompletion(OpenAIServing):
                         delta_tool_calls: list[ToolCall] = []
                         
                         # Parse Harmony output (serving_chat.py lines 761-853)
-                        if self.use_harmony and harmony_parsers is not None:
+                        # Only parse if VLLM_PARSE_HARMONY_OUTPUT is enabled (default: True)
+                        if self.use_harmony and harmony_parsers is not None and envs.VLLM_PARSE_HARMONY_OUTPUT:
                             harmony_parser = harmony_parsers[i]
                             prev_recipient = harmony_parser.current_recipient
                             
@@ -743,10 +749,11 @@ class OpenAIServingCompletion(OpenAIServing):
                     out_logprobs = output.logprobs
                     
                     # Parse Harmony output for non-streaming (similar to serving_chat.py)
+                    # Only parse if VLLM_PARSE_HARMONY_OUTPUT is enabled (default: True)
                     output_thinking = None
                     output_tool_calls = None
                     
-                    if self.use_harmony:
+                    if self.use_harmony and envs.VLLM_PARSE_HARMONY_OUTPUT:
                         # Use parse_chat_output to extract reasoning and content
                         # Similar to serving_chat.py line 1520
                         reasoning, content, _ = parse_chat_output(token_ids)
