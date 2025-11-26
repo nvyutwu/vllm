@@ -1985,11 +1985,10 @@ async def run_server_worker(
                 logger.info("OpenTelemetry logging handler attached to vllm root logger")
             
             # Add filter to console handlers to exclude request/response logs (OTEL only)
-            # These logs go to OTEL collector but not to console to reduce clutter
             class ConsoleLogFilter(logging.Filter):
                 def filter(self, record):
                     msg = record.getMessage()
-                    # Exclude payload logs from console (OTEL only)
+                    # Exclude request/response logs from console (OTEL only)
                     if 'openai.request' in msg or 'openai.response' in msg:
                         return False
                     # Exclude output logs from console for all APIs (OTEL only)
@@ -2001,9 +2000,14 @@ async def run_server_worker(
                             return False
                     return True
             
-            # Apply filter to all existing console/stream handlers
+            # Apply filter to console handlers ONLY (not file handlers)
+            # Note: FileHandler is a subclass of StreamHandler, so we must exclude it
             for handler in vllm_root_logger.handlers:
-                if isinstance(handler, logging.StreamHandler) and not isinstance(handler, type(_otel_handler)):
+                is_stream_handler = isinstance(handler, logging.StreamHandler)
+                is_file_handler = isinstance(handler, logging.FileHandler)
+                is_otel_handler = isinstance(handler, type(_otel_handler))
+                # Only filter console (stdout/stderr) handlers, not file handlers
+                if is_stream_handler and not is_file_handler and not is_otel_handler:
                     handler.addFilter(ConsoleLogFilter())
         
         # Start Prometheus -> OTEL metrics bridge if meter available/env configured
