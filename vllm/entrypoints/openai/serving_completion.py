@@ -892,7 +892,94 @@ class OpenAIServingCompletion(OpenAIServing):
                                 *output.logprobs,
                             ]
 
-                        output_text = prompt_text + output.text
+                        # For gpt-oss with Harmony parsing enabled:
+                        # Parse only the GENERATED portion, then combine with echoed prompt
+                        if self.use_harmony and envs.VLLM_PARSE_HARMONY_OUTPUT:
+                            # Parse the generated tokens to extract thinking/content/tool_calls
+                            parser = get_streamable_parser_for_assistant()
+                            for token_id in output.token_ids:
+                                parser.process(token_id)
+                            
+                            # Extract content based on channel (same logic as non-echo case)
+                            thinking_parts = []
+                            final_parts = []
+                            tool_calls_list = []
+                            
+                            for msg in parser.messages:
+                                msg_content = msg.content[0].text if msg.content else ""
+                                recipient = msg.recipient
+                                
+                                if msg.channel == "final":
+                                    final_parts.append(msg_content)
+                                elif msg.channel == "analysis":
+                                    if recipient and (recipient.startswith("browser.") or recipient == "python"):
+                                        function_name = recipient
+                                        tool_call_id = f"cmpl-tool-{random_uuid()}"
+                                        tool_calls_list.append(
+                                            ToolCall(
+                                                id=tool_call_id,
+                                                function=FunctionCall(
+                                                    name=function_name,
+                                                    arguments=msg_content,
+                                                )
+                                            )
+                                        )
+                                    else:
+                                        thinking_parts.append(msg_content)
+                                elif msg.channel == "commentary" and recipient:
+                                    function_name = None
+                                    if recipient.startswith("functions."):
+                                        function_name = recipient.split("functions.", 1)[1]
+                                    elif recipient.startswith("browser."):
+                                        function_name = recipient
+                                    elif recipient == "python":
+                                        function_name = "python"
+                                    
+                                    if function_name:
+                                        tool_call_id = f"cmpl-tool-{random_uuid()}"
+                                        tool_calls_list.append(
+                                            ToolCall(
+                                                id=tool_call_id,
+                                                function=FunctionCall(
+                                                    name=function_name,
+                                                    arguments=msg_content,
+                                                )
+                                            )
+                                        )
+                            
+                            # Include in-progress content
+                            if parser.current_content:
+                                cur_channel = parser.current_channel
+                                cur_recipient = parser.current_recipient
+                                if cur_channel == "final":
+                                    final_parts.append(parser.current_content)
+                                elif cur_channel == "analysis" and not cur_recipient:
+                                    thinking_parts.append(parser.current_content)
+                            
+                            # Combine: echo prompt + parsed final content
+                            output_thinking = "\n".join(thinking_parts) if thinking_parts else None
+                            parsed_content = "".join(final_parts)
+                            output_text = prompt_text + parsed_content
+                            if tool_calls_list:
+                                output_tool_calls = tool_calls_list
+                            
+                            logger.debug(
+                                f"[Harmony Echo] prompt echoed, generated parsed - "
+                                f"content: {repr(parsed_content)}, thinking: {repr(output_thinking)}"
+                            )
+                        else:
+                            # Parsing disabled with echo - decode output with special tokens
+                            # to match the prompt format (which has special tokens visible)
+                            if self.use_harmony and tokenizer is not None:
+                                try:
+                                    generated_text = tokenizer.decode(
+                                        list(output.token_ids), skip_special_tokens=False
+                                    )
+                                    output_text = prompt_text + generated_text
+                                except Exception:
+                                    output_text = prompt_text + output.text
+                            else:
+                                output_text = prompt_text + output.text
                 else:
                     token_ids = output.token_ids
                     out_logprobs = output.logprobs
