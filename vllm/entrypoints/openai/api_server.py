@@ -1747,6 +1747,7 @@ async def init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_log_outputs=args.enable_log_outputs,
             log_error_stack=args.log_error_stack,
         )
         if "generate" in supported_tasks
@@ -1984,14 +1985,20 @@ async def run_server_worker(
                 logger.info("OpenTelemetry logging handler attached to vllm root logger")
             
             # Add filter to console handlers to exclude request/response logs (OTEL only)
+            # These logs go to OTEL collector but not to console to reduce clutter
             class ConsoleLogFilter(logging.Filter):
                 def filter(self, record):
                     msg = record.getMessage()
-                    # Exclude request/response logs from console (OTEL only)
+                    # Exclude payload logs from console (OTEL only)
                     if 'openai.request' in msg or 'openai.response' in msg:
                         return False
-                    if 'Generated response' in msg and 'chatcmpl-' in msg:
-                        return False
+                    # Exclude output logs from console for all APIs (OTEL only)
+                    # - chatcmpl-*: Chat Completion API
+                    # - cmpl-*: Completion API
+                    # - resp_*: Response API (uses underscore, not hyphen)
+                    if 'Generated response' in msg:
+                        if 'chatcmpl-' in msg or 'cmpl-' in msg or 'resp_' in msg:
+                            return False
                     return True
             
             # Apply filter to all existing console/stream handlers
