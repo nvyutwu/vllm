@@ -642,6 +642,44 @@ class OpenAIServingResponses(OpenAIServing):
                     status = "cancelled"
             else:
                 status = "incomplete"
+
+            # Output logging for Harmony models (gpt-oss)
+            if self.enable_log_outputs and self.request_logger:
+                for item in output:
+                    if isinstance(item, ResponseReasoningItem):
+                        # Log reasoning with [reasoning] prefix
+                        for content_item in item.content:
+                            if hasattr(content_item, 'text') and content_item.text:
+                                self.request_logger.log_outputs(
+                                    request_id=request.request_id,
+                                    outputs=f"[reasoning] {content_item.text}",
+                                    output_token_ids=None,
+                                    finish_reason=None,
+                                    is_streaming=False,
+                                    delta=False,
+                                )
+                    elif isinstance(item, ResponseOutputMessage):
+                        # Log content
+                        for content_item in item.content:
+                            if hasattr(content_item, 'text') and content_item.text:
+                                self.request_logger.log_outputs(
+                                    request_id=request.request_id,
+                                    outputs=content_item.text,
+                                    output_token_ids=None,
+                                    finish_reason="stop",
+                                    is_streaming=False,
+                                    delta=False,
+                                )
+                    elif isinstance(item, ResponseFunctionToolCall):
+                        # Log tool calls with [tool_calls] prefix
+                        self.request_logger.log_outputs(
+                            request_id=request.request_id,
+                            outputs=f"[tool_calls: {item.name}({item.arguments})]",
+                            output_token_ids=None,
+                            finish_reason="tool_calls",
+                            is_streaming=False,
+                            delta=False,
+                        )
         else:
             assert isinstance(context, SimpleContext)
             final_res = context.last_output
