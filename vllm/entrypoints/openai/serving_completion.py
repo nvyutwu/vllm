@@ -40,6 +40,7 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
+from vllm.utils import random_uuid
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
@@ -52,7 +53,6 @@ try:
     from vllm.entrypoints.harmony_utils import (
         get_stop_tokens_for_assistant_actions,
         get_streamable_parser_for_assistant,
-        parse_chat_output,
     )
     HARMONY_AVAILABLE = True
 except ImportError:
@@ -606,8 +606,11 @@ class OpenAIServingCompletion(OpenAIServing):
                                         function_name = "python"
                                     
                                     if function_name:
+                                        # Use cmpl-tool-* ID for Completion API (not chatcmpl-tool-*)
+                                        tool_call_id = f"cmpl-tool-{random_uuid()}"
                                         delta_tool_calls.append(
                                             ToolCall(
+                                                id=tool_call_id,
                                                 function=FunctionCall(
                                                     name=function_name,
                                                     arguments=tool_content,
@@ -627,7 +630,17 @@ class OpenAIServingCompletion(OpenAIServing):
                                     f"channel: {harmony_parser.current_channel}"
                                 )
                         else:
-                            delta_text = output.text
+                            # Parsing disabled - for gpt-oss models, decode with special tokens visible
+                            # so users can see the raw Harmony format
+                            if self.use_harmony and tokenizer is not None:
+                                try:
+                                    delta_text = tokenizer.decode(
+                                        list(output.token_ids), skip_special_tokens=False
+                                    )
+                                except Exception:
+                                    delta_text = output.text
+                            else:
+                                delta_text = output.text
                         
                         delta_token_ids = output.token_ids
                         out_logprobs = output.logprobs
@@ -887,73 +900,134 @@ class OpenAIServingCompletion(OpenAIServing):
                     # Parse Harmony output for non-streaming (similar to serving_chat.py)
                     # Only parse if VLLM_PARSE_HARMONY_OUTPUT is enabled (default: True)
                     if self.use_harmony and envs.VLLM_PARSE_HARMONY_OUTPUT:
-                        # Use parse_chat_output to extract reasoning and content
-                        # Similar to serving_chat.py line 1520
-                        reasoning, content, _ = parse_chat_output(token_ids)
-                        output_thinking = reasoning
-                        output_text = content or ""
+                        # Log raw model output tokens BEFORE parsing for debugging
+                        # This helps verify if text field issues are parser bugs or actual model output
+                        logger.debug(
+                            f"[Harmony Raw Output] token_ids ({len(token_ids)} tokens): {list(token_ids)}"
+                        )
+                        # Also decode and log the raw text for easier reading
+                        if tokenizer is not None:
+                            try:
+                                raw_decoded_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+                                logger.debug(
+                                    f"[Harmony Raw Output] decoded text (with special tokens):\n{raw_decoded_text}"
+                                )
+                            except Exception as e:
+                                logger.warning(f"[Harmony Raw Output] Failed to decode tokens: {e}")
                         
-                        # Parse tool calls from the token IDs
-                        # Similar to Ollama's approach - parse at completion
+                        # Parse messages from token IDs using Harmony parser
+                        # Route content by channel (matching streaming logic):
+                        # - final channel → output_text
+                        # - analysis channel (no tool recipient) → output_thinking
+                        # - commentary/analysis with tool recipient → tool_calls
                         parser = get_streamable_parser_for_assistant()
                         for token_id in token_ids:
                             parser.process(token_id)
                         
-                        # Extract tool calls from completed messages
-                        # Built-in tools can be on commentary OR analysis channel
+                        # Log parsed messages for debugging
+                        logger.debug(
+                            f"[Harmony Parsed] parser.messages ({len(parser.messages)} messages):"
+                        )
+                        for msg_idx, msg in enumerate(parser.messages):
+                            msg_content_text = msg.content[0].text if msg.content else ""
+                            logger.debug(
+                                f"  [{msg_idx}] channel={msg.channel}, recipient={msg.recipient}, "
+                                f"content={repr(msg_content_text[:200])}..."
+                            )
+                        
+                        # Extract content based on channel (like streaming does)
+                        thinking_parts = []
+                        final_parts = []
                         tool_calls_list = []
+                        
                         for msg in parser.messages:
-                            is_tool_call = False
-                            function_name = None
+                            msg_content = msg.content[0].text if msg.content else ""
+                            recipient = msg.recipient
                             
-                            # Check commentary channel for all tools
-                            if msg.channel == "commentary" and msg.recipient:
-                                is_tool_call = True
-                            # Check analysis channel for built-in tools (python, browser)
-                            elif msg.channel == "analysis" and msg.recipient:
-                                if msg.recipient.startswith("browser.") or msg.recipient == "python":
-                                    is_tool_call = True
-                            
-                            if is_tool_call and msg.recipient:
-                                # Parse both custom and built-in tools
-                                if msg.recipient.startswith("functions."):
+                            if msg.channel == "final":
+                                # Final channel content → output_text
+                                final_parts.append(msg_content)
+                            elif msg.channel == "analysis":
+                                # Check if it's a tool call on analysis channel
+                                if recipient and (recipient.startswith("browser.") or recipient == "python"):
+                                    # Built-in tool on analysis channel
+                                    function_name = recipient
+                                    tool_call_id = f"cmpl-tool-{random_uuid()}"
+                                    tool_calls_list.append(
+                                        ToolCall(
+                                            id=tool_call_id,
+                                            function=FunctionCall(
+                                                name=function_name,
+                                                arguments=msg_content,
+                                            )
+                                        )
+                                    )
+                                else:
+                                    # Regular reasoning content (no recipient or non-tool recipient)
+                                    thinking_parts.append(msg_content)
+                            elif msg.channel == "commentary" and recipient:
+                                # Tool call on commentary channel
+                                function_name = None
+                                if recipient.startswith("functions."):
                                     # Custom tools: functions.calc → "calc"
-                                    function_name = msg.recipient.split("functions.", 1)[1]
-                                elif msg.recipient.startswith("browser."):
+                                    function_name = recipient.split("functions.", 1)[1]
+                                elif recipient.startswith("browser."):
                                     # Built-in browser tools: browser.search → "browser.search"
-                                    function_name = msg.recipient
-                                elif msg.recipient == "python":
-                                    # Built-in python tool: python → "python"
+                                    function_name = recipient
+                                elif recipient == "python":
+                                    # Built-in python tool
                                     function_name = "python"
                                 
                                 if function_name:
-                                    arguments = msg.content[0].text if msg.content else ""
+                                    tool_call_id = f"cmpl-tool-{random_uuid()}"
                                     tool_calls_list.append(
                                         ToolCall(
+                                            id=tool_call_id,
                                             function=FunctionCall(
                                                 name=function_name,
-                                                arguments=arguments,
+                                                arguments=msg_content,
                                             )
                                         )
                                     )
                         
+                        # Also include any in-progress content from parser
+                        if parser.current_content:
+                            cur_channel = parser.current_channel
+                            cur_recipient = parser.current_recipient
+                            if cur_channel == "final":
+                                final_parts.append(parser.current_content)
+                            elif cur_channel == "analysis" and not cur_recipient:
+                                thinking_parts.append(parser.current_content)
+                        
+                        # Combine parts
+                        output_thinking = "\n".join(thinking_parts) if thinking_parts else None
+                        output_text = "".join(final_parts)
                         if tool_calls_list:
                             output_tool_calls = tool_calls_list
                         
+                        # Log final parsed result
                         if tool_calls_list:
                             tool_names = [tc.function.name for tc in tool_calls_list]
                             logger.debug(
-                                f"[Harmony Output] Parsed - content: {repr(output_text)}, "
-                                f"thinking: {repr(reasoning if reasoning else None)}, "
+                                f"[Harmony Output] Final parsed - content: {repr(output_text)}, "
+                                f"thinking: {repr(output_thinking)}, "
                                 f"tool_calls: {tool_names}"
                             )
                         else:
                             logger.debug(
-                                f"[Harmony Output] Parsed - content: {repr(output_text)}, "
-                                f"thinking: {repr(reasoning if reasoning else None)}"
+                                f"[Harmony Output] Final parsed - content: {repr(output_text)}, "
+                                f"thinking: {repr(output_thinking)}"
                             )
                     else:
-                        output_text = output.text
+                        # Parsing disabled - for gpt-oss models, decode with special tokens visible
+                        # so users can see the raw Harmony format (e.g., <|channel|>analysis<|message|>...)
+                        if self.use_harmony and tokenizer is not None:
+                            try:
+                                output_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+                            except Exception:
+                                output_text = output.text
+                        else:
+                            output_text = output.text
 
                 if request.logprobs is not None:
                     assert out_logprobs is not None, "Did not output logprobs"
