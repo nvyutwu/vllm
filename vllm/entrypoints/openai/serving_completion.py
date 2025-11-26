@@ -239,6 +239,8 @@ class OpenAIServingCompletion(OpenAIServing):
                     prompt_token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
                     
                     engine_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
+                    # Store the rendered prompt string for echo support
+                    engine_prompt["prompt"] = prompt_str
                     if request.cache_salt is not None:
                         engine_prompt["cache_salt"] = request.cache_salt
                     engine_prompts.append(engine_prompt)
@@ -851,6 +853,11 @@ class OpenAIServingCompletion(OpenAIServing):
 
             for output in final_res.outputs:
                 assert request.max_tokens is not None
+                
+                # Initialize Harmony-specific fields (must be before if/else for echo)
+                output_thinking = None
+                output_tool_calls = None
+                
                 if request.echo:
                     if request.return_token_ids:
                         prompt_text = ""
@@ -879,9 +886,6 @@ class OpenAIServingCompletion(OpenAIServing):
                     
                     # Parse Harmony output for non-streaming (similar to serving_chat.py)
                     # Only parse if VLLM_PARSE_HARMONY_OUTPUT is enabled (default: True)
-                    output_thinking = None
-                    output_tool_calls = None
-                    
                     if self.use_harmony and envs.VLLM_PARSE_HARMONY_OUTPUT:
                         # Use parse_chat_output to extract reasoning and content
                         # Similar to serving_chat.py line 1520
