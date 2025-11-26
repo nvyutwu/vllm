@@ -883,6 +883,16 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     s_tag_obj = structural_tag.model_dump(by_alias=True)
                     self.structured_outputs.structural_tag = json.dumps(s_tag_obj)
 
+        # Merge stop_token_ids from request with default_sampling_params
+        # This is critical for gpt-oss models which need Harmony stop tokens
+        stop_token_ids = list(self.stop_token_ids) if self.stop_token_ids else []
+        default_stop_token_ids = default_sampling_params.get("stop_token_ids", [])
+        if default_stop_token_ids:
+            # Add default stop tokens that are not already in the request
+            for token_id in default_stop_token_ids:
+                if token_id not in stop_token_ids:
+                    stop_token_ids.append(token_id)
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -899,7 +909,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
+            stop_token_ids=stop_token_ids if stop_token_ids else None,
             logprobs=self.top_logprobs if self.logprobs else None,
             prompt_logprobs=prompt_logprobs,
             ignore_eos=self.ignore_eos,
@@ -1387,6 +1397,27 @@ class CompletionRequest(OpenAIBaseModel):
             if len(kwargs) > 0:
                 self.structured_outputs = StructuredOutputsParams(**kwargs)
 
+        # Merge stop_token_ids from request with default_sampling_params
+        # This is critical for gpt-oss models which need Harmony stop tokens
+        request_stop_token_ids = list(self.stop_token_ids) if self.stop_token_ids else []
+        default_stop_token_ids = default_sampling_params.get("stop_token_ids", [])
+        stop_token_ids = list(request_stop_token_ids)  # Start with request tokens
+        if default_stop_token_ids:
+            # Add default stop tokens that are not already in the request
+            for token_id in default_stop_token_ids:
+                if token_id not in stop_token_ids:
+                    stop_token_ids.append(token_id)
+        
+        # Debug logging for stop parameters
+        logger.debug(
+            "[CompletionRequest] stop params: "
+            "stop(strings)=%s, stop_token_ids: request=%s, default=%s, merged=%s",
+            self.stop,
+            request_stop_token_ids,
+            default_stop_token_ids,
+            stop_token_ids,
+        )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -1403,7 +1434,7 @@ class CompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
+            stop_token_ids=stop_token_ids if stop_token_ids else None,
             logprobs=self.logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
