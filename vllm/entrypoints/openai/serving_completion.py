@@ -1339,9 +1339,13 @@ class OpenAIServingCompletion(OpenAIServing):
         request: CompletionRequest,
         max_input_length: int | None = None,
     ) -> RenderConfig:
-        max_input_tokens_len = self.max_model_len - (request.max_tokens or 0)
+        # Don't pre-validate input length based on max_tokens.
+        # This allows users to pass max_tokens up to the full context length,
+        # and get_max_tokens() will compute the actual available output tokens
+        # based on the real input length (max_model_len - input_length).
+        # Input validation still happens in the engine if input exceeds max_model_len.
         return RenderConfig(
-            max_length=max_input_tokens_len,
+            max_length=None,
             truncate_prompt_tokens=request.truncate_prompt_tokens,
             add_special_tokens=request.add_special_tokens,
             cache_salt=request.cache_salt,
