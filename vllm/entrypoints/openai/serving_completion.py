@@ -286,37 +286,12 @@ class OpenAIServingCompletion(OpenAIServing):
                 if self.default_sampling_params is None:
                     self.default_sampling_params = {}
 
-                # Check if max_tokens should be interpreted as total tokens
-                # (prompt + output) instead of max output tokens
-                original_max_tokens = None
-                if envs.VLLM_COMPLETION_MAX_TOKENS_IS_TOTAL and request.max_tokens is not None:
-                    # Interpret max_tokens as total tokens
-                    # Validate that max_tokens > input_length
-                    if request.max_tokens <= input_length:
-                        raise ValueError(
-                            f"max_tokens ({request.max_tokens}) must be greater than "
-                            f"input length ({input_length}). max_tokens represents total tokens (prompt + output)."
-                        )
-                    # Convert to output tokens by subtracting input length
-                    desired_output_tokens = request.max_tokens - input_length
-                    # Temporarily override request.max_tokens for get_max_tokens
-                    original_max_tokens = request.max_tokens
-                    request.max_tokens = desired_output_tokens
-                    logger.debug(
-                        f"[max_tokens as total] Converted max_tokens={original_max_tokens} "
-                        f"with input_length={input_length} to max_output_tokens={desired_output_tokens}"
-                    )
-
                 max_tokens = get_max_tokens(
                     max_model_len=self.max_model_len,
                     request=request,
                     input_length=input_length,
                     default_sampling_params=self.default_sampling_params,
                 )
-                
-                # Restore original max_tokens if we modified it for logging
-                if original_max_tokens is not None:
-                    request.max_tokens = original_max_tokens
 
                 sampling_params: SamplingParams | BeamSearchParams
                 if request.use_beam_search:
