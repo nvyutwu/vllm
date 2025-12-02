@@ -517,13 +517,14 @@ class OpenAIServingCompletion(OpenAIServing):
                     # with the echo implementation.
                     prompt_token_ids_to_return: list[int] | None = None
 
-                    assert request.max_tokens is not None
+                    # Note: request.max_tokens can be None if user wants full context
+                    # Only check for max_tokens == 0 (echo-only mode) if explicitly set
                     if request.echo and not has_echoed[i]:
                         assert prompt_token_ids is not None
                         if request.return_token_ids:
                             prompt_text = ""
                         assert prompt_text is not None
-                        if request.max_tokens == 0:
+                        if request.max_tokens is not None and request.max_tokens == 0:
                             # only return the prompt
                             delta_text = prompt_text
                             delta_token_ids = prompt_token_ids
@@ -865,7 +866,7 @@ class OpenAIServingCompletion(OpenAIServing):
             out_logprobs: GenericSequence[dict[int, Logprob] | None] | None
 
             for output in final_res.outputs:
-                assert request.max_tokens is not None
+                # Note: request.max_tokens can be None if user wants full context
                 
                 # Initialize Harmony-specific fields (must be before if/else for echo)
                 output_thinking = None
@@ -875,7 +876,8 @@ class OpenAIServingCompletion(OpenAIServing):
                     if request.return_token_ids:
                         prompt_text = ""
                     assert prompt_text is not None
-                    if request.max_tokens == 0:
+                    # Only check for max_tokens == 0 (echo-only mode) if explicitly set
+                    if request.max_tokens is not None and request.max_tokens == 0:
                         token_ids = prompt_token_ids
                         out_logprobs = prompt_logprobs
                         output_text = prompt_text
