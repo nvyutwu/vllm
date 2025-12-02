@@ -101,6 +101,10 @@ class OpenAIServingCompletion(OpenAIServing):
         self.use_harmony = HARMONY_AVAILABLE and self.model_config.hf_config.model_type == "gpt_oss"
         if self.use_harmony:
             logger.info("Enabling Harmony format for gpt-oss model in Completion API")
+            if envs.VLLM_RENDER_HARMONY_INPUT:
+                logger.info("Harmony input rendering is ENABLED (chat template will be applied)")
+            else:
+                logger.info("Harmony input rendering is DISABLED (raw prompt will be used)")
             if envs.VLLM_PARSE_HARMONY_OUTPUT:
                 logger.info("Harmony output parsing is ENABLED (thinking, content, tool_calls will be separated)")
             else:
@@ -194,11 +198,12 @@ class OpenAIServingCompletion(OpenAIServing):
             else:
                 tokenizer = await self.engine_client.get_tokenizer()
             
-            # Use Harmony format for gpt-oss models (similar to Ollama)
-            if self.use_harmony:
+            # Optionally apply chat template for gpt-oss models when enabled
+            # By default (VLLM_RENDER_HARMONY_INPUT=0), raw prompt is passed without rendering
+            if self.use_harmony and envs.VLLM_RENDER_HARMONY_INPUT:
                 from vllm.entrypoints.chat_utils import apply_hf_chat_template, ConversationMessage
                 
-                logger.info("Using Harmony format for gpt-oss model in Completion API")
+                logger.debug("Applying Harmony chat template to input")
                 
                 # Convert prompt to messages and use chat template (like Ollama does)
                 prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
