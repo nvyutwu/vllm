@@ -497,6 +497,10 @@ class StreamingHarmonyContext(HarmonyContext):
         self.encoding = get_encoding()
         self.last_tok = None
         self.first_tok_of_message = True
+        # For multi-turn: flag to reinitialize parser at start of new turn
+        self._reinit_parser_for_new_turn = False
+        # For multi-turn: message count baseline when parser was reinitialized
+        self._turn_base_message_count = 0
 
     @property
     def messages(self) -> list:
@@ -504,43 +508,51 @@ class StreamingHarmonyContext(HarmonyContext):
 
     def append_output(self, output: RequestOutput | list[Message]) -> None:
         if isinstance(output, RequestOutput):
-            # append_output is called for each output token in streaming case,
-            # so we only want to add the prompt tokens once for each message.
+            # Only count prompt tokens once per message
             if self.first_tok_of_message:
                 self._update_prefill_token_usage(output)
-            # Reset self.first_tok_of_message if needed:
-            # if the current token is the last one of the current message
-            # (finished=True), then the next token processed will mark the
-            # beginning of a new message
             self.first_tok_of_message = output.finished
-            for tok in output.outputs[0].token_ids:
+
+            # Reinitialize parser for new turn after tool call
+            if self._reinit_parser_for_new_turn:
+                self.parser = get_streamable_parser_for_assistant()
+                self._turn_base_message_count = (
+                    len(self._messages) - self.num_init_messages
+                )
+                self._reinit_parser_for_new_turn = False
+
+            token_ids = list(output.outputs[0].token_ids)
+            for tok in token_ids:
                 self.parser.process(tok)
             self._update_decode_token_usage(output)
 
-            # For streaming, update previous turn when message is complete
             if output.finished:
                 self.all_turn_metrics.append(self.current_turn_metrics.copy())
                 self.current_turn_metrics.reset()
-            # Check if the current token is part of reasoning content
             self._update_num_reasoning_tokens()
-            self.last_tok = tok
-            if len(self._messages) - self.num_init_messages < len(self.parser.messages):
-                self._messages.extend(
-                    self.parser.messages[len(self._messages) - self.num_init_messages :]
-                )
+
+            if token_ids:
+                self.last_tok = token_ids[-1]
+
+            # Extend _messages with new messages from parser
+            current_offset = (
+                len(self._messages)
+                - self.num_init_messages
+                - self._turn_base_message_count
+            )
+            if current_offset < len(self.parser.messages):
+                self._messages.extend(self.parser.messages[current_offset:])
         else:
-            # Handle the case of tool output in direct message format
+            # Tool output message
             assert len(output) == 1, "Tool output should be a single message"
             msg = output[0]
-            # Sometimes the recipient is not set for tool messages,
-            # so we set it to "assistant"
             if msg.author.role == Role.TOOL and msg.recipient is None:
                 msg.recipient = "assistant"
             toks = self.encoding.render(msg)
             for tok in toks:
                 self.parser.process(tok)
             self.last_tok = toks[-1]
-            # TODO: add tool_output messages to self._messages
+            self._messages.append(msg)
 
     def is_expecting_start(self) -> bool:
         return self.parser.state == StreamState.EXPECT_START
@@ -549,17 +561,7 @@ class StreamingHarmonyContext(HarmonyContext):
         return self.last_tok in self.encoding.stop_tokens_for_assistant_actions()
 
     def render_for_completion(self) -> list[int]:
-        # now this list of tokens as next turn's starting tokens
-        # `<|start|>assistant`,
-        # we need to process them in parser.
         rendered_tokens = super().render_for_completion()
-
-        last_n = -1
-        to_process = []
-        while rendered_tokens[last_n] != self.last_tok:
-            to_process.append(rendered_tokens[last_n])
-            last_n -= 1
-        for tok in reversed(to_process):
-            self.parser.process(tok)
-
+        # Flag parser reinitialization for next turn
+        self._reinit_parser_for_new_turn = True
         return rendered_tokens
