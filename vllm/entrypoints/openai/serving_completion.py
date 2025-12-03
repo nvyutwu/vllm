@@ -115,6 +115,10 @@ class OpenAIServingCompletion(OpenAIServing):
             self.default_sampling_params["stop_token_ids"].extend(
                 get_stop_tokens_for_assistant_actions()
             )
+            # For Completion API, show special tokens by default so users can see
+            # the raw Harmony format (e.g., <|channel|>analysis<|message|>...)
+            # This is different from Chat API where we parse and hide them.
+            self.default_sampling_params["skip_special_tokens"] = False
 
     async def create_completion(
         self,
@@ -559,38 +563,42 @@ class OpenAIServingCompletion(OpenAIServing):
                             harmony_parser = harmony_parsers[i]
                             prev_recipient = harmony_parser.current_recipient
                             
+                            # Use engine's output.text (which has proper UTF-8 incremental decoding)
+                            # instead of harmony_parser.last_content_delta (which decodes tokens individually)
                             for token_id in output.token_ids:
                                 harmony_parser.process(token_id)
-                                content_delta = harmony_parser.last_content_delta or ""
-                                
-                                # Route content based on channel (like Ollama's AddContent)
-                                cur_channel = harmony_parser.current_channel
-                                cur_recipient = harmony_parser.current_recipient
-                                
-                                if cur_channel == "final":
-                                    delta_text += content_delta
-                                elif cur_channel == "analysis":
-                                    # Check if it's a tool call on analysis channel (python can be on analysis)
-                                    if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
-                                        # Built-in tool on analysis channel
-                                        if i not in accumulated_tool_content:
-                                            accumulated_tool_content[i] = ""
-                                            current_tool_recipient[i] = cur_recipient
-                                        accumulated_tool_content[i] += content_delta
-                                    else:
-                                        # Regular reasoning content
-                                        delta_thinking += content_delta
-                                elif cur_channel == "commentary" and cur_recipient:
-                                    # Tool call content - accumulate for both custom and built-in tools
-                                    # Custom tools: functions.*
-                                    # Built-in tools: browser.*, python
-                                    if (cur_recipient.startswith("functions.") or 
-                                        cur_recipient.startswith("browser.") or 
-                                        cur_recipient == "python"):
-                                        if i not in accumulated_tool_content:
-                                            accumulated_tool_content[i] = ""
-                                            current_tool_recipient[i] = cur_recipient
-                                        accumulated_tool_content[i] += content_delta
+                            
+                            # Use properly decoded text from engine's detokenizer
+                            content_delta = output.text
+                            
+                            # Route content based on channel (like Ollama's AddContent)
+                            cur_channel = harmony_parser.current_channel
+                            cur_recipient = harmony_parser.current_recipient
+                            
+                            if cur_channel == "final":
+                                delta_text += content_delta
+                            elif cur_channel == "analysis":
+                                # Check if it's a tool call on analysis channel (python can be on analysis)
+                                if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
+                                    # Built-in tool on analysis channel
+                                    if i not in accumulated_tool_content:
+                                        accumulated_tool_content[i] = ""
+                                        current_tool_recipient[i] = cur_recipient
+                                    accumulated_tool_content[i] += content_delta
+                                else:
+                                    # Regular reasoning content
+                                    delta_thinking += content_delta
+                            elif cur_channel == "commentary" and cur_recipient:
+                                # Tool call content - accumulate for both custom and built-in tools
+                                # Custom tools: functions.*
+                                # Built-in tools: browser.*, python
+                                if (cur_recipient.startswith("functions.") or 
+                                    cur_recipient.startswith("browser.") or 
+                                    cur_recipient == "python"):
+                                    if i not in accumulated_tool_content:
+                                        accumulated_tool_content[i] = ""
+                                        current_tool_recipient[i] = cur_recipient
+                                    accumulated_tool_content[i] += content_delta
                             
                             # Parse tool calls only when done (use output.finish_reason)
                             if output.finish_reason is not None:
@@ -636,17 +644,11 @@ class OpenAIServingCompletion(OpenAIServing):
                                     f"channel: {harmony_parser.current_channel}"
                                 )
                         else:
-                            # Parsing disabled - for gpt-oss models, decode with special tokens visible
-                            # so users can see the raw Harmony format
-                            if self.use_harmony and tokenizer is not None:
-                                try:
-                                    delta_text = tokenizer.decode(
-                                        list(output.token_ids), skip_special_tokens=False
-                                    )
-                                except Exception:
-                                    delta_text = output.text
-                            else:
-                                delta_text = output.text
+                            # The engine's detokenizer handles incremental UTF-8 decoding correctly,
+                            # preventing "��" (U+FFFD) for multi-byte characters like emojis.
+                            # Note: output.text uses skip_special_tokens=True by default in SamplingParams,
+                            # so Harmony format special tokens won't be visible unless you override it.
+                            delta_text = output.text
                         
                         delta_token_ids = output.token_ids
                         out_logprobs = output.logprobs
@@ -678,7 +680,15 @@ class OpenAIServingCompletion(OpenAIServing):
                     else:
                         logprobs = None
 
-                    previous_text_lens[i] += len(output.text)
+                    # Track text length using actual delta being sent, not output.text
+                    # When Harmony parsing is active, delta_text may differ from output.text
+                    # (output.text can contain incomplete UTF-8 like "��" during streaming)
+                    if self.use_harmony and harmony_parsers is not None and envs.VLLM_PARSE_HARMONY_OUTPUT:
+                        text_len_delta = len(delta_text)
+                    else:
+                        text_len_delta = len(output.text)
+                    
+                    previous_text_lens[i] += text_len_delta
                     previous_num_tokens[i] += len(output.token_ids)
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
@@ -901,39 +911,71 @@ class OpenAIServingCompletion(OpenAIServing):
 
                         # For gpt-oss with Harmony parsing enabled:
                         # Parse only the GENERATED portion, then combine with echoed prompt
+                        #
+                        # IMPORTANT: Track token IDs per channel instead of using parser's decoded text.
+                        # The parser decodes tokens individually which breaks multi-byte UTF-8 characters
                         if self.use_harmony and envs.VLLM_PARSE_HARMONY_OUTPUT:
                             # Parse the generated tokens to extract thinking/content/tool_calls
                             parser = get_streamable_parser_for_assistant()
+                            
+                            # Track token IDs per channel for proper UTF-8 decoding
+                            thinking_tokens: list[int] = []
+                            final_tokens: list[int] = []
+                            tool_calls_data: list[tuple[str, list[int]]] = []
+                            current_tool_tokens: list[int] = []
+                            current_tool_recipient: str | None = None
+                            prev_recipient: str | None = None
+                            
                             for token_id in output.token_ids:
                                 parser.process(token_id)
-                            
-                            # Extract content based on channel (same logic as non-echo case)
-                            thinking_parts = []
-                            final_parts = []
-                            tool_calls_list = []
-                            
-                            for msg in parser.messages:
-                                msg_content = msg.content[0].text if msg.content else ""
-                                recipient = msg.recipient
                                 
-                                if msg.channel == "final":
-                                    final_parts.append(msg_content)
-                                elif msg.channel == "analysis":
-                                    if recipient and (recipient.startswith("browser.") or recipient == "python"):
-                                        function_name = recipient
-                                        tool_call_id = f"cmpl-tool-{random_uuid()}"
-                                        tool_calls_list.append(
-                                            ToolCall(
-                                                id=tool_call_id,
-                                                function=FunctionCall(
-                                                    name=function_name,
-                                                    arguments=msg_content,
-                                                )
-                                            )
-                                        )
+                                cur_channel = parser.current_channel
+                                cur_recipient = parser.current_recipient
+                                
+                                # Detect tool call boundary (recipient change)
+                                if cur_recipient != prev_recipient:
+                                    if current_tool_tokens and prev_recipient:
+                                        if (prev_recipient.startswith("functions.") or 
+                                            prev_recipient.startswith("browser.") or 
+                                            prev_recipient == "python"):
+                                            tool_calls_data.append((prev_recipient, list(current_tool_tokens)))
+                                    current_tool_tokens = []
+                                
+                                # Route token based on channel
+                                if cur_channel == "final":
+                                    final_tokens.append(token_id)
+                                elif cur_channel == "analysis":
+                                    if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
+                                        current_tool_tokens.append(token_id)
+                                        current_tool_recipient = cur_recipient
                                     else:
-                                        thinking_parts.append(msg_content)
-                                elif msg.channel == "commentary" and recipient:
+                                        thinking_tokens.append(token_id)
+                                elif cur_channel == "commentary" and cur_recipient:
+                                    if (cur_recipient.startswith("functions.") or 
+                                        cur_recipient.startswith("browser.") or 
+                                        cur_recipient == "python"):
+                                        current_tool_tokens.append(token_id)
+                                        current_tool_recipient = cur_recipient
+                                
+                                prev_recipient = cur_recipient
+                            
+                            # Handle any remaining tool call tokens
+                            if current_tool_tokens and current_tool_recipient:
+                                tool_calls_data.append((current_tool_recipient, list(current_tool_tokens)))
+                            
+                            # Decode using tokenizer (handles multi-byte UTF-8 correctly)
+                            parsed_content = ""
+                            tool_calls_list: list[ToolCall] = []
+                            
+                            if tokenizer is not None:
+                                if final_tokens:
+                                    parsed_content = tokenizer.decode(final_tokens, skip_special_tokens=False)
+                                if thinking_tokens:
+                                    output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=False)
+                                
+                                # Build tool calls with properly decoded arguments
+                                for recipient, tool_tokens in tool_calls_data:
+                                    tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=True)
                                     function_name = None
                                     if recipient.startswith("functions."):
                                         function_name = recipient.split("functions.", 1)[1]
@@ -949,23 +991,12 @@ class OpenAIServingCompletion(OpenAIServing):
                                                 id=tool_call_id,
                                                 function=FunctionCall(
                                                     name=function_name,
-                                                    arguments=msg_content,
+                                                    arguments=tool_content,
                                                 )
                                             )
                                         )
                             
-                            # Include in-progress content
-                            if parser.current_content:
-                                cur_channel = parser.current_channel
-                                cur_recipient = parser.current_recipient
-                                if cur_channel == "final":
-                                    final_parts.append(parser.current_content)
-                                elif cur_channel == "analysis" and not cur_recipient:
-                                    thinking_parts.append(parser.current_content)
-                            
                             # Combine: echo prompt + parsed final content
-                            output_thinking = "\n".join(thinking_parts) if thinking_parts else None
-                            parsed_content = "".join(final_parts)
                             output_text = prompt_text + parsed_content
                             if tool_calls_list:
                                 output_tool_calls = tool_calls_list
@@ -1014,62 +1045,77 @@ class OpenAIServingCompletion(OpenAIServing):
                         # - final channel → output_text
                         # - analysis channel (no tool recipient) → output_thinking
                         # - commentary/analysis with tool recipient → tool_calls
+                        #
+                        # IMPORTANT: Track token IDs per channel instead of using parser's decoded text.
+                        # The parser decodes tokens individually which breaks multi-byte UTF-8 characters
                         parser = get_streamable_parser_for_assistant()
+                        
+                        # Track token IDs per channel for proper UTF-8 decoding
+                        thinking_tokens: list[int] = []
+                        final_tokens: list[int] = []
+                        tool_calls_data: list[tuple[str, list[int]]] = []  # [(recipient, token_ids), ...]
+                        current_tool_tokens: list[int] = []
+                        current_tool_recipient: str | None = None
+                        prev_recipient: str | None = None
+                        
                         for token_id in token_ids:
                             parser.process(token_id)
-                        
-                        # Log parsed messages for debugging
-                        logger.debug(
-                            f"[Harmony Parsed] parser.messages ({len(parser.messages)} messages):"
-                        )
-                        for msg_idx, msg in enumerate(parser.messages):
-                            msg_content_text = msg.content[0].text if msg.content else ""
-                            logger.debug(
-                                f"  [{msg_idx}] channel={msg.channel}, recipient={msg.recipient}, "
-                                f"content={repr(msg_content_text[:200])}..."
-                            )
-                        
-                        # Extract content based on channel (like streaming does)
-                        thinking_parts = []
-                        final_parts = []
-                        tool_calls_list = []
-                        
-                        for msg in parser.messages:
-                            msg_content = msg.content[0].text if msg.content else ""
-                            recipient = msg.recipient
                             
-                            if msg.channel == "final":
-                                # Final channel content → output_text
-                                final_parts.append(msg_content)
-                            elif msg.channel == "analysis":
-                                # Check if it's a tool call on analysis channel
-                                if recipient and (recipient.startswith("browser.") or recipient == "python"):
-                                    # Built-in tool on analysis channel
-                                    function_name = recipient
-                                    tool_call_id = f"cmpl-tool-{random_uuid()}"
-                                    tool_calls_list.append(
-                                        ToolCall(
-                                            id=tool_call_id,
-                                            function=FunctionCall(
-                                                name=function_name,
-                                                arguments=msg_content,
-                                            )
-                                        )
-                                    )
+                            cur_channel = parser.current_channel
+                            cur_recipient = parser.current_recipient
+                            
+                            # Detect tool call boundary (recipient change)
+                            if cur_recipient != prev_recipient:
+                                if current_tool_tokens and prev_recipient:
+                                    if (prev_recipient.startswith("functions.") or 
+                                        prev_recipient.startswith("browser.") or 
+                                        prev_recipient == "python"):
+                                        tool_calls_data.append((prev_recipient, list(current_tool_tokens)))
+                                current_tool_tokens = []
+                            
+                            # Route token based on channel
+                            if cur_channel == "final":
+                                final_tokens.append(token_id)
+                            elif cur_channel == "analysis":
+                                if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
+                                    current_tool_tokens.append(token_id)
+                                    current_tool_recipient = cur_recipient
                                 else:
-                                    # Regular reasoning content (no recipient or non-tool recipient)
-                                    thinking_parts.append(msg_content)
-                            elif msg.channel == "commentary" and recipient:
-                                # Tool call on commentary channel
+                                    thinking_tokens.append(token_id)
+                            elif cur_channel == "commentary" and cur_recipient:
+                                if (cur_recipient.startswith("functions.") or 
+                                    cur_recipient.startswith("browser.") or 
+                                    cur_recipient == "python"):
+                                    current_tool_tokens.append(token_id)
+                                    current_tool_recipient = cur_recipient
+                            
+                            prev_recipient = cur_recipient
+                        
+                        # Handle any remaining tool call tokens
+                        if current_tool_tokens and current_tool_recipient:
+                            tool_calls_data.append((current_tool_recipient, list(current_tool_tokens)))
+                        
+                        # Decode using tokenizer (handles multi-byte UTF-8 correctly)
+                        # Use skip_special_tokens=False for Completion API to show Harmony markers
+                        output_text = ""
+                        output_thinking = None
+                        tool_calls_list: list[ToolCall] = []
+                        
+                        if tokenizer is not None:
+                            if final_tokens:
+                                output_text = tokenizer.decode(final_tokens, skip_special_tokens=False)
+                            if thinking_tokens:
+                                output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=False)
+                            
+                            # Build tool calls with properly decoded arguments
+                            for recipient, tool_tokens in tool_calls_data:
+                                tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=False)
                                 function_name = None
                                 if recipient.startswith("functions."):
-                                    # Custom tools: functions.calc → "calc"
                                     function_name = recipient.split("functions.", 1)[1]
                                 elif recipient.startswith("browser."):
-                                    # Built-in browser tools: browser.search → "browser.search"
                                     function_name = recipient
                                 elif recipient == "python":
-                                    # Built-in python tool
                                     function_name = "python"
                                 
                                 if function_name:
@@ -1079,23 +1125,11 @@ class OpenAIServingCompletion(OpenAIServing):
                                             id=tool_call_id,
                                             function=FunctionCall(
                                                 name=function_name,
-                                                arguments=msg_content,
+                                                arguments=tool_content,
                                             )
                                         )
                                     )
                         
-                        # Also include any in-progress content from parser
-                        if parser.current_content:
-                            cur_channel = parser.current_channel
-                            cur_recipient = parser.current_recipient
-                            if cur_channel == "final":
-                                final_parts.append(parser.current_content)
-                            elif cur_channel == "analysis" and not cur_recipient:
-                                thinking_parts.append(parser.current_content)
-                        
-                        # Combine parts
-                        output_thinking = "\n".join(thinking_parts) if thinking_parts else None
-                        output_text = "".join(final_parts)
                         if tool_calls_list:
                             output_tool_calls = tool_calls_list
                         

@@ -893,6 +893,12 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 if token_id not in stop_token_ids:
                     stop_token_ids.append(token_id)
 
+        # Use skip_special_tokens from default_sampling_params if provided
+        # This allows gpt-oss models to override the default True value
+        skip_special_tokens = default_sampling_params.get(
+            "skip_special_tokens", self.skip_special_tokens
+        )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -915,7 +921,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens,
             min_tokens=self.min_tokens,
-            skip_special_tokens=self.skip_special_tokens,
+            skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             logits_processors=get_logits_processors(
                 self.logits_processors, logits_processor_pattern
@@ -1418,6 +1424,12 @@ class CompletionRequest(OpenAIBaseModel):
             stop_token_ids,
         )
 
+        # Use skip_special_tokens from default_sampling_params if provided
+        # This allows gpt-oss models to override the default True value
+        skip_special_tokens = default_sampling_params.get(
+            "skip_special_tokens", self.skip_special_tokens
+        )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -1440,7 +1452,7 @@ class CompletionRequest(OpenAIBaseModel):
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
             prompt_logprobs=prompt_logprobs,
-            skip_special_tokens=self.skip_special_tokens,
+            skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
             logits_processors=get_logits_processors(
