@@ -761,10 +761,16 @@ class OpenAIServingChat(OpenAIServing):
                     if self.use_harmony:
                         harmony_parser = harmony_parsers[i]
                         prev_recipient = harmony_parser.current_recipient
-                        delta_text = ""
+                        
+                        # Use engine's output.text (which has proper UTF-8 incremental decoding)
+                        # instead of harmony_parser.last_content_delta (which decodes tokens individually
+                        # and can produce "��" for multi-byte UTF-8 like emojis)
+                        # We process tokens through parser to track channel/recipient state only
                         for token_id in output.token_ids:
                             harmony_parser.process(token_id)
-                            delta_text += harmony_parser.last_content_delta or ""
+                        
+                        # Use properly decoded text from engine's detokenizer
+                        delta_text = output.text
                         cur_channel = harmony_parser.current_channel
                         cur_recipient = harmony_parser.current_recipient
                     else:
@@ -1518,6 +1524,21 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
 
             if self.use_harmony:
+                # Debug logging: raw model output for gpt-oss
+                logger.debug(
+                    "[Harmony Raw Output] token_ids (%d tokens): %s",
+                    len(token_ids), list(token_ids)
+                )
+                # Decode raw text for easier reading
+                try:
+                    raw_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+                    logger.debug(
+                        "[Harmony Raw Output] decoded text (with special tokens):\n%s",
+                        raw_text
+                    )
+                except Exception as e:
+                    logger.debug("[Harmony Raw Output] Failed to decode: %s", e)
+                
                 reasoning, content, _ = parse_chat_output(token_ids)
                 if not request.include_reasoning:
                     reasoning = None
@@ -1986,9 +2007,17 @@ class OpenAIServingChat(OpenAIServing):
         )
         messages.append(sys_msg)
 
-        # Add developer message.
-        dev_msg = get_developer_message(tools=tools_for_prompt)
-        messages.append(dev_msg)
+        # Add developer message only if there are function tools
+        # Check if tools_for_prompt contains any "function" type tools
+        has_function_tools = False
+        if tools_for_prompt:
+            has_function_tools = any(
+                tool.type == "function" for tool in tools_for_prompt
+            )
+        
+        if has_function_tools:
+            dev_msg = get_developer_message(tools=tools_for_prompt)
+            messages.append(dev_msg)
 
         # Add user message.
         for chat_msg in request.messages:
