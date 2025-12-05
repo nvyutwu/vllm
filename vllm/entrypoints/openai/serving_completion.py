@@ -119,6 +119,13 @@ class OpenAIServingCompletion(OpenAIServing):
             # the raw Harmony format (e.g., <|channel|>analysis<|message|>...)
             # This is different from Chat API where we parse and hide them.
             self.default_sampling_params["skip_special_tokens"] = False
+            
+            # Cache EOS token IDs for efficient detection in streaming
+            # gpt-oss has two EOS tokens: <|call|> for tool calls, <|return|> for other contents
+            # These are excluded from output.text but should be included when skip_special_tokens=False
+            self.harmony_eos_token_ids: list[int] = []
+        else:
+            self.harmony_eos_token_ids = []
 
     async def create_completion(
         self,
@@ -201,6 +208,20 @@ class OpenAIServingCompletion(OpenAIServing):
                 tokenizer = None
             else:
                 tokenizer = await self.engine_client.get_tokenizer()
+            
+            # Initialize EOS token IDs for gpt-oss on first request (lazy initialization)
+            if self.use_harmony and not self.harmony_eos_token_ids and tokenizer is not None:
+                try:
+                    call_token_id = tokenizer.convert_tokens_to_ids("<|call|>")
+                    return_token_id = tokenizer.convert_tokens_to_ids("<|return|>")
+                    if call_token_id != tokenizer.unk_token_id:
+                        self.harmony_eos_token_ids.append(call_token_id)
+                        logger.info(f"Cached gpt-oss EOS token <|call|> with ID: {call_token_id}")
+                    if return_token_id != tokenizer.unk_token_id:
+                        self.harmony_eos_token_ids.append(return_token_id)
+                        logger.info(f"Cached gpt-oss EOS token <|return|> with ID: {return_token_id}")
+                except Exception as e:
+                    logger.warning(f"Failed to cache gpt-oss EOS token IDs: {e}")
             
             # Optionally apply chat template for gpt-oss models when enabled
             # By default (VLLM_RENDER_HARMONY_INPUT=0), raw prompt is passed without rendering
@@ -646,9 +667,28 @@ class OpenAIServingCompletion(OpenAIServing):
                         else:
                             # The engine's detokenizer handles incremental UTF-8 decoding correctly,
                             # preventing "��" (U+FFFD) for multi-byte characters like emojis.
-                            # Note: output.text uses skip_special_tokens=True by default in SamplingParams,
-                            # so Harmony format special tokens won't be visible unless you override it.
+                            # Use engine's output.text for content (correct UTF-8 handling)
                             delta_text = output.text
+                            
+                            # Determine skip_special_tokens following the same priority as to_sampling_params
+                            if request.skip_special_tokens is not None:
+                                should_skip_special_tokens = request.skip_special_tokens
+                            else:
+                                should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
+                            
+                            # For gpt-oss: Append EOS tokens explicitly only when skip_special_tokens=False
+                            # (they're excluded from output.text but should be included when showing special tokens)
+                            # EOS tokens (<|call|>, <|return|>) are complete tokens, safe to decode individually
+                            if (self.use_harmony and self.harmony_eos_token_ids and tokenizer is not None 
+                                and not should_skip_special_tokens):
+                                for token_id in output.token_ids:
+                                    if token_id in self.harmony_eos_token_ids:
+                                        try:
+                                            eos_str = tokenizer.decode([token_id], skip_special_tokens=False)
+                                            delta_text += eos_str
+                                            logger.debug(f"[Harmony Streaming] Appended EOS token: {repr(eos_str)}")
+                                        except Exception as e:
+                                            logger.warning(f"Failed to decode EOS token {token_id}: {e}")
                         
                         delta_token_ids = output.token_ids
                         out_logprobs = output.logprobs
@@ -964,18 +1004,25 @@ class OpenAIServingCompletion(OpenAIServing):
                                 tool_calls_data.append((current_tool_recipient, list(current_tool_tokens)))
                             
                             # Decode using tokenizer (handles multi-byte UTF-8 correctly)
+                            # Respect user's skip_special_tokens setting even when parsing is enabled
+                            # Determine skip_special_tokens following the same priority as to_sampling_params
+                            if request.skip_special_tokens is not None:
+                                should_skip_special_tokens = request.skip_special_tokens
+                            else:
+                                should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
+                            
                             parsed_content = ""
                             tool_calls_list: list[ToolCall] = []
                             
                             if tokenizer is not None:
                                 if final_tokens:
-                                    parsed_content = tokenizer.decode(final_tokens, skip_special_tokens=False)
+                                    parsed_content = tokenizer.decode(final_tokens, skip_special_tokens=should_skip_special_tokens)
                                 if thinking_tokens:
-                                    output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=False)
+                                    output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=should_skip_special_tokens)
                                 
                                 # Build tool calls with properly decoded arguments
                                 for recipient, tool_tokens in tool_calls_data:
-                                    tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=True)
+                                    tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=should_skip_special_tokens)
                                     function_name = None
                                     if recipient.startswith("functions."):
                                         function_name = recipient.split("functions.", 1)[1]
@@ -1006,12 +1053,17 @@ class OpenAIServingCompletion(OpenAIServing):
                                 f"content: {repr(parsed_content)}, thinking: {repr(output_thinking)}"
                             )
                         else:
-                            # Parsing disabled with echo - decode output with special tokens
-                            # to match the prompt format (which has special tokens visible)
+                            # Parsing disabled with echo - decode output respecting skip_special_tokens
+                            # Determine skip_special_tokens following the same priority as to_sampling_params
+                            if request.skip_special_tokens is not None:
+                                should_skip_special_tokens = request.skip_special_tokens
+                            else:
+                                should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
+                            
                             if self.use_harmony and tokenizer is not None:
                                 try:
                                     generated_text = tokenizer.decode(
-                                        list(output.token_ids), skip_special_tokens=False
+                                        list(output.token_ids), skip_special_tokens=should_skip_special_tokens
                                     )
                                     output_text = prompt_text + generated_text
                                 except Exception:
@@ -1096,20 +1148,26 @@ class OpenAIServingCompletion(OpenAIServing):
                             tool_calls_data.append((current_tool_recipient, list(current_tool_tokens)))
                         
                         # Decode using tokenizer (handles multi-byte UTF-8 correctly)
-                        # Use skip_special_tokens=False for Completion API to show Harmony markers
+                        # Respect user's skip_special_tokens setting even when parsing is enabled
+                        # Determine skip_special_tokens following the same priority as to_sampling_params
+                        if request.skip_special_tokens is not None:
+                            should_skip_special_tokens = request.skip_special_tokens
+                        else:
+                            should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
+                        
                         output_text = ""
                         output_thinking = None
                         tool_calls_list: list[ToolCall] = []
                         
                         if tokenizer is not None:
                             if final_tokens:
-                                output_text = tokenizer.decode(final_tokens, skip_special_tokens=False)
+                                output_text = tokenizer.decode(final_tokens, skip_special_tokens=should_skip_special_tokens)
                             if thinking_tokens:
-                                output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=False)
+                                output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=should_skip_special_tokens)
                             
                             # Build tool calls with properly decoded arguments
                             for recipient, tool_tokens in tool_calls_data:
-                                tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=False)
+                                tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=should_skip_special_tokens)
                                 function_name = None
                                 if recipient.startswith("functions."):
                                     function_name = recipient.split("functions.", 1)[1]
@@ -1147,11 +1205,16 @@ class OpenAIServingCompletion(OpenAIServing):
                                 f"thinking: {repr(output_thinking)}"
                             )
                     else:
-                        # Parsing disabled - for gpt-oss models, decode with special tokens visible
-                        # so users can see the raw Harmony format (e.g., <|channel|>analysis<|message|>...)
+                        # Parsing disabled - for gpt-oss models, decode with skip_special_tokens from request
+                        # Determine skip_special_tokens following the same priority as to_sampling_params
+                        if request.skip_special_tokens is not None:
+                            should_skip_special_tokens = request.skip_special_tokens
+                        else:
+                            should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
+                        
                         if self.use_harmony and tokenizer is not None:
                             try:
-                                output_text = tokenizer.decode(token_ids, skip_special_tokens=False)
+                                output_text = tokenizer.decode(token_ids, skip_special_tokens=should_skip_special_tokens)
                             except Exception:
                                 output_text = output.text
                         else:

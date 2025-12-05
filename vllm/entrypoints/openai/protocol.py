@@ -575,7 +575,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool | None = None
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1)] | None = None
     prompt_logprobs: int | None = None
@@ -893,11 +893,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 if token_id not in stop_token_ids:
                     stop_token_ids.append(token_id)
 
-        # Use skip_special_tokens from default_sampling_params if provided
-        # This allows gpt-oss models to override the default True value
-        skip_special_tokens = default_sampling_params.get(
-            "skip_special_tokens", self.skip_special_tokens
-        )
+        # Priority: user's explicit value > model's default > True (standard default)
+        # If user explicitly sets skip_special_tokens, use it
+        # Otherwise, use model's default (e.g., False for gpt-oss to show Harmony format)
+        if self.skip_special_tokens is not None:
+            skip_special_tokens = self.skip_special_tokens
+        else:
+            skip_special_tokens = default_sampling_params.get(
+                "skip_special_tokens", True
+            )
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
@@ -1149,7 +1153,7 @@ class CompletionRequest(OpenAIBaseModel):
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool | None = None
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1)] | None = None
     allowed_token_ids: list[int] | None = None
@@ -1424,11 +1428,15 @@ class CompletionRequest(OpenAIBaseModel):
             stop_token_ids,
         )
 
-        # Use skip_special_tokens from default_sampling_params if provided
-        # This allows gpt-oss models to override the default True value
-        skip_special_tokens = default_sampling_params.get(
-            "skip_special_tokens", self.skip_special_tokens
-        )
+        # Priority: user's explicit value > model's default > True (standard default)
+        # If user explicitly sets skip_special_tokens, use it
+        # Otherwise, use model's default (e.g., False for gpt-oss to show Harmony format)
+        if self.skip_special_tokens is not None:
+            skip_special_tokens = self.skip_special_tokens
+        else:
+            skip_special_tokens = default_sampling_params.get(
+                "skip_special_tokens", True
+            )
 
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
