@@ -141,6 +141,20 @@ class OpenAIServingCompletion(OpenAIServing):
             - suffix (the language models we currently support do not support
             suffix)
         """
+        # DEBUG: Log the raw incoming request
+        logger.debug(
+            f"[Tokenizer Debug - Input] Received completion request:\n"
+            f"  prompt type: {type(request.prompt)}\n"
+            f"  prompt (first 200 chars): {repr(str(request.prompt)[:200]) if request.prompt else None}\n"
+            f"  add_special_tokens: {request.add_special_tokens}\n"
+            f"  model: {request.model}"
+        )
+        if isinstance(request.prompt, list) and request.prompt and isinstance(request.prompt[0], int):
+            logger.debug(
+                f"[Tokenizer Debug - Input] Prompt is already tokenized:\n"
+                f"  token_ids ({len(request.prompt)} tokens): {request.prompt}"
+            )
+        
         error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             return error_check_ret
@@ -281,6 +295,45 @@ class OpenAIServingCompletion(OpenAIServing):
                     prompt_embeds=request.prompt_embeds,
                     config=self._build_render_config(request),
                 )
+                
+                # DEBUG: Log raw input token IDs after rendering/tokenization
+                for idx, engine_prompt in enumerate(engine_prompts):
+                    _, prompt_token_ids, _ = self._get_prompt_components(engine_prompt)
+                    if prompt_token_ids is not None:
+                        logger.debug(
+                            f"[Tokenizer Debug] Prompt #{idx} - Raw token IDs after rendering ({len(prompt_token_ids)} tokens):\n"
+                            f"  Token IDs: {list(prompt_token_ids)}"
+                        )
+                        # Also decode to show what text these tokens represent
+                        if tokenizer is not None:
+                            try:
+                                decoded_text = tokenizer.decode(prompt_token_ids, skip_special_tokens=False)
+                                logger.debug(
+                                    f"[Tokenizer Debug] Prompt #{idx} - Decoded text (with special tokens):\n"
+                                    f"  {repr(decoded_text)}"
+                                )
+                                
+                                # Specifically decode the suspicious tokens: 40791, 2152
+                                suspicious_tokens = [40791, 2152]
+                                for token_id in suspicious_tokens:
+                                    try:
+                                        token_str = tokenizer.decode([token_id], skip_special_tokens=False)
+                                        logger.debug(
+                                            f"[Tokenizer Debug] Token {token_id} decodes to: {repr(token_str)}"
+                                        )
+                                    except Exception:
+                                        pass
+                                        
+                                # Check if these tokens are in the prompt
+                                if 40791 in prompt_token_ids:
+                                    idx_40791 = list(prompt_token_ids).index(40791)
+                                    logger.debug(f"[Tokenizer Debug] Token 40791 found at position {idx_40791}")
+                                if 2152 in prompt_token_ids:
+                                    idx_2152 = list(prompt_token_ids).index(2152)
+                                    logger.debug(f"[Tokenizer Debug] Token 2152 found at position {idx_2152}")
+                                    
+                            except Exception as e:
+                                logger.debug(f"[Tokenizer Debug] Failed to decode: {e}")
         except ValueError as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))

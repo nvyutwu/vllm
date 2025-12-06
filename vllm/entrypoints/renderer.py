@@ -319,7 +319,18 @@ class CompletionRenderer(BaseRenderer):
         cache_salt: str | None,
     ) -> EngineTokensPrompt:
         """Tokenize text input asynchronously."""
+        from vllm.logger import init_logger
+        logger = init_logger(__name__)
+        
         async_tokenizer = self._get_async_tokenizer()
+
+        # DEBUG: Log tokenization parameters
+        logger.debug(
+            f"[Tokenizer Debug - Renderer] Tokenizing text input:\n"
+            f"  text: {repr(text[:200])}{'...' if len(text) > 200 else ''}\n"
+            f"  add_special_tokens: {add_special_tokens}\n"
+            f"  truncate_prompt_tokens: {truncate_prompt_tokens}"
+        )
 
         # Handle encoder-specific preprocessing
         if (
@@ -338,6 +349,29 @@ class CompletionRenderer(BaseRenderer):
                 truncation=True,
                 max_length=truncate_prompt_tokens,
             )
+
+        # DEBUG: Log the tokenized result
+        logger.debug(
+            f"[Tokenizer Debug - Renderer] Tokenization result:\n"
+            f"  token_ids ({len(encoded.input_ids)} tokens): {encoded.input_ids}\n"
+            f"  First 5 tokens: {encoded.input_ids[:5]}\n"
+            f"  Last 5 tokens: {encoded.input_ids[-5:]}"
+        )
+        
+        # DEBUG: Try to decode individual tokens to understand what they are
+        if hasattr(async_tokenizer, 'tokenizer'):
+            try:
+                tokenizer = async_tokenizer.tokenizer
+                # Decode first and last few tokens individually
+                first_tokens_decoded = [tokenizer.decode([tid], skip_special_tokens=False) for tid in encoded.input_ids[:5]]
+                last_tokens_decoded = [tokenizer.decode([tid], skip_special_tokens=False) for tid in encoded.input_ids[-5:]]
+                logger.debug(
+                    f"[Tokenizer Debug - Renderer] Decoded tokens:\n"
+                    f"  First 5 decoded: {first_tokens_decoded}\n"
+                    f"  Last 5 decoded: {last_tokens_decoded}"
+                )
+            except Exception as e:
+                logger.debug(f"[Tokenizer Debug - Renderer] Failed to decode tokens: {e}")
 
         return self._create_tokens_prompt(
             encoded.input_ids, max_length, cache_salt, text
