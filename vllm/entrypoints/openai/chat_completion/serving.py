@@ -13,6 +13,7 @@ from typing import Any, Final
 import jinja2
 import partial_json_parser
 import regex as re
+from pathlib import Path
 from fastapi import Request
 from openai_harmony import Message as OpenAIMessage
 from partial_json_parser.core.options import Allow
@@ -361,6 +362,32 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        # Register NVCF assets (videos/images) if provided via request headers.
+        if raw_request is not None:
+            from vllm.multimodal.utils import MediaConnector
+            headers = raw_request.headers
+            asset_dir = headers.get("NVCF-ASSET-DIR")
+            asset_ids_hdr = headers.get("NVCF-FUNCTION-ASSET-IDS")
+
+            if asset_dir and asset_ids_hdr:
+                # Set asset mapping without validation (validated later)
+                nvcf_asset_dir = Path(asset_dir)
+                asset_ids = [aid.strip() for aid in asset_ids_hdr.split(",") if aid.strip()]
+                MediaConnector.set_default_nvcf_assets({aid: nvcf_asset_dir / aid for aid in asset_ids})
+            else:
+                # Clear the default assets if not provided in the current request.
+                MediaConnector.set_default_nvcf_assets(None)
+
+        # Resolve NVCF media assets (images/videos) in-place before preprocessing.
+        # This handles both structured content and HTML tags (<img>, <video>) in text.
+        if raw_request is not None:
+            try:
+                request.messages = self._resolve_nvcf_media_assets(
+                    request.messages, raw_request)
+            except Exception as e:
+                logger.exception("Error while resolving NVCF assets")
+                return self.create_error_response(str(e))
+
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -2107,7 +2134,145 @@ class OpenAIServingChat(OpenAIServing):
 
         return ChatCompletionLogProbs(content=logprobs_content)
 
-    def _should_stream_with_auto_tool_parsing(self, request: ChatCompletionRequest):
+    def _resolve_nvcf_media_assets(self, messages: list[dict], raw_request: Request
+                                   ) -> list[dict]:
+        """
+        Validate and transform NVCF asset references for images and videos.
+        When media assets are embedded in plain text with HTML tags, transform
+        the message into structured parts to ensure proper loading by the
+        multimodal parser. Asset validation is performed but URLs remain as
+        asset_id format (MediaConnector will load files directly).
+        
+        Supported inputs:
+        - Structured: {"type":"image_url", "image_url":{"url":"data:image/...;asset_id,<id>"}}
+        - Structured: {"type":"video_url", "video_url":{"url":"data:video/...;asset_id,<id>"}}
+        - Text with HTML: "... <img src=\"data:image/...;asset_id,<id>\"/> ..."
+        - Text with HTML: "... <video src=\"data:video/...;asset_id,<id>\"/> ..."
+        
+        Headers used:
+        - NVCF-ASSET-DIR: absolute directory containing assets
+        - NVCF-FUNCTION-ASSET-IDS: comma-separated allowed asset ids
+        """
+        headers = raw_request.headers
+        asset_dir = headers.get("NVCF-ASSET-DIR")
+        allowed_ids_hdr = headers.get("NVCF-FUNCTION-ASSET-IDS")
+
+        if not asset_dir or not allowed_ids_hdr:
+            # Nothing to resolve
+            return messages
+
+        asset_root = Path(asset_dir)
+        if not asset_root.exists() or not asset_root.is_dir():
+            raise ValueError(f"Invalid NVCF-ASSET-DIR: {asset_dir}")
+
+        allowed_ids = {s.strip() for s in allowed_ids_hdr.split(',') if s.strip()}
+
+        def validate_asset_url(data_url: str) -> str:
+            """Validate asset_id URL and return it unchanged."""
+            # Match both image and video asset URLs
+            m = re.match(r"^data:(image|video)/[^;]+;asset_id,([^,]+)$", data_url)
+            if not m:
+                return data_url
+            
+            asset_id = m.group(2)
+            if asset_id not in allowed_ids:
+                raise ValueError(f"Asset id '{asset_id}' not permitted by NVCF-FUNCTION-ASSET-IDS")
+            file_path = (asset_root / asset_id).resolve()
+            # prevent traversal
+            if asset_root not in file_path.parents and file_path != asset_root:
+                raise ValueError("Asset path escapes NVCF-ASSET-DIR")
+            
+            # Verify file exists
+            if not file_path.exists():
+                raise ValueError(f"Asset file not found: {asset_id}")
+            
+            # Return the original asset_id URL unchanged
+            return data_url
+
+        def transform_message(msg: dict) -> dict:
+            content = msg.get("content")
+            
+            # Case 1: structured content list
+            if isinstance(content, list):
+                new_parts = []
+                for part in content:
+                    if isinstance(part, dict):
+                        # Handle image_url
+                        if "image_url" in part:
+                            url_obj = part["image_url"]
+                            if isinstance(url_obj, dict):
+                                url = url_obj.get("url")
+                                if isinstance(url, str) and ";asset_id," in url:
+                                    url_obj["url"] = validate_asset_url(url)
+                            elif isinstance(url_obj, str) and ";asset_id," in url_obj:
+                                part["image_url"] = {"url": validate_asset_url(url_obj)}
+                        # Handle video_url
+                        elif "video_url" in part:
+                            url_obj = part["video_url"]
+                            if isinstance(url_obj, dict):
+                                url = url_obj.get("url")
+                                if isinstance(url, str) and ";asset_id," in url:
+                                    url_obj["url"] = validate_asset_url(url)
+                            elif isinstance(url_obj, str) and ";asset_id," in url_obj:
+                                part["video_url"] = {"url": validate_asset_url(url_obj)}
+                    new_parts.append(part)
+                msg["content"] = new_parts
+                return msg
+
+            # Case 2: plain text possibly containing <img> or <video> tags
+            if isinstance(content, str):
+                # Match both <img> and <video> tags
+                pattern = re.compile(
+                    r"<(img|video)\s+[^>]*src=\"([^\"]+)\"[^>]*/?>", 
+                    re.IGNORECASE
+                )
+                idx = 0
+                parts = []
+                for m in pattern.finditer(content):
+                    start, end = m.span()
+                    tag_type = m.group(1).lower()  # 'img' or 'video'
+                    url = m.group(2)
+                    
+                    # Add text before the tag
+                    if start > idx:
+                        text_chunk = content[idx:start]
+                        if text_chunk:
+                            parts.append({"type": "text", "text": text_chunk})
+                    
+                    # Process the media URL
+                    if ";asset_id," in url:
+                        validated_url = validate_asset_url(url)
+                        if tag_type == "img":
+                            parts.append({
+                                "type": "image_url", 
+                                "image_url": {"url": validated_url}
+                            })
+                        elif tag_type == "video":
+                            parts.append({
+                                "type": "video_url",
+                                "video_url": {"url": validated_url}
+                            })
+                    else:
+                        # Keep as text if not asset_id pattern
+                        parts.append({"type": "text", "text": m.group(0)})
+                    
+                    idx = end
+                
+                if parts:
+                    # Add trailing text
+                    if idx < len(content):
+                        tail = content[idx:]
+                        if tail:
+                            parts.append({"type": "text", "text": tail})
+                    msg["content"] = parts
+                return msg
+
+            return msg
+
+        return [transform_message(dict(m)) for m in messages]
+
+    def _should_stream_with_auto_tool_parsing(self,
+                                              request: ChatCompletionRequest):
         """
         Utility function to check if streamed tokens should go through the tool
         call parser that was configured.
