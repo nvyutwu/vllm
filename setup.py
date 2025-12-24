@@ -1036,6 +1036,16 @@ setup(
         "bench": ["pandas", "matplotlib", "seaborn", "datasets", "scipy"],
         "tensorizer": ["tensorizer==2.10.1"],
         "fastsafetensors": ["fastsafetensors >= 0.2.2"],
+        # OpenTelemetry logging + optional Kratos offload
+        # Note: kratos-cli is hosted on an internal index. Set PIP_EXTRA_INDEX_URL accordingly.
+        "otel": [
+            "opentelemetry-sdk>=1.30.0",
+            "opentelemetry-api>=1.30.0",
+            "opentelemetry-exporter-otlp>=1.30.0",
+            "opentelemetry-exporter-otlp-proto-http>=1.30.0",
+            "opentelemetry-semantic-conventions-ai>=0.4.1",
+            "kratos-cli>=4.0.93",
+        ],
         "runai": ["runai-model-streamer[s3,gcs] >= 0.15.3"],
         "audio": [
             "librosa",

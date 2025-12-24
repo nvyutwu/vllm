@@ -3,6 +3,7 @@
 import importlib
 import inspect
 import multiprocessing
+import logging
 import multiprocessing.forkserver as forkserver
 import os
 import signal

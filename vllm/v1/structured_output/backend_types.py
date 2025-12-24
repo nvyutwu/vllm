@@ -94,6 +94,12 @@ class StructuredOutputGrammar(ABC):
         Resets the state of the structured output grammar.
         """
 
+    def destroy(self):
+        """
+        Cleanup grammar resources. Override if backend needs explicit cleanup.
+        """
+        pass
+
 
 @dataclass
 class StructuredOutputBackend(ABC):
