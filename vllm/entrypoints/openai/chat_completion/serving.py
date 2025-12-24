@@ -6,6 +6,8 @@ import json
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
+import logging
+import os
 from typing import Any, Final
 
 import jinja2
@@ -85,6 +87,7 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -238,6 +241,25 @@ class OpenAIServingChat(OpenAIServing):
             raise self.engine_client.dead_error
 
         try:
+            # Log request payload BEFORE any chat template is applied
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                payload_logger = logging.getLogger("vllm.entrypoints.openai.payload")
+                try:
+                    req_dump = request.model_dump()
+                except Exception:
+                    req_dump = None
+                try:
+                    payload_logger.info(
+                        "openai.request",
+                        extra={
+                            "rid": getattr(request, "request_id", "") or "",
+                            "endpoint": self.__class__.__name__,
+                            "payload": req_dump,
+                        },
+                    )
+                except Exception:
+                    pass
+
             renderer = self.engine_client.renderer
             tokenizer = renderer.tokenizer
 
@@ -641,6 +663,7 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -1420,6 +1443,73 @@ class OpenAIServingChat(OpenAIServing):
                 total_tokens=num_prompt_tokens + num_completion_tokens,
             )
 
+            # Emit a single streaming summary payload log
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    usage_dict = (
+                        request_metadata.final_usage_info.model_dump()
+                        if request_metadata.final_usage_info
+                        else None
+                    )
+                except Exception:
+                    usage_dict = None
+                # Build choices with actual content, reasoning, and tool_calls
+                choices_list = []
+                for i in range(num_choices):
+                    choice_data = {
+                        "index": i,
+                        "message": {
+                            "role": "assistant",
+                        },
+                        "finish_reason": "stop",
+                    }
+                    # Add reasoning if present
+                    if previous_reasoning_texts[i]:
+                        choice_data["message"]["reasoning_content"] = previous_reasoning_texts[i]
+                    # Add content if present
+                    if previous_content_texts[i]:
+                        choice_data["message"]["content"] = previous_content_texts[i]
+                    else:
+                        choice_data["message"]["content"] = None
+                    # Add tool_calls if present
+                    if previous_tool_calls[i]:
+                        tool_calls_list = []
+                        for tc in previous_tool_calls[i]:
+                            if tc.function and tc.function.name:
+                                tool_calls_list.append({
+                                    "id": tc.id,
+                                    "type": tc.type or "function",
+                                    "function": {
+                                        "name": tc.function.name,
+                                        "arguments": tc.function.arguments or "",
+                                    },
+                                })
+                        if tool_calls_list:
+                            choice_data["message"]["tool_calls"] = tool_calls_list
+                            choice_data["finish_reason"] = "tool_calls"
+                    choices_list.append(choice_data)
+                resp_summary = {
+                    "id": request_id,
+                    "object": "chat.completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": choices_list,
+                    "usage": usage_dict,
+                    "stream": True,
+                }
+                try:
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": rid_hint,
+                            "endpoint": self.__class__.__name__,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": resp_summary,
+                        },
+                    )
+                except Exception:
+                    pass
+
             # Log complete streaming response if output logging is enabled
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
@@ -1525,6 +1615,7 @@ class OpenAIServingChat(OpenAIServing):
         request_metadata: RequestResponseMetadata,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
         final_res: RequestOutput | None = None
 
         try:
@@ -1827,6 +1918,65 @@ class OpenAIServingChat(OpenAIServing):
             kv_transfer_params=final_res.kv_transfer_params,
         )
 
+        # Emit a single non-streaming summary payload log
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                usage_dict = usage.model_dump() if usage else None
+            except Exception:
+                usage_dict = None
+            # Build choices with actual content, reasoning, and tool_calls
+            choices_list = []
+            for choice in choices:
+                choice_data = {
+                    "index": choice.index,
+                    "message": {
+                        "role": choice.message.role if hasattr(choice.message, 'role') else "assistant",
+                    },
+                    "finish_reason": choice.finish_reason,
+                }
+                # Add reasoning if present
+                if hasattr(choice.message, 'reasoning') and choice.message.reasoning:
+                    choice_data["message"]["reasoning_content"] = choice.message.reasoning
+                # Add content
+                choice_data["message"]["content"] = choice.message.content
+                # Add tool_calls if present
+                if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
+                    tool_calls_list = []
+                    for tc in choice.message.tool_calls:
+                        tc_dict = {
+                            "id": tc.id if hasattr(tc, 'id') else None,
+                            "type": tc.type if hasattr(tc, 'type') else "function",
+                            "function": {
+                                "name": tc.function.name if hasattr(tc.function, 'name') else None,
+                                "arguments": tc.function.arguments if hasattr(tc.function, 'arguments') else "",
+                            },
+                        }
+                        tool_calls_list.append(tc_dict)
+                    if tool_calls_list:
+                        choice_data["message"]["tool_calls"] = tool_calls_list
+                choices_list.append(choice_data)
+            resp_summary = {
+                "id": request_id,
+                "object": "chat.completion",
+                "created": created_time,
+                "model": model_name,
+                "choices": choices_list,
+                "usage": usage_dict,
+                "stream": False,
+            }
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid_hint,
+                        "endpoint": self.__class__.__name__,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": resp_summary,
+                    },
+                )
+            except Exception:
+                pass
+
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
@@ -1858,15 +2008,11 @@ class OpenAIServingChat(OpenAIServing):
                     output_text = f"[tool_calls: {tool_calls_str}]"
 
                 if output_text:
-                    # Get the corresponding output token IDs
-                    output_token_ids = None
-                    if choice.index < len(final_res.outputs):
-                        output_token_ids = final_res.outputs[choice.index].token_ids
-
+                    # Don't log output_token_ids to reduce log volume
                     self.request_logger.log_outputs(
                         request_id=request_id,
                         outputs=output_text,
-                        output_token_ids=output_token_ids,
+                        output_token_ids=None,
                         finish_reason=choice.finish_reason,
                         is_streaming=False,
                         delta=False,
