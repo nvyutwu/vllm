@@ -1025,17 +1025,20 @@ class OpenAIServingResponses(OpenAIServing):
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
-            output_text = ""
-            if content:
-                output_text = content
-            elif reasoning:
-                output_text = f"[reasoning: {reasoning}]"
-
-            if output_text:
+            if reasoning:
                 self.request_logger.log_outputs(
                     request_id=request.request_id,
-                    outputs=output_text,
-                    output_token_ids=final_output.token_ids,
+                    outputs=f"[reasoning] {reasoning}",
+                    output_token_ids=None,
+                    finish_reason=final_output.finish_reason,
+                    is_streaming=False,
+                    delta=False,
+                )
+            if content:
+                self.request_logger.log_outputs(
+                    request_id=request.request_id,
+                    outputs=content,
+                    output_token_ids=None,
                     finish_reason=final_output.finish_reason,
                     is_streaming=False,
                     delta=False,

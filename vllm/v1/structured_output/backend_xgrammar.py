@@ -220,6 +220,16 @@ class XgrammarGrammar(StructuredOutputGrammar):
         self.num_processed_tokens = 0
         self.matcher.reset()
 
+    def destroy(self):
+        """Explicitly destroy xgrammar resources to avoid nanobind reference leaks."""
+        # Explicitly delete the C++ objects to help nanobind with reference counting
+        if hasattr(self, 'matcher') and self.matcher is not None:
+            del self.matcher
+            self.matcher = None
+        if hasattr(self, 'ctx') and self.ctx is not None:
+            del self.ctx
+            self.ctx = None
+
 
 # cf https://github.com/mlc-ai/xgrammar/blob/a32ac892676d2eedc0327416105b9b06edfb94b2/cpp/json_schema_converter.cc
 STRING_SUPPORTED_FORMATS = {

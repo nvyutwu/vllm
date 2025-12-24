@@ -66,6 +66,14 @@ class StructuredOutputRequest:
     def structured_output_key(self) -> StructuredOutputKey:
         return get_structured_output_key(self.params)
 
+    def cleanup(self) -> None:
+        """Cleanup grammar resources to avoid memory leaks."""
+        if self._grammar is not None and isinstance(
+            self._grammar, StructuredOutputGrammar
+        ):
+            self._grammar.destroy()
+            self._grammar = None
+
 
 def get_structured_output_key(params: StructuredOutputsParams) -> StructuredOutputKey:
     if params.json is not None:
