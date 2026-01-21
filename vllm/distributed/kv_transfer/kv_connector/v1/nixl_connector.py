@@ -2567,14 +2567,14 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             5.0,
         ]
         nixl_histogram_xfer_time = self._histogram_cls(
-            name="vllm:nixl_xfer_time_seconds",
+            name="nixl_xfer_time_seconds",
             documentation="Histogram of transfer duration for NIXL KV Cache transfers.",
             buckets=buckets[1:],
             labelnames=labelnames,
         )
         self.nixl_histogram_xfer_time = self.make_per_engine(nixl_histogram_xfer_time)
         nixl_histogram_post_time = self._histogram_cls(
-            name="vllm:nixl_post_time_seconds",
+            name="nixl_post_time_seconds",
             documentation="Histogram of transfer post time for NIXL KV"
             " Cache transfers.",
             buckets=buckets,
@@ -2584,7 +2584,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         # uniform 2kb to 16gb range
         buckets = [2 ** (10 + i) for i in range(1, 25, 2)]
         nixl_histogram_bytes_transferred = self._histogram_cls(
-            name="vllm:nixl_bytes_transferred",
+            name="nixl_bytes_transferred",
             documentation="Histogram of bytes transferred per NIXL KV Cache transfers.",
             buckets=buckets,
             labelnames=labelnames,
@@ -2609,7 +2609,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             50000,
         ]
         nixl_histogram_num_descriptors = self._histogram_cls(
-            name="vllm:nixl_num_descriptors",
+            name="nixl_num_descriptors",
             documentation="Histogram of number of descriptors per NIXL"
             "  KV Cache transfers.",
             buckets=buckets,
@@ -2619,7 +2619,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             nixl_histogram_num_descriptors
         )
         counter_nixl_num_failed_transfers = self._counter_cls(
-            name="vllm:nixl_num_failed_transfers",
+            name="nixl_num_failed_transfers",
             documentation="Number of failed NIXL KV Cache transfers.",
             labelnames=labelnames,
         )
@@ -2627,7 +2627,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             counter_nixl_num_failed_transfers
         )
         counter_nixl_num_failed_notifications = self._counter_cls(
-            name="vllm:nixl_num_failed_notifications",
+            name="nixl_num_failed_notifications",
             documentation="Number of failed NIXL KV Cache notifications.",
             labelnames=labelnames,
         )

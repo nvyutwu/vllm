@@ -151,7 +151,7 @@ class SpecDecodingProm:
             return
 
         counter_drafts = self._counter_cls(
-            name="vllm:spec_decode_num_drafts",
+            name="spec_decode_num_drafts",
             documentation="Number of spec decoding drafts.",
             labelnames=labelnames,
         )
@@ -160,7 +160,7 @@ class SpecDecodingProm:
         )
 
         counter_draft_tokens = self._counter_cls(
-            name="vllm:spec_decode_num_draft_tokens",
+            name="spec_decode_num_draft_tokens",
             documentation="Number of draft tokens.",
             labelnames=labelnames,
         )
@@ -169,7 +169,7 @@ class SpecDecodingProm:
         )
 
         counter_accepted_tokens = self._counter_cls(
-            name="vllm:spec_decode_num_accepted_tokens",
+            name="spec_decode_num_accepted_tokens",
             documentation="Number of accepted tokens.",
             labelnames=labelnames,
         )
@@ -185,7 +185,7 @@ class SpecDecodingProm:
         )
         pos_labelnames = labelnames + ["position"]
         base_counter = self._counter_cls(
-            name="vllm:spec_decode_num_accepted_tokens_per_pos",
+            name="spec_decode_num_accepted_tokens_per_pos",
             documentation="Accepted tokens per draft position.",
             labelnames=pos_labelnames,
         )
