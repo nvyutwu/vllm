@@ -106,6 +106,7 @@ class LLMEngine:
             self.output_processor.tracer = tracer
 
         # EngineCore (gets EngineCoreRequests and gives EngineCoreOutputs)
+        engine_startup_time_start = time.perf_counter()
         self.engine_core = EngineCoreClient.make_client(
             multiprocess_mode=multiprocess_mode,
             asyncio_mode=False,
@@ -113,6 +114,7 @@ class LLMEngine:
             executor_class=executor_class,
             log_stats=self.log_stats,
         )
+        engine_startup_time = time.perf_counter() - engine_startup_time_start
 
         self.logger_manager: StatLoggerManager | None = None
         if self.log_stats:
@@ -122,7 +124,9 @@ class LLMEngine:
                 enable_default_loggers=log_stats,
                 aggregate_engine_logging=aggregate_engine_logging,
             )
-            self.logger_manager.log_engine_initialized()
+            self.logger_manager.log_engine_initialized(
+                startup_time=engine_startup_time
+            )
 
         if not multiprocess_mode:
             # for v0 compatibility

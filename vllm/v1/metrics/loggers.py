@@ -57,7 +57,7 @@ class StatLoggerBase(ABC):
     ): ...
 
     @abstractmethod
-    def log_engine_initialized(self): ...
+    def log_engine_initialized(self, startup_time: float | None = None): ...
 
     def log(self):  # noqa
         pass
@@ -266,7 +266,7 @@ class LoggingStatLogger(StatLoggerBase):
         if self._enable_perf_stats():
             self.perf_metrics_logging.log(log_fn=log_fn, log_prefix=self.log_prefix)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.debug(
                 "Engine %03d: vllm cache_config_info with initialization "
@@ -334,7 +334,7 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
     def log(self):
         LoggingStatLogger.log(self)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.info(
                 "%d Engines: vllm cache_config_info with initialization "
@@ -379,9 +379,9 @@ class PerEngineStatLoggerAdapter(AggregateStatLoggerBase):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
             per_engine_stat_logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
-            per_engine_stat_logger.log_engine_initialized()
+            per_engine_stat_logger.log_engine_initialized(startup_time)
 
 
 class PrometheusStatLogger(AggregateStatLoggerBase):
@@ -1243,8 +1243,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+        if startup_time is not None:
+            for engine_idx in self.engine_indexes:
+                self.gauge_engine_startup_time[engine_idx].set(startup_time)
 
 
 PromMetric: TypeAlias = Gauge | Counter | Histogram
@@ -1372,6 +1375,6 @@ class StatLoggerManager:
         for logger in self.stat_loggers:
             logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for agg_logger in self.stat_loggers:
-            agg_logger.log_engine_initialized()
+            agg_logger.log_engine_initialized(startup_time)
