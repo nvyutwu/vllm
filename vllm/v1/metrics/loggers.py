@@ -1044,6 +1044,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if type == "cache_config":
             name = "cache_config_info"
             documentation = "Information of the LLMEngine CacheConfig"
+        elif type == "model_config":
+            name = "model_config_info"
+            documentation = "Information of the LLMEngine ModelConfig"
+        elif type == "parallel_config":
+            name = "parallel_config_info"
+            documentation = "Information of the LLMEngine ParallelConfig"
+        elif type == "speculative_config":
+            name = "speculative_config_info"
+            documentation = "Information of the LLMEngine SpeculativeConfig"
         assert name is not None, f"Unknown metrics info type {type}"
 
         # Info type metrics are syntactic sugar for a gauge permanently set to 1
@@ -1244,7 +1253,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
     def log_engine_initialized(self, startup_time: float | None = None):
+        # Log all config info metrics for performance correlation
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+        self.log_metrics_info("model_config", self.vllm_config.model_config)
+        self.log_metrics_info("parallel_config", self.vllm_config.parallel_config)
+        if self.vllm_config.speculative_config is not None:
+            self.log_metrics_info(
+                "speculative_config", self.vllm_config.speculative_config
+            )
         if startup_time is not None:
             for engine_idx in self.engine_indexes:
                 self.gauge_engine_startup_time[engine_idx].set(startup_time)

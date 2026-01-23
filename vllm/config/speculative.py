@@ -232,6 +232,15 @@ class SpeculativeConfig:
 
         return hf_config
 
+    def metrics_info(self) -> dict[str, str]:
+        """Return key speculative decoding config as a dict for Prometheus info metrics."""
+        return {
+            "spec_enabled": "true",
+            "spec_method": str(self.method or "auto"),
+            "spec_num_tokens": str(self.num_speculative_tokens or 0),
+            "spec_draft_model": str(self.model or "none"),
+        }
+
     def __post_init__(self):
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
