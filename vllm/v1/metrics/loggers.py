@@ -408,6 +408,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             vllm_config.observability_config.kv_cache_metrics
         )
 
+        # Throughput tracking (SGLang-compatible gen_throughput)
+        self._throughput_last_time: dict[int, float] = {}
+        self._throughput_accumulated_tokens: dict[int, int] = {}
+
         labelnames = ["model_name", "engine"]
         model_name = vllm_config.model_config.served_model_name
         max_model_len = vllm_config.model_config.max_model_len
@@ -1146,6 +1150,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.histogram_iteration_tokens[engine_idx].observe(
             iteration_stats.num_prompt_tokens + iteration_stats.num_generation_tokens
         )
+
+        # Update gen_throughput gauge (SGLang-compatible)
+        now = time.monotonic()
+        if engine_idx not in self._throughput_last_time:
+            self._throughput_last_time[engine_idx] = now
+            self._throughput_accumulated_tokens[engine_idx] = 0
+        self._throughput_accumulated_tokens[engine_idx] += (
+            iteration_stats.num_generation_tokens
+        )
+        delta_time = now - self._throughput_last_time[engine_idx]
+        # Update throughput every 5 seconds (similar to SGLang's approach)
+        if delta_time >= 5.0:
+            throughput = (
+                self._throughput_accumulated_tokens[engine_idx] / delta_time
+                if delta_time > 0
+                else 0.0
+            )
+            self.gauge_gen_throughput[engine_idx].set(throughput)
+            self._throughput_last_time[engine_idx] = now
+            self._throughput_accumulated_tokens[engine_idx] = 0
 
         for max_gen_tokens in iteration_stats.max_num_generation_tokens_iter:
             self.histogram_max_num_generation_tokens_request[engine_idx].observe(
