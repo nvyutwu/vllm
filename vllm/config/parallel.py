@@ -501,6 +501,7 @@ class ParallelConfig:
             "tensor_parallel_size": str(self.tensor_parallel_size),
             "pipeline_parallel_size": str(self.pipeline_parallel_size),
             "data_parallel_size": str(self.data_parallel_size),
+            "enable_expert_parallel": str(self.enable_expert_parallel),
         }
 
     def __post_init__(self) -> None:
