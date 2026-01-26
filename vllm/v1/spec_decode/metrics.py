@@ -139,6 +139,7 @@ class SpecDecodingProm:
     """
 
     _counter_cls = prometheus_client.Counter
+    _gauge_cls = prometheus_client.Gauge
 
     def __init__(
         self,
@@ -196,6 +197,21 @@ class SpecDecodingProm:
             for idx, lv in per_engine_labelvalues.items()
         }
 
+        # SGLang-compatible: Mean acceptance length gauge
+        gauge_spec_accept_length = self._gauge_cls(
+            name="spec_accept_length",
+            documentation=(
+                "Average accepted sequence length in speculative decoding "
+                "(including bonus token)."
+            ),
+            labelnames=labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_spec_accept_length = {
+            idx: gauge_spec_accept_length.labels(*lv)
+            for idx, lv in per_engine_labelvalues.items()
+        }
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
@@ -212,6 +228,14 @@ class SpecDecodingProm:
             self.counter_spec_decode_num_accepted_tokens_per_pos[engine_idx]
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+
+        # Update mean acceptance length gauge (SGLang-compatible)
+        if spec_decoding_stats.num_drafts > 0:
+            mean_accept_length = 1 + (
+                spec_decoding_stats.num_accepted_tokens
+                / spec_decoding_stats.num_drafts
+            )
+            self.gauge_spec_accept_length[engine_idx].set(mean_accept_length)
 
 
 def make_per_engine(

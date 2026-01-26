@@ -2635,6 +2635,15 @@ class NixlPromMetrics(KVConnectorPromMetrics):
             counter_nixl_num_failed_notifications
         )
 
+        # SGLang-compatible: KV transfer speed gauge
+        gauge_kv_transfer_speed = self._gauge_cls(
+            name="kv_transfer_speed_gb_s",
+            documentation="KV cache transfer speed in GB/s.",
+            labelnames=labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_kv_transfer_speed = self.make_per_engine(gauge_kv_transfer_speed)
+
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         for prom_obj, list_item_key in zip(
             [
@@ -2661,3 +2670,13 @@ class NixlPromMetrics(KVConnectorPromMetrics):
         ):
             for list_item in transfer_stats_data[counter_item_key]:
                 counter_obj[engine_idx].inc(list_item)
+
+        # SGLang-compatible: Compute and set KV transfer speed
+        bytes_list = transfer_stats_data.get("bytes_transferred", [])
+        time_list = transfer_stats_data.get("transfer_duration", [])
+        if bytes_list and time_list:
+            total_bytes = sum(bytes_list)
+            total_time = sum(time_list)
+            if total_time > 0:
+                speed_gb_s = (total_bytes / total_time) / 1e9
+                self.gauge_kv_transfer_speed[engine_idx].set(speed_gb_s)

@@ -1015,6 +1015,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # TODO: This metric might be incorrect in case of using multiple
         # api_server counts which uses prometheus mp.
         self.gauge_lora_info: Gauge | None = None
+        self.gauge_lora_pool_utilization: dict[int, Gauge] | None = None
         if vllm_config.lora_config is not None:
             if len(self.engine_indexes) > 1:
                 logger.warning(
@@ -1034,6 +1035,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.labelname_waiting_lora_adapters,
                     self.labelname_running_lora_adapters,
                 ],
+            )
+
+            # SGLang-compatible: LoRA pool utilization gauge
+            gauge_lora_pool_utilization = self._gauge_cls(
+                name="lora_pool_utilization",
+                documentation=(
+                    "LoRA adapter pool utilization as a ratio (0-1). "
+                    "Computed as active_adapters / max_loras."
+                ),
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            )
+            self.gauge_lora_pool_utilization = make_per_engine(
+                gauge_lora_pool_utilization, engine_indexes, model_name
             )
 
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
@@ -1138,6 +1153,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                     self.labelname_max_lora: self.max_lora,
                 }
                 self.gauge_lora_info.labels(**lora_info_labels).set_to_current_time()
+
+                # SGLang-compatible: Update LoRA pool utilization
+                if self.gauge_lora_pool_utilization is not None and self.max_lora > 0:
+                    num_active = len(scheduler_stats.running_lora_adapters)
+                    utilization = num_active / self.max_lora
+                    self.gauge_lora_pool_utilization[engine_idx].set(utilization)
 
         if mm_cache_stats is not None:
             self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)
