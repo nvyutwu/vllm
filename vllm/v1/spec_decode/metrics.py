@@ -212,6 +212,21 @@ class SpecDecodingProm:
             for idx, lv in per_engine_labelvalues.items()
         }
 
+        # SGLang-compatible: Draft acceptance rate gauge
+        gauge_spec_accept_rate = self._gauge_cls(
+            name="spec_accept_rate",
+            documentation=(
+                "Draft acceptance rate in speculative decoding "
+                "(accepted_tokens / draft_tokens, 0-1)."
+            ),
+            labelnames=labelnames,
+            multiprocess_mode="mostrecent",
+        )
+        self.gauge_spec_accept_rate = {
+            idx: gauge_spec_accept_rate.labels(*lv)
+            for idx, lv in per_engine_labelvalues.items()
+        }
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
@@ -229,13 +244,20 @@ class SpecDecodingProm:
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
 
-        # Update mean acceptance length gauge (SGLang-compatible)
+        # Update mean acceptance length and acceptance rate gauges
         if spec_decoding_stats.num_drafts > 0:
             mean_accept_length = 1 + (
                 spec_decoding_stats.num_accepted_tokens
                 / spec_decoding_stats.num_drafts
             )
             self.gauge_spec_accept_length[engine_idx].set(mean_accept_length)
+
+        if spec_decoding_stats.num_draft_tokens > 0:
+            accept_rate = (
+                spec_decoding_stats.num_accepted_tokens
+                / spec_decoding_stats.num_draft_tokens
+            )
+            self.gauge_spec_accept_rate[engine_idx].set(accept_rate)
 
 
 def make_per_engine(
