@@ -1273,6 +1273,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
+    def log(self):
+        """Flush per-interval gauges.
+
+        Called periodically by StatLoggerManager.log() on the same
+        interval as the logging stat logger. This updates spec decode
+        gauges with per-interval values and resets the interval
+        accumulators, matching SGLang's per-interval gauge behavior.
+        Cumulative values remain available via the Prometheus counters
+        and PromQL rate()/increase() queries.
+        """
+        self.spec_decoding_prom.flush_gauges()
+
     def log_engine_initialized(self, startup_time: float | None = None):
         # Log all config info metrics for performance correlation
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)

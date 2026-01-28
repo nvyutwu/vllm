@@ -227,18 +227,24 @@ class SpecDecodingProm:
             for idx, lv in per_engine_labelvalues.items()
         }
 
-        # Accumulators for computing correct cumulative gauges
-        self._total_drafts: dict[int, int] = {idx: 0 for idx in per_engine_labelvalues}
-        self._total_draft_tokens: dict[int, int] = {
+        # Per-interval accumulators for gauge computation.
+        # Accumulated across observe() calls and flushed to gauges
+        # periodically via flush_gauges(). Cumulative values are
+        # available from the Prometheus counters above via PromQL.
+        self._interval_drafts: dict[int, int] = {
             idx: 0 for idx in per_engine_labelvalues
         }
-        self._total_accepted_tokens: dict[int, int] = {
+        self._interval_draft_tokens: dict[int, int] = {
+            idx: 0 for idx in per_engine_labelvalues
+        }
+        self._interval_accepted_tokens: dict[int, int] = {
             idx: 0 for idx in per_engine_labelvalues
         }
 
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
+        # Increment monotonic counters (cumulative, for PromQL rate())
         self.counter_spec_decode_num_drafts[engine_idx].inc(
             spec_decoding_stats.num_drafts
         )
@@ -253,27 +259,44 @@ class SpecDecodingProm:
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
 
-        # Accumulate totals for gauge computation
-        self._total_drafts[engine_idx] += spec_decoding_stats.num_drafts
-        self._total_draft_tokens[engine_idx] += spec_decoding_stats.num_draft_tokens
-        self._total_accepted_tokens[engine_idx] += (
+        # Accumulate into per-interval buffers for gauges
+        self._interval_drafts[engine_idx] += spec_decoding_stats.num_drafts
+        self._interval_draft_tokens[engine_idx] += (
+            spec_decoding_stats.num_draft_tokens
+        )
+        self._interval_accepted_tokens[engine_idx] += (
             spec_decoding_stats.num_accepted_tokens
         )
 
-        # Update gauges from cumulative totals
-        if self._total_drafts[engine_idx] > 0:
-            mean_accept_length = 1 + (
-                self._total_accepted_tokens[engine_idx]
-                / self._total_drafts[engine_idx]
-            )
-            self.gauge_spec_accept_length[engine_idx].set(mean_accept_length)
+    def flush_gauges(self):
+        """Compute gauges from per-interval accumulators and reset.
 
-        if self._total_draft_tokens[engine_idx] > 0:
-            accept_rate = (
-                self._total_accepted_tokens[engine_idx]
-                / self._total_draft_tokens[engine_idx]
-            )
-            self.gauge_spec_accept_rate[engine_idx].set(accept_rate)
+        Called periodically by PrometheusStatLogger.log() to update
+        spec_accept_length and spec_accept_rate gauges with values
+        from the current logging interval, matching SGLang's behavior.
+        """
+        if not self.spec_decoding_enabled:
+            return
+        for engine_idx in self._interval_drafts:
+            drafts = self._interval_drafts[engine_idx]
+            draft_tokens = self._interval_draft_tokens[engine_idx]
+            accepted_tokens = self._interval_accepted_tokens[engine_idx]
+
+            if drafts > 0:
+                mean_accept_length = 1 + (accepted_tokens / drafts)
+                self.gauge_spec_accept_length[engine_idx].set(
+                    mean_accept_length
+                )
+
+            if draft_tokens > 0:
+                accept_rate = accepted_tokens / draft_tokens
+                self.gauge_spec_accept_rate[engine_idx].set(accept_rate)
+
+        # Reset interval accumulators
+        for engine_idx in self._interval_drafts:
+            self._interval_drafts[engine_idx] = 0
+            self._interval_draft_tokens[engine_idx] = 0
+            self._interval_accepted_tokens[engine_idx] = 0
 
 
 def make_per_engine(
