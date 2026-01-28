@@ -227,6 +227,15 @@ class SpecDecodingProm:
             for idx, lv in per_engine_labelvalues.items()
         }
 
+        # Accumulators for computing correct cumulative gauges
+        self._total_drafts: dict[int, int] = {idx: 0 for idx in per_engine_labelvalues}
+        self._total_draft_tokens: dict[int, int] = {
+            idx: 0 for idx in per_engine_labelvalues
+        }
+        self._total_accepted_tokens: dict[int, int] = {
+            idx: 0 for idx in per_engine_labelvalues
+        }
+
     def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
         if not self.spec_decoding_enabled:
             return
@@ -244,18 +253,25 @@ class SpecDecodingProm:
         ):
             counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
 
-        # Update mean acceptance length and acceptance rate gauges
-        if spec_decoding_stats.num_drafts > 0:
+        # Accumulate totals for gauge computation
+        self._total_drafts[engine_idx] += spec_decoding_stats.num_drafts
+        self._total_draft_tokens[engine_idx] += spec_decoding_stats.num_draft_tokens
+        self._total_accepted_tokens[engine_idx] += (
+            spec_decoding_stats.num_accepted_tokens
+        )
+
+        # Update gauges from cumulative totals
+        if self._total_drafts[engine_idx] > 0:
             mean_accept_length = 1 + (
-                spec_decoding_stats.num_accepted_tokens
-                / spec_decoding_stats.num_drafts
+                self._total_accepted_tokens[engine_idx]
+                / self._total_drafts[engine_idx]
             )
             self.gauge_spec_accept_length[engine_idx].set(mean_accept_length)
 
-        if spec_decoding_stats.num_draft_tokens > 0:
+        if self._total_draft_tokens[engine_idx] > 0:
             accept_rate = (
-                spec_decoding_stats.num_accepted_tokens
-                / spec_decoding_stats.num_draft_tokens
+                self._total_accepted_tokens[engine_idx]
+                / self._total_draft_tokens[engine_idx]
             )
             self.gauge_spec_accept_rate[engine_idx].set(accept_rate)
 
