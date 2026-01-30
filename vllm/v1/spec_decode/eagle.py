@@ -995,11 +995,30 @@ class EagleProposer:
         # because MTP layers are typically stored in BF16 even when the main
         # model is quantized (e.g., NVFP4, FP8). Using the main model's
         # quant_config would cause dimension mismatches during weight loading.
+        #
+        # IMPORTANT: We must set BOTH quant_config=None AND modify the
+        # model_config inside vllm_config to have quantization=None. This is
+        # because VllmConfig.__post_init__ will re-create quant_config from
+        # self.model_config.quantization if quant_config is None.
         draft_vllm_config = self.vllm_config
+        actual_draft_model_config = draft_model_config
         if self.method == "mtp" and draft_model_config.quantization is None:
-            # Create a modified vllm_config with quant_config=None for MTP
-            from dataclasses import replace
-            draft_vllm_config = replace(self.vllm_config, quant_config=None)
+            import copy
+            # Create a modified model_config with quantization=None
+            # This will be used BOTH inside vllm_config (to prevent __post_init__
+            # from re-creating quant_config) AND passed to get_model
+            actual_draft_model_config = copy.deepcopy(draft_model_config)
+            actual_draft_model_config.quantization = None
+
+            # Create a modified vllm_config with:
+            # 1. quant_config=None - to disable quantization
+            # 2. model_config with quantization=None - to prevent __post_init__
+            #    from re-creating quant_config based on model_config.quantization
+            draft_vllm_config = replace(
+                self.vllm_config,
+                quant_config=None,
+                model_config=actual_draft_model_config,
+            )
             logger.info(
                 "Loading MTP model without quantization (BF16) to avoid "
                 "dimension mismatch with quantized main model."
@@ -1007,7 +1026,7 @@ class EagleProposer:
 
         with set_model_tag("eagle_head"):
             self.model = get_model(
-                vllm_config=draft_vllm_config, model_config=draft_model_config
+                vllm_config=draft_vllm_config, model_config=actual_draft_model_config
             )
 
         draft_attn_layer_names = (

@@ -245,31 +245,44 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
 
         Returns True if we should skip loading this weight due to mismatch.
         """
+        from vllm.logger import init_logger
         param_data = param.data
 
         # Quick check: if shapes match exactly, no mismatch
         if param_data.shape == loaded_weight.shape:
             return False
 
+        logger = init_logger(__name__)
+
+        # Check for different number of dimensions (e.g., 3D vs 2D)
+        # This happens when model is created with quantization (NVFP4 uses 3D
+        # packed tensors) but weights are BF16 (2D tensors)
+        # e.g., NVFP4 param [160, 768, 2560] vs BF16 weight [1536, 5120]
+        if len(param_data.shape) != len(loaded_weight.shape):
+            logger.warning(
+                f"Skipping weight load for '{name}' due to dimension count mismatch: "
+                f"param shape {tuple(param_data.shape)} ({len(param_data.shape)}D), "
+                f"loaded weight shape {tuple(loaded_weight.shape)} ({len(loaded_weight.shape)}D). "
+                f"This indicates the MTP model is still being created with quantization. "
+                f"Please check that the speculative config does not inherit quantization."
+            )
+            return True
+
         # Check for quantization-related dimension mismatch
         # NVFP4 packs 4-bit weights, resulting in 2x dimension reduction
         # e.g., BF16 [1536, 5120] -> NVFP4 [1536, 2560]
-        if len(param_data.shape) == len(loaded_weight.shape):
-            # Check last dimension for 2x ratio (common for quantized weights)
-            param_last_dim = param_data.shape[-1]
-            weight_last_dim = loaded_weight.shape[-1]
+        param_last_dim = param_data.shape[-1]
+        weight_last_dim = loaded_weight.shape[-1]
 
-            if (param_last_dim * 2 == weight_last_dim or
-                param_last_dim == weight_last_dim * 2):
-                from vllm.logger import init_logger
-                logger = init_logger(__name__)
-                logger.warning(
-                    f"Skipping weight load for '{name}' due to dimension mismatch: "
-                    f"param shape {tuple(param_data.shape)}, "
-                    f"loaded weight shape {tuple(loaded_weight.shape)}. "
-                    f"This is expected for BF16 MTP layers in quantized models."
-                )
-                return True
+        if (param_last_dim * 2 == weight_last_dim or
+            param_last_dim == weight_last_dim * 2):
+            logger.warning(
+                f"Skipping weight load for '{name}' due to dimension mismatch: "
+                f"param shape {tuple(param_data.shape)}, "
+                f"loaded weight shape {tuple(loaded_weight.shape)}. "
+                f"This is expected for BF16 MTP layers in quantized models."
+            )
+            return True
 
         return False
 
