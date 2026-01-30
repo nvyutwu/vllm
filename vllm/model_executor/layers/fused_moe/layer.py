@@ -1140,6 +1140,25 @@ class FusedMoE(CustomOp):
         expert_id: int,
         return_success: bool = False,
     ) -> bool | None:
+        # Check for dimension mismatch (mixed precision: quantized main + BF16 MTP)
+        # NVFP4/FP8 quantization packs weights, resulting in different dimensions
+        # e.g., BF16 [intermediate, hidden] vs NVFP4 [intermediate, hidden/2]
+        # Skip loading if there's a 2x dimension ratio mismatch
+        param_shape = param.data.shape
+        weight_shape = loaded_weight.shape
+        if len(param_shape) >= 2 and len(weight_shape) >= 2:
+            # Check last dimension for 2x ratio (common for quantized weights)
+            param_last = param_shape[-1]
+            weight_last = weight_shape[-1]
+            if param_last * 2 == weight_last or param_last == weight_last * 2:
+                logger.warning(
+                    f"Skipping expert weight load for '{weight_name}' expert {expert_id} "
+                    f"due to dimension mismatch: param shape {tuple(param_shape)}, "
+                    f"loaded weight shape {tuple(weight_shape)}. "
+                    f"This is expected for BF16 MTP layers in quantized models."
+                )
+                return False if return_success else None
+
         if self.quant_config and self.quant_config.get_name() == "mxfp4":
             # (FIXME) for gpt-oss all experts are combined
             if "bias" in weight_name:
