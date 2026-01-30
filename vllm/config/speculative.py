@@ -266,10 +266,14 @@ class SpeculativeConfig:
                     self.enforce_eager = True
                 # use the draft model from the same model:
                 self.model = self.target_model_config.model
-                # Align the quantization of draft model for cases such as
-                # --quantization fp8 with a bf16 checkpoint.
-                if not self.quantization:
-                    self.quantization = self.target_model_config.quantization
+                # NOTE: We intentionally do NOT inherit quantization from the
+                # target model for MTP. MTP layers are typically stored in BF16
+                # even when the main model is quantized (e.g., nvfp4, fp8).
+                # Inheriting quantization causes dtype mismatches during CUDA
+                # graph capture because some MTP layers (eh_proj, norms) are
+                # always BF16 while the mtp_block would use quantized kernels.
+                # Users can explicitly set --speculative-config.quantization
+                # if their MTP weights are actually quantized in the checkpoint.
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "suffix":
