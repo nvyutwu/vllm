@@ -522,6 +522,15 @@ class Glm4MoeModel(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
+                # Skip loading quantization scale parameters if they don't exist
+                # This allows mixed precision: quantized main model + BF16 MTP
+                if name not in params_dict:
+                    # Check if this is a quantization scale parameter
+                    if any(name.endswith(suffix) for suffix in [
+                        ".k_scale", ".v_scale", ".q_scale",
+                        ".weight_scale", ".input_scale"
+                    ]):
+                        continue
                 if is_pp_missing_parameter(name, self):
                     continue
 
@@ -583,6 +592,18 @@ class Glm4MoeModel(nn.Module):
 
                     if is_pp_missing_parameter(name, self):
                         continue
+
+                    # Skip loading quantization scale parameters if they don't exist
+                    # This allows mixed precision: quantized main model + BF16 MTP
+                    if name not in params_dict:
+                        # Check if this is a quantization scale parameter
+                        if any(name.endswith(suffix) for suffix in [
+                            ".k_scale", ".v_scale", ".q_scale",
+                            ".weight_scale", ".input_scale"
+                        ]):
+                            continue
+                        # If not a scale parameter, we should fail normally
+                        # to catch actual missing parameters
 
                     param = params_dict[name]
                     weight_loader = getattr(
