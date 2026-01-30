@@ -991,9 +991,23 @@ class EagleProposer:
 
         from vllm.compilation.backends import set_model_tag
 
+        # For MTP models, we need to use a vllm_config without quantization
+        # because MTP layers are typically stored in BF16 even when the main
+        # model is quantized (e.g., NVFP4, FP8). Using the main model's
+        # quant_config would cause dimension mismatches during weight loading.
+        draft_vllm_config = self.vllm_config
+        if self.method == "mtp" and draft_model_config.quantization is None:
+            # Create a modified vllm_config with quant_config=None for MTP
+            from dataclasses import replace
+            draft_vllm_config = replace(self.vllm_config, quant_config=None)
+            logger.info(
+                "Loading MTP model without quantization (BF16) to avoid "
+                "dimension mismatch with quantized main model."
+            )
+
         with set_model_tag("eagle_head"):
             self.model = get_model(
-                vllm_config=self.vllm_config, model_config=draft_model_config
+                vllm_config=draft_vllm_config, model_config=draft_model_config
             )
 
         draft_attn_layer_names = (

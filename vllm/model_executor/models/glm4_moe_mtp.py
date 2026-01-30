@@ -235,6 +235,44 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
     ) -> torch.Tensor | None:
         return self.model.compute_logits(hidden_states, spec_step_idx)
 
+    def _has_dimension_mismatch(
+        self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, name: str
+    ) -> bool:
+        """
+        Check if there's a dimension mismatch between param and loaded_weight.
+        This handles mixed precision cases where main model is quantized (NVFP4/FP8)
+        but MTP layers are BF16.
+
+        Returns True if we should skip loading this weight due to mismatch.
+        """
+        param_data = param.data
+
+        # Quick check: if shapes match exactly, no mismatch
+        if param_data.shape == loaded_weight.shape:
+            return False
+
+        # Check for quantization-related dimension mismatch
+        # NVFP4 packs 4-bit weights, resulting in 2x dimension reduction
+        # e.g., BF16 [1536, 5120] -> NVFP4 [1536, 2560]
+        if len(param_data.shape) == len(loaded_weight.shape):
+            # Check last dimension for 2x ratio (common for quantized weights)
+            param_last_dim = param_data.shape[-1]
+            weight_last_dim = loaded_weight.shape[-1]
+
+            if (param_last_dim * 2 == weight_last_dim or
+                param_last_dim == weight_last_dim * 2):
+                from vllm.logger import init_logger
+                logger = init_logger(__name__)
+                logger.warning(
+                    f"Skipping weight load for '{name}' due to dimension mismatch: "
+                    f"param shape {tuple(param_data.shape)}, "
+                    f"loaded weight shape {tuple(loaded_weight.shape)}. "
+                    f"This is expected for BF16 MTP layers in quantized models."
+                )
+                return True
+
+        return False
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -287,24 +325,9 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
 
                 param = params_dict[name]
 
-                # Skip if shapes don't match (mixed precision: quantized main + BF16 MTP)
-                # Check the actual data shape, accounting for potential sharding
-                param_data = param.data
-                if hasattr(param, 'weight_loader_v2'):
-                    # For merged column weights, just check if dimensions are compatible
-                    # We can't do exact shape matching due to tensor parallelism
-                    # If there's a major dimension mismatch (e.g., 2560 vs 5120), skip
-                    if param_data.shape[-1] * 2 == loaded_weight.shape[-1] or \
-                       param_data.shape[-1] == loaded_weight.shape[-1] * 2:
-                        # Significant dimension mismatch (quantized vs full precision)
-                        import logging
-                        logger = logging.getLogger(__name__)
-                        logger.debug(
-                            f"Skipping weight load for {name} due to dimension mismatch: "
-                            f"param shape {param_data.shape}, loaded weight shape {loaded_weight.shape}. "
-                            f"This is expected for BF16 MTP in quantized models."
-                        )
-                        break
+                # Skip if dimension mismatch (mixed precision: quantized main + BF16 MTP)
+                if self._has_dimension_mismatch(param, loaded_weight, name):
+                    break
 
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -318,20 +341,9 @@ class Glm4MoeMTP(nn.Module, Glm4MixtureOfExperts):
 
                     param = params_dict[name]
 
-                    # Skip if shapes don't match (mixed precision: quantized main + BF16 MTP)
-                    param_data = param.data
-                    if hasattr(param, 'weight_loader_v2'):
-                        # Check for significant dimension mismatch
-                        if param_data.shape[-1] * 2 == loaded_weight.shape[-1] or \
-                           param_data.shape[-1] == loaded_weight.shape[-1] * 2:
-                            import logging
-                            logger = logging.getLogger(__name__)
-                            logger.debug(
-                                f"Skipping expert weight load for {name} due to dimension mismatch: "
-                                f"param shape {param_data.shape}, loaded weight shape {loaded_weight.shape}. "
-                                f"This is expected for BF16 MTP experts in quantized models."
-                            )
-                            break
+                    # Skip if dimension mismatch (mixed precision: quantized main + BF16 MTP)
+                    if self._has_dimension_mismatch(param, loaded_weight, name):
+                        break
 
                     weight_loader = param.weight_loader
                     weight_loader(
