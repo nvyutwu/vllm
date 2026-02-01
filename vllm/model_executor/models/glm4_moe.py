@@ -506,6 +506,24 @@ class Glm4MoeModel(nn.Module):
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue
+
+            # Handle FP8 kv-scale remapping for ModelOpt quantized checkpoints.
+            # ModelOpt stores scales as: self_attn.k_proj.k_scale, v_proj.v_scale
+            # vLLM expects them as: self_attn.attn.k_scale, attn.v_scale
+            # We must handle these BEFORE stacked_params_mapping, otherwise
+            # k_proj/v_proj will be incorrectly transformed to qkv_proj.
+            if name.endswith(".k_scale") or name.endswith(".v_scale"):
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
