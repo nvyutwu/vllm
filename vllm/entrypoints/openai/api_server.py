@@ -1747,6 +1747,7 @@ async def init_app_state(
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            enable_log_outputs=args.enable_log_outputs,
             log_error_stack=args.log_error_stack,
         )
         if "generate" in supported_tasks
@@ -1990,13 +1991,23 @@ async def run_server_worker(
                     # Exclude request/response logs from console (OTEL only)
                     if 'openai.request' in msg or 'openai.response' in msg:
                         return False
-                    if 'Generated response' in msg and 'chatcmpl-' in msg:
-                        return False
+                    # Exclude output logs from console for all APIs (OTEL only)
+                    # - chatcmpl-*: Chat Completion API
+                    # - cmpl-*: Completion API
+                    # - resp_*: Response API (uses underscore, not hyphen)
+                    if 'Generated response' in msg:
+                        if 'chatcmpl-' in msg or 'cmpl-' in msg or 'resp_' in msg:
+                            return False
                     return True
             
-            # Apply filter to all existing console/stream handlers
+            # Apply filter to console handlers ONLY (not file handlers)
+            # Note: FileHandler is a subclass of StreamHandler, so we must exclude it
             for handler in vllm_root_logger.handlers:
-                if isinstance(handler, logging.StreamHandler) and not isinstance(handler, type(_otel_handler)):
+                is_stream_handler = isinstance(handler, logging.StreamHandler)
+                is_file_handler = isinstance(handler, logging.FileHandler)
+                is_otel_handler = isinstance(handler, type(_otel_handler))
+                # Only filter console (stdout/stderr) handlers, not file handlers
+                if is_stream_handler and not is_file_handler and not is_otel_handler:
                     handler.addFilter(ConsoleLogFilter())
         
         # Start Prometheus -> OTEL metrics bridge if meter available/env configured

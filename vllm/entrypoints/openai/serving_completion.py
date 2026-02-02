@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import json
+import logging
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
@@ -39,6 +42,17 @@ from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
+
+# Import Harmony utilities for gpt-oss models
+try:
+    from vllm.entrypoints.harmony_utils import (
+        get_stop_tokens_for_assistant_actions,
+    )
+    HARMONY_AVAILABLE = True
+except ImportError:
+    HARMONY_AVAILABLE = False
+    logger.warning("Harmony utilities not available. gpt-oss models will not be supported in Completion API.")
 
 
 class OpenAIServingCompletion(OpenAIServing):
@@ -51,6 +65,7 @@ class OpenAIServingCompletion(OpenAIServing):
         return_tokens_as_token_ids: bool = False,
         enable_prompt_tokens_details: bool = False,
         enable_force_include_usage: bool = False,
+        enable_log_outputs: bool = False,
         log_error_stack: bool = False,
     ):
         super().__init__(
@@ -64,6 +79,7 @@ class OpenAIServingCompletion(OpenAIServing):
         # set up logits processors
         self.logits_processors = self.model_config.logits_processors
 
+        self.enable_log_outputs = enable_log_outputs
         self.enable_prompt_tokens_details = enable_prompt_tokens_details
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
         self.enable_force_include_usage = enable_force_include_usage
@@ -74,6 +90,17 @@ class OpenAIServingCompletion(OpenAIServing):
                 "Using default completion sampling params from %s: %s",
                 source,
                 self.default_sampling_params,
+            )
+        
+        # Check if model is gpt-oss and needs Harmony format
+        self.use_harmony = HARMONY_AVAILABLE and self.model_config.hf_config.model_type == "gpt_oss"
+        if self.use_harmony:
+            logger.info("Enabling Harmony format for gpt-oss model in Completion API")
+            # Add stop tokens for Harmony assistant actions
+            if "stop_token_ids" not in self.default_sampling_params:
+                self.default_sampling_params["stop_token_ids"] = []
+            self.default_sampling_params["stop_token_ids"].extend(
+                get_stop_tokens_for_assistant_actions()
             )
 
     async def create_completion(
@@ -119,6 +146,37 @@ class OpenAIServingCompletion(OpenAIServing):
         if raw_request:
             raw_request.state.request_metadata = request_metadata
 
+        # Log request payload BEFORE any processing
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            headers_json = ""
+            try:
+                if raw_request is not None:
+                    headers_to_log = {k: v for k, v in raw_request.headers.items()}
+                    headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+            except Exception:
+                headers_json = ""
+            try:
+                req_dump = request.model_dump()
+            except Exception:
+                req_dump = None
+            try:
+                req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
+            except Exception:
+                req_str = ""
+            try:
+                payload_logger.info(
+                    "openai.request",
+                    extra={
+                        "rid": rid_hint or "",
+                        "endpoint": self.__class__.__name__,
+                        "payload": req_str,
+                        "headers": headers_json,
+                    },
+                )
+            except Exception:
+                pass
+
         try:
             lora_request = self._maybe_get_adapters(request)
 
@@ -126,8 +184,8 @@ class OpenAIServingCompletion(OpenAIServing):
                 tokenizer = None
             else:
                 tokenizer = await self.engine_client.get_tokenizer()
+            
             renderer = self._get_renderer(tokenizer)
-
             engine_prompts = await renderer.render_prompt_and_embeds(
                 prompt_or_prompts=request.prompt,
                 prompt_embeds=request.prompt_embeds,
@@ -341,6 +399,10 @@ class OpenAIServingCompletion(OpenAIServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
+
+        # Track accumulated content for output logging
+        previous_texts = [""] * num_choices * num_prompts
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -380,13 +442,14 @@ class OpenAIServingCompletion(OpenAIServing):
                     # with the echo implementation.
                     prompt_token_ids_to_return: list[int] | None = None
 
-                    assert request.max_tokens is not None
+                    # Note: request.max_tokens can be None if user wants full context
+                    # Only check for max_tokens == 0 (echo-only mode) if explicitly set
                     if request.echo and not has_echoed[i]:
                         assert prompt_token_ids is not None
                         if request.return_token_ids:
                             prompt_text = ""
                         assert prompt_text is not None
-                        if request.max_tokens == 0:
+                        if request.max_tokens is not None and request.max_tokens == 0:
                             # only return the prompt
                             delta_text = prompt_text
                             delta_token_ids = prompt_token_ids
@@ -442,25 +505,25 @@ class OpenAIServingCompletion(OpenAIServing):
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
 
+                    choice = CompletionResponseStreamChoice(
+                        index=i,
+                        text=delta_text,
+                        logprobs=logprobs,
+                        finish_reason=finish_reason,
+                        stop_reason=stop_reason,
+                        prompt_token_ids=prompt_token_ids_to_return,
+                        token_ids=(
+                            as_list(output.token_ids)
+                            if request.return_token_ids
+                            else None
+                        ),
+                    )
+
                     chunk = CompletionStreamResponse(
                         id=request_id,
                         created=created_time,
                         model=model_name,
-                        choices=[
-                            CompletionResponseStreamChoice(
-                                index=i,
-                                text=delta_text,
-                                logprobs=logprobs,
-                                finish_reason=finish_reason,
-                                stop_reason=stop_reason,
-                                prompt_token_ids=prompt_token_ids_to_return,
-                                token_ids=(
-                                    as_list(output.token_ids)
-                                    if request.return_token_ids
-                                    else None
-                                ),
-                            )
-                        ],
+                        choices=[choice],
                     )
                     if include_continuous_usage:
                         prompt_tokens = num_prompt_tokens[prompt_idx]
@@ -473,6 +536,10 @@ class OpenAIServingCompletion(OpenAIServing):
 
                     response_json = chunk.model_dump_json(exclude_unset=False)
                     yield f"data: {response_json}\n\n"
+
+                    # Track content for output logging
+                    if delta_text:
+                        previous_texts[i] += delta_text
 
             total_prompt_tokens = sum(num_prompt_tokens)
             total_completion_tokens = sum(previous_num_tokens)
@@ -502,6 +569,53 @@ class OpenAIServingCompletion(OpenAIServing):
 
             # report to FastAPI middleware aggregate usage across all choices
             request_metadata.final_usage_info = final_usage_info
+
+            # Payload logging for streaming response summary
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    usage_dict = final_usage_info.model_dump() if final_usage_info else None
+                except Exception:
+                    usage_dict = None
+                resp_summary = {
+                    "id": rid_hint,
+                    "object": "text_completion",
+                    "created": created_time,
+                    "model": model_name,
+                    "choices": [],
+                    "usage": usage_dict,
+                    "stream": True,
+                }
+                try:
+                    payload_str = json.dumps(resp_summary, ensure_ascii=False)
+                except Exception:
+                    payload_str = ""
+                try:
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": rid_hint,
+                            "endpoint": self.__class__.__name__,
+                            "payload": payload_str,
+                        },
+                    )
+                except Exception:
+                    pass
+
+            # Output logging for streaming complete
+            if self.enable_log_outputs and self.request_logger:
+                for i in range(num_choices * num_prompts):
+                    content_text = previous_texts[i]
+
+                    # Log content
+                    if content_text:
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=content_text,
+                            output_token_ids=None,
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
 
         except Exception as e:
             # TODO: Use a vllm-specific Validation Error
@@ -535,12 +649,13 @@ class OpenAIServingCompletion(OpenAIServing):
             out_logprobs: GenericSequence[dict[int, Logprob] | None] | None
 
             for output in final_res.outputs:
-                assert request.max_tokens is not None
+                # Note: request.max_tokens can be None if user wants full context
                 if request.echo:
                     if request.return_token_ids:
                         prompt_text = ""
                     assert prompt_text is not None
-                    if request.max_tokens == 0:
+                    # Only check for max_tokens == 0 (echo-only mode) if explicitly set
+                    if request.max_tokens is not None and request.max_tokens == 0:
                         token_ids = prompt_token_ids
                         out_logprobs = prompt_logprobs
                         output_text = prompt_text
@@ -613,6 +728,53 @@ class OpenAIServingCompletion(OpenAIServing):
         request_metadata.final_usage_info = usage
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
+
+        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
+
+        # Payload logging for non-streaming response
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                usage_dict = usage.model_dump() if usage else None
+            except Exception:
+                usage_dict = None
+            resp_summary = {
+                "id": rid_hint,
+                "object": "text_completion",
+                "created": created_time,
+                "model": model_name,
+                "choices": [],
+                "usage": usage_dict,
+                "stream": False,
+            }
+            try:
+                payload_str = json.dumps(resp_summary, ensure_ascii=False)
+            except Exception:
+                payload_str = ""
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": rid_hint,
+                        "endpoint": self.__class__.__name__,
+                        "payload": payload_str,
+                    },
+                )
+            except Exception:
+                pass
+
+        # Output logging for non-streaming response
+        if self.enable_log_outputs and self.request_logger:
+            for choice in choices:
+                if choice.text:
+                    self.request_logger.log_outputs(
+                        request_id=request_id,
+                        outputs=choice.text,
+                        output_token_ids=None,
+                        finish_reason=choice.finish_reason,
+                        is_streaming=False,
+                        delta=False,
+                    )
+
         return CompletionResponse(
             id=request_id,
             created=created_time,
@@ -705,9 +867,13 @@ class OpenAIServingCompletion(OpenAIServing):
         request: CompletionRequest,
         max_input_length: int | None = None,
     ) -> RenderConfig:
-        max_input_tokens_len = self.max_model_len - (request.max_tokens or 0)
+        # Don't pre-validate input length based on max_tokens.
+        # This allows users to pass max_tokens up to the full context length,
+        # and get_max_tokens() will compute the actual available output tokens
+        # based on the real input length (max_model_len - input_length).
+        # Input validation still happens in the engine if input exceeds max_model_len.
         return RenderConfig(
-            max_length=max_input_tokens_len,
+            max_length=None,
             truncate_prompt_tokens=request.truncate_prompt_tokens,
             add_special_tokens=request.add_special_tokens,
             cache_salt=request.cache_salt,

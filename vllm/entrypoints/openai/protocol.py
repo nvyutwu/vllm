@@ -575,7 +575,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool | None = None
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1)] | None = None
     prompt_logprobs: int | None = None
@@ -883,6 +883,26 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     s_tag_obj = structural_tag.model_dump(by_alias=True)
                     self.structured_outputs.structural_tag = json.dumps(s_tag_obj)
 
+        # Merge stop_token_ids from request with default_sampling_params
+        # This is critical for gpt-oss models which need Harmony stop tokens
+        stop_token_ids = list(self.stop_token_ids) if self.stop_token_ids else []
+        default_stop_token_ids = default_sampling_params.get("stop_token_ids", [])
+        if default_stop_token_ids:
+            # Add default stop tokens that are not already in the request
+            for token_id in default_stop_token_ids:
+                if token_id not in stop_token_ids:
+                    stop_token_ids.append(token_id)
+
+        # Priority: user's explicit value > model's default > True (standard default)
+        # If user explicitly sets skip_special_tokens, use it
+        # Otherwise, use model's default (e.g., False for gpt-oss to show Harmony format)
+        if self.skip_special_tokens is not None:
+            skip_special_tokens = self.skip_special_tokens
+        else:
+            skip_special_tokens = default_sampling_params.get(
+                "skip_special_tokens", True
+            )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -899,13 +919,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
+            stop_token_ids=stop_token_ids if stop_token_ids else None,
             logprobs=self.top_logprobs if self.logprobs else None,
             prompt_logprobs=prompt_logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens,
             min_tokens=self.min_tokens,
-            skip_special_tokens=self.skip_special_tokens,
+            skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             logits_processors=get_logits_processors(
                 self.logits_processors, logits_processor_pattern
@@ -1115,7 +1135,7 @@ class CompletionRequest(OpenAIBaseModel):
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool | None = None
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1)] | None = None
     allowed_token_ids: list[int] | None = None
@@ -1369,6 +1389,37 @@ class CompletionRequest(OpenAIBaseModel):
             if len(kwargs) > 0:
                 self.structured_outputs = StructuredOutputsParams(**kwargs)
 
+        # Merge stop_token_ids from request with default_sampling_params
+        # This is critical for gpt-oss models which need Harmony stop tokens
+        request_stop_token_ids = list(self.stop_token_ids) if self.stop_token_ids else []
+        default_stop_token_ids = default_sampling_params.get("stop_token_ids", [])
+        stop_token_ids = list(request_stop_token_ids)  # Start with request tokens
+        if default_stop_token_ids:
+            # Add default stop tokens that are not already in the request
+            for token_id in default_stop_token_ids:
+                if token_id not in stop_token_ids:
+                    stop_token_ids.append(token_id)
+        
+        # Debug logging for stop parameters
+        logger.debug(
+            "[CompletionRequest] stop params: "
+            "stop(strings)=%s, stop_token_ids: request=%s, default=%s, merged=%s",
+            self.stop,
+            request_stop_token_ids,
+            default_stop_token_ids,
+            stop_token_ids,
+        )
+
+        # Priority: user's explicit value > model's default > True (standard default)
+        # If user explicitly sets skip_special_tokens, use it
+        # Otherwise, use model's default (e.g., False for gpt-oss to show Harmony format)
+        if self.skip_special_tokens is not None:
+            skip_special_tokens = self.skip_special_tokens
+        else:
+            skip_special_tokens = default_sampling_params.get(
+                "skip_special_tokens", True
+            )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -1385,13 +1436,13 @@ class CompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
+            stop_token_ids=stop_token_ids if stop_token_ids else None,
             logprobs=self.logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
             prompt_logprobs=prompt_logprobs,
-            skip_special_tokens=self.skip_special_tokens,
+            skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
             logits_processors=get_logits_processors(
@@ -1874,6 +1925,17 @@ class RerankResponse(OpenAIBaseModel):
     results: list[RerankResult]
 
 
+class FunctionCall(OpenAIBaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(OpenAIBaseModel):
+    id: str = Field(default_factory=make_tool_call_id)
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class CompletionLogProbs(OpenAIBaseModel):
     text_offset: list[int] = Field(default_factory=list)
     token_logprobs: list[float | None] = Field(default_factory=list)
@@ -1897,6 +1959,22 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
+    
+    # vLLM-specific fields for Harmony/gpt-oss models (similar to Ollama)
+    thinking: str | None = Field(
+        default=None,
+        description=(
+            "Thinking/reasoning content from the model (e.g., from analysis channel "
+            "in Harmony format for gpt-oss models). Similar to Ollama's thinking field."
+        ),
+    )
+    tool_calls: list[ToolCall] | None = Field(
+        default=None,
+        description=(
+            "Tool calls made by the model (e.g., from commentary channel "
+            "in Harmony format for gpt-oss models). Similar to Ollama's tool_calls field."
+        ),
+    )
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -1932,6 +2010,22 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    
+    # vLLM-specific fields for Harmony/gpt-oss models (similar to Ollama)
+    thinking: str | None = Field(
+        default=None,
+        description=(
+            "Thinking/reasoning content delta from the model (for streaming). "
+            "Similar to Ollama's thinking field."
+        ),
+    )
+    tool_calls: list[ToolCall] | None = Field(
+        default=None,
+        description=(
+            "Tool calls made by the model (for streaming). "
+            "Similar to Ollama's tool_calls field."
+        ),
+    )
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -2054,17 +2148,6 @@ class ClassificationResponse(OpenAIBaseModel):
     model: str
     data: list[ClassificationData]
     usage: UsageInfo
-
-
-class FunctionCall(OpenAIBaseModel):
-    name: str
-    arguments: str
-
-
-class ToolCall(OpenAIBaseModel):
-    id: str = Field(default_factory=make_tool_call_id)
-    type: Literal["function"] = "function"
-    function: FunctionCall
 
 
 class DeltaFunctionCall(BaseModel):

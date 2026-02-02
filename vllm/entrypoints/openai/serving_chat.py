@@ -599,6 +599,11 @@ class OpenAIServingChat(OpenAIServing):
 
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
+        
+        # Track reasoning, content and tool calls separately for proper logging
+        previous_reasoning_texts = [""] * num_choices
+        previous_content_texts = [""] * num_choices
+        previous_tool_calls: list[list[DeltaToolCall]] = [[] for _ in range(num_choices)]
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -756,10 +761,16 @@ class OpenAIServingChat(OpenAIServing):
                     if self.use_harmony:
                         harmony_parser = harmony_parsers[i]
                         prev_recipient = harmony_parser.current_recipient
-                        delta_text = ""
+                        
+                        # Use engine's output.text (which has proper UTF-8 incremental decoding)
+                        # instead of harmony_parser.last_content_delta (which decodes tokens individually
+                        # and can produce "��" for multi-byte UTF-8 like emojis)
+                        # We process tokens through parser to track channel/recipient state only
                         for token_id in output.token_ids:
                             harmony_parser.process(token_id)
-                            delta_text += harmony_parser.last_content_delta or ""
+                        
+                        # Use properly decoded text from engine's detokenizer
+                        delta_text = output.text
                         cur_channel = harmony_parser.current_channel
                         cur_recipient = harmony_parser.current_recipient
                     else:
@@ -802,6 +813,7 @@ class OpenAIServingChat(OpenAIServing):
                             cur_channel == "commentary"
                             and cur_recipient
                             and cur_recipient.startswith("functions.")
+                            and request.tool_choice != "none"
                         ):
                             # Count completed tool calls to determine index
                             base_index = 0
@@ -1087,10 +1099,68 @@ class OpenAIServingChat(OpenAIServing):
                         assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
                         all_previous_token_ids[i] = current_token_ids
+                        
+                        # Track reasoning, content, and tool calls separately for logging
+                        if delta_message:
+                            if delta_message.reasoning:
+                                previous_reasoning_texts[i] += delta_message.reasoning
+                            if delta_message.content:
+                                previous_content_texts[i] += delta_message.content
+                            if delta_message.tool_calls:
+                                # Track tool calls - merge or add new ones
+                                for delta_tc in delta_message.tool_calls:
+                                    if delta_tc.index is not None:
+                                        # Ensure we have enough slots
+                                        while len(previous_tool_calls[i]) <= delta_tc.index:
+                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
+                                        # Merge with existing tool call at this index
+                                        existing_tc = previous_tool_calls[i][delta_tc.index]
+                                        if delta_tc.id is not None:
+                                            existing_tc.id = delta_tc.id
+                                        if delta_tc.type is not None:
+                                            existing_tc.type = delta_tc.type
+                                        if delta_tc.function is not None:
+                                            if existing_tc.function is None:
+                                                existing_tc.function = DeltaFunctionCall()
+                                            if delta_tc.function.name is not None:
+                                                existing_tc.function.name = delta_tc.function.name
+                                            if delta_tc.function.arguments is not None:
+                                                if existing_tc.function.arguments is None:
+                                                    existing_tc.function.arguments = ""
+                                                existing_tc.function.arguments += delta_tc.function.arguments
                     else:
                         # Update for comprehensive logging even in simple case
                         assert previous_texts is not None
                         previous_texts[i] += delta_text
+                        
+                        # Track reasoning and content separately for logging
+                        if delta_message:
+                            if delta_message.reasoning:
+                                previous_reasoning_texts[i] += delta_message.reasoning
+                            if delta_message.content:
+                                previous_content_texts[i] += delta_message.content
+                            if delta_message.tool_calls:
+                                # Track tool calls - merge or add new ones
+                                for delta_tc in delta_message.tool_calls:
+                                    if delta_tc.index is not None:
+                                        # Ensure we have enough slots
+                                        while len(previous_tool_calls[i]) <= delta_tc.index:
+                                            previous_tool_calls[i].append(DeltaToolCall(index=len(previous_tool_calls[i])))
+                                        # Merge with existing tool call at this index
+                                        existing_tc = previous_tool_calls[i][delta_tc.index]
+                                        if delta_tc.id is not None:
+                                            existing_tc.id = delta_tc.id
+                                        if delta_tc.type is not None:
+                                            existing_tc.type = delta_tc.type
+                                        if delta_tc.function is not None:
+                                            if existing_tc.function is None:
+                                                existing_tc.function = DeltaFunctionCall()
+                                            if delta_tc.function.name is not None:
+                                                existing_tc.function.name = delta_tc.function.name
+                                            if delta_tc.function.arguments is not None:
+                                                if existing_tc.function.arguments is None:
+                                                    existing_tc.function.arguments = ""
+                                                existing_tc.function.arguments += delta_tc.function.arguments
 
                     # set the previous values for the next iteration
                     previous_num_tokens[i] += len(output.token_ids)
@@ -1315,19 +1385,86 @@ class OpenAIServingChat(OpenAIServing):
             if self.enable_log_outputs and self.request_logger:
                 # Log the complete response for each choice
                 for i in range(num_choices):
-                    full_text = (
-                        previous_texts[i]
-                        if previous_texts and i < len(previous_texts)
-                        else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                    reasoning_text = previous_reasoning_texts[i]
+                    content_text = previous_content_texts[i]
+                    tool_calls_list = previous_tool_calls[i]
+                    
+                    logger.debug(
+                        "Streaming complete for request %s, choice %d: reasoning_length=%d, content_length=%d, tool_calls=%d",
+                        request_id, i, len(reasoning_text), len(content_text), len(tool_calls_list)
                     )
-                    self.request_logger.log_outputs(
-                        request_id=request_id,
-                        outputs=full_text,
-                        output_token_ids=None,  # Consider also logging all token IDs
-                        finish_reason="streaming_complete",
-                        is_streaming=True,
-                        delta=False,
-                    )
+                    
+                    if reasoning_text:
+                        logger.debug(
+                            "Logging reasoning part for request %s: [reasoning] %s...",
+                            request_id, reasoning_text[:100]
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=f"[reasoning] {reasoning_text}",
+                            output_token_ids=None,
+                            finish_reason=None,
+                            is_streaming=True,
+                            delta=False,
+                        )
+                    
+                    if content_text:
+                        logger.debug(
+                            "Logging content part for request %s: %s...",
+                            request_id, content_text[:100]
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=content_text,
+                            output_token_ids=None,
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
+                    
+                    # Log tool calls if present (similar to non-streaming mode)
+                    if tool_calls_list:
+                        tool_call_descriptions = []
+                        for tc in tool_calls_list:
+                            if tc.function and tc.function.name and tc.function.arguments:
+                                tool_call_descriptions.append(
+                                    f"{tc.function.name}({tc.function.arguments})"
+                                )
+                        if tool_call_descriptions:
+                            tool_calls_str = ", ".join(tool_call_descriptions)
+                            tool_calls_output = f"[tool_calls: {tool_calls_str}]"
+                            logger.debug(
+                                "Logging tool calls for request %s: %s",
+                                request_id, tool_calls_output[:200]
+                            )
+                            self.request_logger.log_outputs(
+                                request_id=request_id,
+                                outputs=tool_calls_output,
+                                output_token_ids=None,
+                                finish_reason="streaming_complete",
+                                is_streaming=True,
+                                delta=False,
+                            )
+                    
+                    # If neither reasoning nor content nor tool calls, log a fallback message
+                    if not reasoning_text and not content_text and not tool_calls_list:
+                        full_text = (
+                            previous_texts[i]
+                            if previous_texts and i < len(previous_texts)
+                            else f"<streaming_complete: {previous_num_tokens[i]} tokens>"
+                        )
+                        logger.debug(
+                            "No separate reasoning/content/tool_calls tracked, logging full text for request %s",
+                            request_id
+                        )
+                        self.request_logger.log_outputs(
+                            request_id=request_id,
+                            outputs=full_text,
+                            output_token_ids=None,
+                            finish_reason="streaming_complete",
+                            is_streaming=True,
+                            delta=False,
+                        )
 
         except Exception as e:
             # TODO: Use a vllm-specific Validation Error
@@ -1391,7 +1528,8 @@ class OpenAIServingChat(OpenAIServing):
                 if not request.include_reasoning:
                     reasoning = None
 
-                if self.tool_parser is not None:
+                # Only extract and include tool calls if tool_choice is not "none"
+                if self.tool_parser is not None and request.tool_choice != "none":
                     tool_parser = self.tool_parser(tokenizer)
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
@@ -1840,17 +1978,31 @@ class OpenAIServingChat(OpenAIServing):
         # if the model supports it. TODO: Support browsing.
         assert not self.supports_browsing
         assert not self.supports_code_interpreter
+
+        # When tool_choice is "none", don't include tool definitions in the prompt
+        # so the model won't see or attempt to use tools
+        include_tools = request.tools is not None and request.tool_choice != "none"
+        tools_for_prompt = request.tools if include_tools else None
+
         sys_msg = get_system_message(
             reasoning_effort=request.reasoning_effort,
             browser_description=None,
             python_description=None,
-            with_custom_tools=request.tools is not None,
+            with_custom_tools=include_tools,
         )
         messages.append(sys_msg)
 
-        # Add developer message.
-        dev_msg = get_developer_message(tools=request.tools)
-        messages.append(dev_msg)
+        # Add developer message only if there are function tools
+        # Check if tools_for_prompt contains any "function" type tools
+        has_function_tools = False
+        if tools_for_prompt:
+            has_function_tools = any(
+                tool.type == "function" for tool in tools_for_prompt
+            )
+        
+        if has_function_tools:
+            dev_msg = get_developer_message(tools=tools_for_prompt)
+            messages.append(dev_msg)
 
         # Add user message.
         for chat_msg in request.messages:
