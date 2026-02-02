@@ -204,7 +204,6 @@ if TYPE_CHECKING:
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
     VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS: bool = False
-    VLLM_RENDER_HARMONY_INPUT: bool = False
     VLLM_TOOL_JSON_ERROR_AUTOMATIC_RETRY: bool = False
     VLLM_CUSTOM_SCOPES_FOR_PROFILING: bool = False
     VLLM_NVTX_SCOPES_FOR_PROFILING: bool = False
@@ -1401,12 +1400,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allows harmony instructions to be injected on system messages
     "VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS": lambda: bool(
         int(os.getenv("VLLM_GPT_OSS_HARMONY_SYSTEM_INSTRUCTIONS", "0"))
-    ),
-    # If enabled, apply chat template rendering to Completion API input for gpt-oss models.
-    # If disabled (default), pass raw prompt without any template rendering.
-    # Enable this if you want the Completion API to behave like Chat API with template.
-    "VLLM_RENDER_HARMONY_INPUT": lambda: bool(
-        int(os.getenv("VLLM_RENDER_HARMONY_INPUT", "0"))
     ),
     # Enable automatic retry when tool call JSON parsing fails
     # If enabled, returns an error message to the model to retry

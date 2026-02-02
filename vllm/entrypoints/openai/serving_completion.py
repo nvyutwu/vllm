@@ -13,7 +13,6 @@ from typing import cast
 import jinja2
 from fastapi import Request
 
-from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.logger import RequestLogger
 from vllm.entrypoints.openai.protocol import (
@@ -97,10 +96,6 @@ class OpenAIServingCompletion(OpenAIServing):
         self.use_harmony = HARMONY_AVAILABLE and self.model_config.hf_config.model_type == "gpt_oss"
         if self.use_harmony:
             logger.info("Enabling Harmony format for gpt-oss model in Completion API")
-            if envs.VLLM_RENDER_HARMONY_INPUT:
-                logger.info("Harmony input rendering is ENABLED (chat template will be applied)")
-            else:
-                logger.info("Harmony input rendering is DISABLED (raw prompt will be used)")
             # Add stop tokens for Harmony assistant actions
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []
@@ -190,54 +185,12 @@ class OpenAIServingCompletion(OpenAIServing):
             else:
                 tokenizer = await self.engine_client.get_tokenizer()
             
-            # Optionally apply chat template for gpt-oss models when enabled
-            # By default (VLLM_RENDER_HARMONY_INPUT=0), raw prompt is passed without rendering
-            if self.use_harmony and envs.VLLM_RENDER_HARMONY_INPUT:
-                from vllm.entrypoints.chat_utils import apply_hf_chat_template, ConversationMessage
-                
-                logger.debug("Applying Harmony chat template to input")
-                
-                # Convert prompt to messages and use chat template (like Ollama does)
-                prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
-                engine_prompts = []
-                
-                for prompt_text in prompts:
-                    # Convert to simple user message  
-                    conversation = [ConversationMessage(role="user", content=prompt_text)]
-                    
-                    # Apply chat template to get Harmony-formatted prompt string
-                    # This produces: <|start|>system<|message|>...<|end|>
-                    #                <|start|>user<|message|>{prompt}<|end|>
-                    #                <|start|>assistant
-                    prompt_str = apply_hf_chat_template(
-                        tokenizer=tokenizer,
-                        conversation=conversation,
-                        chat_template=None,  # Use model's default chat template
-                        tools=None,  # No tools for basic completion
-                        model_config=self.model_config,
-                        add_generation_prompt=True,  # Adds <|start|>assistant
-                    )
-                    
-                    # Log the rendered prompt for debugging
-                    logger.debug(f"[Harmony Input] Rendered prompt:\n{prompt_str}")
-                    
-                    # Tokenize the chat-templated string
-                    # Special tokens are already in the template, so don't add them again
-                    prompt_token_ids = tokenizer.encode(prompt_str, add_special_tokens=False)
-                    
-                    engine_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-                    # Store the rendered prompt string for echo support
-                    engine_prompt["prompt"] = prompt_str
-                    if request.cache_salt is not None:
-                        engine_prompt["cache_salt"] = request.cache_salt
-                    engine_prompts.append(engine_prompt)
-            else:
-                renderer = self._get_renderer(tokenizer)
-                engine_prompts = await renderer.render_prompt_and_embeds(
-                    prompt_or_prompts=request.prompt,
-                    prompt_embeds=request.prompt_embeds,
-                    config=self._build_render_config(request),
-                )
+            renderer = self._get_renderer(tokenizer)
+            engine_prompts = await renderer.render_prompt_and_embeds(
+                prompt_or_prompts=request.prompt,
+                prompt_embeds=request.prompt_embeds,
+                config=self._build_render_config(request),
+            )
         except ValueError as e:
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(str(e))
