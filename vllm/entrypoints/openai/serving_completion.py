@@ -24,10 +24,8 @@ from vllm.entrypoints.openai.protocol import (
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
     ErrorResponse,
-    FunctionCall,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
-    ToolCall,
     UsageInfo,
 )
 from vllm.entrypoints.openai.serving_engine import OpenAIServing, clamp_prompt_logprobs
@@ -40,7 +38,6 @@ from vllm.logprobs import Logprob
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.utils import random_uuid
 from vllm.utils.async_utils import merge_async_iterators
 from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
@@ -52,7 +49,6 @@ payload_logger = logging.getLogger("vllm.payload")
 try:
     from vllm.entrypoints.harmony_utils import (
         get_stop_tokens_for_assistant_actions,
-        get_streamable_parser_for_assistant,
     )
     HARMONY_AVAILABLE = True
 except ImportError:
@@ -105,27 +101,12 @@ class OpenAIServingCompletion(OpenAIServing):
                 logger.info("Harmony input rendering is ENABLED (chat template will be applied)")
             else:
                 logger.info("Harmony input rendering is DISABLED (raw prompt will be used)")
-            if envs.VLLM_PARSE_HARMONY_OUTPUT:
-                logger.info("Harmony output parsing is ENABLED (thinking, content, tool_calls will be separated)")
-            else:
-                logger.warning("Harmony output parsing is DISABLED - raw model output will be returned")
             # Add stop tokens for Harmony assistant actions
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []
             self.default_sampling_params["stop_token_ids"].extend(
                 get_stop_tokens_for_assistant_actions()
             )
-            # For Completion API, show special tokens by default so users can see
-            # the raw Harmony format (e.g., <|channel|>analysis<|message|>...)
-            # This is different from Chat API where we parse and hide them.
-            self.default_sampling_params["skip_special_tokens"] = False
-            
-            # Cache EOS token IDs for efficient detection in streaming
-            # gpt-oss has two EOS tokens: <|call|> for tool calls, <|return|> for other contents
-            # These are excluded from output.text but should be included when skip_special_tokens=False
-            self.harmony_eos_token_ids: list[int] = []
-        else:
-            self.harmony_eos_token_ids = []
 
     async def create_completion(
         self,
@@ -209,20 +190,6 @@ class OpenAIServingCompletion(OpenAIServing):
             else:
                 tokenizer = await self.engine_client.get_tokenizer()
             
-            # Initialize EOS token IDs for gpt-oss on first request (lazy initialization)
-            if self.use_harmony and not self.harmony_eos_token_ids and tokenizer is not None:
-                try:
-                    call_token_id = tokenizer.convert_tokens_to_ids("<|call|>")
-                    return_token_id = tokenizer.convert_tokens_to_ids("<|return|>")
-                    if call_token_id != tokenizer.unk_token_id:
-                        self.harmony_eos_token_ids.append(call_token_id)
-                        logger.info(f"Cached gpt-oss EOS token <|call|> with ID: {call_token_id}")
-                    if return_token_id != tokenizer.unk_token_id:
-                        self.harmony_eos_token_ids.append(return_token_id)
-                        logger.info(f"Cached gpt-oss EOS token <|return|> with ID: {return_token_id}")
-                except Exception as e:
-                    logger.warning(f"Failed to cache gpt-oss EOS token IDs: {e}")
-            
             # Optionally apply chat template for gpt-oss models when enabled
             # By default (VLLM_RENDER_HARMONY_INPUT=0), raw prompt is passed without rendering
             if self.use_harmony and envs.VLLM_RENDER_HARMONY_INPUT:
@@ -238,27 +205,17 @@ class OpenAIServingCompletion(OpenAIServing):
                     # Convert to simple user message  
                     conversation = [ConversationMessage(role="user", content=prompt_text)]
                     
-                    # Prepare chat template kwargs for gpt-oss
-                    chat_template_kwargs = {}
-                    if request.reasoning_effort is not None:
-                        chat_template_kwargs["reasoning_effort"] = request.reasoning_effort
-                    if request.builtin_tools is not None:
-                        chat_template_kwargs["builtin_tools"] = request.builtin_tools
-                        logger.debug(f"Enabling built-in tools: {request.builtin_tools}")
-                    
                     # Apply chat template to get Harmony-formatted prompt string
                     # This produces: <|start|>system<|message|>...<|end|>
                     #                <|start|>user<|message|>{prompt}<|end|>
                     #                <|start|>assistant
-                    # With builtin_tools, also includes browser/python tool definitions
                     prompt_str = apply_hf_chat_template(
                         tokenizer=tokenizer,
                         conversation=conversation,
                         chat_template=None,  # Use model's default chat template
-                        tools=None,  # No custom tools for basic completion
+                        tools=None,  # No tools for basic completion
                         model_config=self.model_config,
                         add_generation_prompt=True,  # Adds <|start|>assistant
-                        **chat_template_kwargs,
                     )
                     
                     # Log the rendered prompt for debugging
@@ -493,26 +450,11 @@ class OpenAIServingCompletion(OpenAIServing):
 
         # Track accumulated content for output logging
         previous_texts = [""] * num_choices * num_prompts
-        previous_thinking_texts = [""] * num_choices * num_prompts
-        previous_tool_calls_content: list[list[tuple[str, str]]] = [[] for _ in range(num_choices * num_prompts)]
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
             stream_options, self.enable_force_include_usage
         )
-        
-        # Initialize Harmony parsers for streaming (similar to serving_chat.py)
-        harmony_parsers = None
-        # Track accumulated tool call content per choice (parsed at the end)
-        accumulated_tool_content: dict[int, str] = {}
-        current_tool_recipient: dict[int, str | None] = {}
-        
-        if self.use_harmony:
-            harmony_parsers = [
-                get_streamable_parser_for_assistant() 
-                for _ in range(num_choices * num_prompts)
-            ]
-            logger.info(f"Initialized {len(harmony_parsers)} Harmony parsers for streaming")
 
         try:
             async for prompt_idx, res in result_generator:
@@ -574,122 +516,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         has_echoed[i] = True
                     else:
                         # return just the delta
-                        delta_text = ""
-                        delta_thinking = ""
-                        delta_tool_calls: list[ToolCall] = []
-                        
-                        # Parse Harmony output (serving_chat.py lines 761-853)
-                        # Only parse if VLLM_PARSE_HARMONY_OUTPUT is enabled (default: True)
-                        if self.use_harmony and harmony_parsers is not None and envs.VLLM_PARSE_HARMONY_OUTPUT:
-                            harmony_parser = harmony_parsers[i]
-                            prev_recipient = harmony_parser.current_recipient
-                            
-                            # Use engine's output.text (which has proper UTF-8 incremental decoding)
-                            # instead of harmony_parser.last_content_delta (which decodes tokens individually)
-                            for token_id in output.token_ids:
-                                harmony_parser.process(token_id)
-                            
-                            # Use properly decoded text from engine's detokenizer
-                            content_delta = output.text
-                            
-                            # Route content based on channel (like Ollama's AddContent)
-                            cur_channel = harmony_parser.current_channel
-                            cur_recipient = harmony_parser.current_recipient
-                            
-                            if cur_channel == "final":
-                                delta_text += content_delta
-                            elif cur_channel == "analysis":
-                                # Check if it's a tool call on analysis channel (python can be on analysis)
-                                if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
-                                    # Built-in tool on analysis channel
-                                    if i not in accumulated_tool_content:
-                                        accumulated_tool_content[i] = ""
-                                        current_tool_recipient[i] = cur_recipient
-                                    accumulated_tool_content[i] += content_delta
-                                else:
-                                    # Regular reasoning content
-                                    delta_thinking += content_delta
-                            elif cur_channel == "commentary" and cur_recipient:
-                                # Tool call content - accumulate for both custom and built-in tools
-                                # Custom tools: functions.*
-                                # Built-in tools: browser.*, python
-                                if (cur_recipient.startswith("functions.") or 
-                                    cur_recipient.startswith("browser.") or 
-                                    cur_recipient == "python"):
-                                    if i not in accumulated_tool_content:
-                                        accumulated_tool_content[i] = ""
-                                        current_tool_recipient[i] = cur_recipient
-                                    accumulated_tool_content[i] += content_delta
-                            
-                            # Parse tool calls only when done (use output.finish_reason)
-                            if output.finish_reason is not None:
-                                if i in accumulated_tool_content and current_tool_recipient.get(i):
-                                    # Drain and parse the accumulated tool call
-                                    recipient = current_tool_recipient[i]
-                                    tool_content = accumulated_tool_content[i]
-                                    
-                                    # Extract function name based on recipient format
-                                    function_name = None
-                                    if recipient and recipient.startswith("functions."):
-                                        # Custom tools: functions.calc → "calc"
-                                        function_name = recipient.split("functions.", 1)[1]
-                                    elif recipient and recipient.startswith("browser."):
-                                        # Built-in browser tools: browser.search → "browser.search"
-                                        function_name = recipient
-                                    elif recipient == "python":
-                                        # Built-in python tool: python → "python"
-                                        function_name = "python"
-                                    
-                                    if function_name:
-                                        # Use cmpl-tool-* ID for Completion API (not chatcmpl-tool-*)
-                                        tool_call_id = f"cmpl-tool-{random_uuid()}"
-                                        delta_tool_calls.append(
-                                            ToolCall(
-                                                id=tool_call_id,
-                                                function=FunctionCall(
-                                                    name=function_name,
-                                                    arguments=tool_content,
-                                                )
-                                            )
-                                        )
-                                        tool_type = "built-in" if not recipient.startswith("functions.") else "custom"
-                                        logger.debug(
-                                            f"[Harmony Output] {tool_type.capitalize()} tool call in final chunk: "
-                                            f"{function_name}({tool_content[:50]}...)"
-                                        )
-                            
-                            if delta_text or delta_thinking:
-                                logger.debug(
-                                    f"[Harmony Output] Delta - content: {repr(delta_text)}, "
-                                    f"thinking: {repr(delta_thinking)}, "
-                                    f"channel: {harmony_parser.current_channel}"
-                                )
-                        else:
-                            # The engine's detokenizer handles incremental UTF-8 decoding correctly,
-                            # preventing "��" (U+FFFD) for multi-byte characters like emojis.
-                            # Use engine's output.text for content (correct UTF-8 handling)
-                            delta_text = output.text
-                            
-                            # Determine skip_special_tokens following the same priority as to_sampling_params
-                            if request.skip_special_tokens is not None:
-                                should_skip_special_tokens = request.skip_special_tokens
-                            else:
-                                should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
-                            
-                            # For gpt-oss: Append EOS tokens explicitly only when skip_special_tokens=False
-                            # (they're excluded from output.text but should be included when showing special tokens)
-                            # EOS tokens (<|call|>, <|return|>) are complete tokens, safe to decode individually
-                            if (self.use_harmony and self.harmony_eos_token_ids and tokenizer is not None 
-                                and not should_skip_special_tokens):
-                                for token_id in output.token_ids:
-                                    if token_id in self.harmony_eos_token_ids:
-                                        try:
-                                            eos_str = tokenizer.decode([token_id], skip_special_tokens=False)
-                                            delta_text += eos_str
-                                            logger.debug(f"[Harmony Streaming] Appended EOS token: {repr(eos_str)}")
-                                        except Exception as e:
-                                            logger.warning(f"Failed to decode EOS token {token_id}: {e}")
-                        
+                        delta_text = output.text
                         delta_token_ids = output.token_ids
                         out_logprobs = output.logprobs
 
@@ -720,20 +547,11 @@ class OpenAIServingCompletion(OpenAIServing):
                     else:
                         logprobs = None
 
-                    # Track text length using actual delta being sent, not output.text
-                    # When Harmony parsing is active, delta_text may differ from output.text
-                    # (output.text can contain incomplete UTF-8 like "��" during streaming)
-                    if self.use_harmony and harmony_parsers is not None and envs.VLLM_PARSE_HARMONY_OUTPUT:
-                        text_len_delta = len(delta_text)
-                    else:
-                        text_len_delta = len(output.text)
-                    
-                    previous_text_lens[i] += text_len_delta
+                    previous_text_lens[i] += len(output.text)
                     previous_num_tokens[i] += len(output.token_ids)
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
 
-                    # Prepare the choice with parsed Harmony content
                     choice = CompletionResponseStreamChoice(
                         index=i,
                         text=delta_text,
@@ -747,14 +565,6 @@ class OpenAIServingCompletion(OpenAIServing):
                             else None
                         ),
                     )
-                    
-                    # Add thinking field if we have reasoning content (Harmony models)
-                    if self.use_harmony and delta_thinking:
-                        choice.thinking = delta_thinking
-                    
-                    # Add tool_calls only in final chunk when done 
-                    if self.use_harmony and delta_tool_calls:
-                        choice.tool_calls = delta_tool_calls
 
                     chunk = CompletionStreamResponse(
                         id=request_id,
@@ -777,13 +587,6 @@ class OpenAIServingCompletion(OpenAIServing):
                     # Track content for output logging
                     if delta_text:
                         previous_texts[i] += delta_text
-                    if delta_thinking:
-                        previous_thinking_texts[i] += delta_thinking
-                    if delta_tool_calls:
-                        for tc in delta_tool_calls:
-                            previous_tool_calls_content[i].append(
-                                (tc.function.name, tc.function.arguments)
-                            )
 
             total_prompt_tokens = sum(num_prompt_tokens)
             total_completion_tokens = sum(previous_num_tokens)
@@ -848,41 +651,13 @@ class OpenAIServingCompletion(OpenAIServing):
             # Output logging for streaming complete
             if self.enable_log_outputs and self.request_logger:
                 for i in range(num_choices * num_prompts):
-                    thinking_text = previous_thinking_texts[i]
                     content_text = previous_texts[i]
-                    tool_calls_list = previous_tool_calls_content[i]
-
-                    # Log reasoning with [reasoning] prefix
-                    if thinking_text:
-                        self.request_logger.log_outputs(
-                            request_id=request_id,
-                            outputs=f"[reasoning] {thinking_text}",
-                            output_token_ids=None,
-                            finish_reason=None,
-                            is_streaming=True,
-                            delta=False,
-                        )
 
                     # Log content
                     if content_text:
                         self.request_logger.log_outputs(
                             request_id=request_id,
                             outputs=content_text,
-                            output_token_ids=None,
-                            finish_reason="streaming_complete",
-                            is_streaming=True,
-                            delta=False,
-                        )
-
-                    # Log tool calls with [tool_calls] prefix
-                    if tool_calls_list:
-                        tool_call_descriptions = [
-                            f"{name}({args})" for name, args in tool_calls_list
-                        ]
-                        tool_calls_str = ", ".join(tool_call_descriptions)
-                        self.request_logger.log_outputs(
-                            request_id=request_id,
-                            outputs=f"[tool_calls: {tool_calls_str}]",
                             output_token_ids=None,
                             finish_reason="streaming_complete",
                             is_streaming=True,
@@ -922,11 +697,6 @@ class OpenAIServingCompletion(OpenAIServing):
 
             for output in final_res.outputs:
                 # Note: request.max_tokens can be None if user wants full context
-                
-                # Initialize Harmony-specific fields (must be before if/else for echo)
-                output_thinking = None
-                output_tool_calls = None
-                
                 if request.echo:
                     if request.return_token_ids:
                         prompt_text = ""
@@ -949,276 +719,11 @@ class OpenAIServingCompletion(OpenAIServing):
                                 *output.logprobs,
                             ]
 
-                        # For gpt-oss with Harmony parsing enabled:
-                        # Parse only the GENERATED portion, then combine with echoed prompt
-                        #
-                        # IMPORTANT: Track token IDs per channel instead of using parser's decoded text.
-                        # The parser decodes tokens individually which breaks multi-byte UTF-8 characters
-                        if self.use_harmony and envs.VLLM_PARSE_HARMONY_OUTPUT:
-                            # Parse the generated tokens to extract thinking/content/tool_calls
-                            parser = get_streamable_parser_for_assistant()
-                            
-                            # Track token IDs per channel for proper UTF-8 decoding
-                            thinking_tokens: list[int] = []
-                            final_tokens: list[int] = []
-                            tool_calls_data: list[tuple[str, list[int]]] = []
-                            current_tool_tokens: list[int] = []
-                            current_tool_recipient: str | None = None
-                            prev_recipient: str | None = None
-                            
-                            for token_id in output.token_ids:
-                                parser.process(token_id)
-                                
-                                cur_channel = parser.current_channel
-                                cur_recipient = parser.current_recipient
-                                
-                                # Detect tool call boundary (recipient change)
-                                if cur_recipient != prev_recipient:
-                                    if current_tool_tokens and prev_recipient:
-                                        if (prev_recipient.startswith("functions.") or 
-                                            prev_recipient.startswith("browser.") or 
-                                            prev_recipient == "python"):
-                                            tool_calls_data.append((prev_recipient, list(current_tool_tokens)))
-                                    current_tool_tokens = []
-                                
-                                # Route token based on channel
-                                if cur_channel == "final":
-                                    final_tokens.append(token_id)
-                                elif cur_channel == "analysis":
-                                    if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
-                                        current_tool_tokens.append(token_id)
-                                        current_tool_recipient = cur_recipient
-                                    else:
-                                        thinking_tokens.append(token_id)
-                                elif cur_channel == "commentary" and cur_recipient:
-                                    if (cur_recipient.startswith("functions.") or 
-                                        cur_recipient.startswith("browser.") or 
-                                        cur_recipient == "python"):
-                                        current_tool_tokens.append(token_id)
-                                        current_tool_recipient = cur_recipient
-                                
-                                prev_recipient = cur_recipient
-                            
-                            # Handle any remaining tool call tokens
-                            if current_tool_tokens and current_tool_recipient:
-                                tool_calls_data.append((current_tool_recipient, list(current_tool_tokens)))
-                            
-                            # Decode using tokenizer (handles multi-byte UTF-8 correctly)
-                            # Respect user's skip_special_tokens setting even when parsing is enabled
-                            # Determine skip_special_tokens following the same priority as to_sampling_params
-                            if request.skip_special_tokens is not None:
-                                should_skip_special_tokens = request.skip_special_tokens
-                            else:
-                                should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
-                            
-                            parsed_content = ""
-                            tool_calls_list: list[ToolCall] = []
-                            
-                            if tokenizer is not None:
-                                if final_tokens:
-                                    parsed_content = tokenizer.decode(final_tokens, skip_special_tokens=should_skip_special_tokens)
-                                if thinking_tokens:
-                                    output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=should_skip_special_tokens)
-                                
-                                # Build tool calls with properly decoded arguments
-                                for recipient, tool_tokens in tool_calls_data:
-                                    tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=should_skip_special_tokens)
-                                    function_name = None
-                                    if recipient.startswith("functions."):
-                                        function_name = recipient.split("functions.", 1)[1]
-                                    elif recipient.startswith("browser."):
-                                        function_name = recipient
-                                    elif recipient == "python":
-                                        function_name = "python"
-                                    
-                                    if function_name:
-                                        tool_call_id = f"cmpl-tool-{random_uuid()}"
-                                        tool_calls_list.append(
-                                            ToolCall(
-                                                id=tool_call_id,
-                                                function=FunctionCall(
-                                                    name=function_name,
-                                                    arguments=tool_content,
-                                                )
-                                            )
-                                        )
-                            
-                            # Combine: echo prompt + parsed final content
-                            output_text = prompt_text + parsed_content
-                            if tool_calls_list:
-                                output_tool_calls = tool_calls_list
-                            
-                            logger.debug(
-                                f"[Harmony Echo] prompt echoed, generated parsed - "
-                                f"content: {repr(parsed_content)}, thinking: {repr(output_thinking)}"
-                            )
-                        else:
-                            # Parsing disabled with echo - decode output respecting skip_special_tokens
-                            # Determine skip_special_tokens following the same priority as to_sampling_params
-                            if request.skip_special_tokens is not None:
-                                should_skip_special_tokens = request.skip_special_tokens
-                            else:
-                                should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
-                            
-                            if self.use_harmony and tokenizer is not None:
-                                try:
-                                    generated_text = tokenizer.decode(
-                                        list(output.token_ids), skip_special_tokens=should_skip_special_tokens
-                                    )
-                                    output_text = prompt_text + generated_text
-                                except Exception:
-                                    output_text = prompt_text + output.text
-                            else:
-                                output_text = prompt_text + output.text
+                        output_text = prompt_text + output.text
                 else:
                     token_ids = output.token_ids
                     out_logprobs = output.logprobs
-                    
-                    # Parse Harmony output for non-streaming (similar to serving_chat.py)
-                    # Only parse if VLLM_PARSE_HARMONY_OUTPUT is enabled (default: True)
-                    if self.use_harmony and envs.VLLM_PARSE_HARMONY_OUTPUT:
-                        # Log raw model output tokens BEFORE parsing for debugging
-                        # This helps verify if text field issues are parser bugs or actual model output
-                        logger.debug(
-                            f"[Harmony Raw Output] token_ids ({len(token_ids)} tokens): {list(token_ids)}"
-                        )
-                        # Also decode and log the raw text for easier reading
-                        if tokenizer is not None:
-                            try:
-                                raw_decoded_text = tokenizer.decode(token_ids, skip_special_tokens=False)
-                                logger.debug(
-                                    f"[Harmony Raw Output] decoded text (with special tokens):\n{raw_decoded_text}"
-                                )
-                            except Exception as e:
-                                logger.warning(f"[Harmony Raw Output] Failed to decode tokens: {e}")
-                        
-                        # Parse messages from token IDs using Harmony parser
-                        # Route content by channel (matching streaming logic):
-                        # - final channel → output_text
-                        # - analysis channel (no tool recipient) → output_thinking
-                        # - commentary/analysis with tool recipient → tool_calls
-                        #
-                        # IMPORTANT: Track token IDs per channel instead of using parser's decoded text.
-                        # The parser decodes tokens individually which breaks multi-byte UTF-8 characters
-                        parser = get_streamable_parser_for_assistant()
-                        
-                        # Track token IDs per channel for proper UTF-8 decoding
-                        thinking_tokens: list[int] = []
-                        final_tokens: list[int] = []
-                        tool_calls_data: list[tuple[str, list[int]]] = []  # [(recipient, token_ids), ...]
-                        current_tool_tokens: list[int] = []
-                        current_tool_recipient: str | None = None
-                        prev_recipient: str | None = None
-                        
-                        for token_id in token_ids:
-                            parser.process(token_id)
-                            
-                            cur_channel = parser.current_channel
-                            cur_recipient = parser.current_recipient
-                            
-                            # Detect tool call boundary (recipient change)
-                            if cur_recipient != prev_recipient:
-                                if current_tool_tokens and prev_recipient:
-                                    if (prev_recipient.startswith("functions.") or 
-                                        prev_recipient.startswith("browser.") or 
-                                        prev_recipient == "python"):
-                                        tool_calls_data.append((prev_recipient, list(current_tool_tokens)))
-                                current_tool_tokens = []
-                            
-                            # Route token based on channel
-                            if cur_channel == "final":
-                                final_tokens.append(token_id)
-                            elif cur_channel == "analysis":
-                                if cur_recipient and (cur_recipient.startswith("browser.") or cur_recipient == "python"):
-                                    current_tool_tokens.append(token_id)
-                                    current_tool_recipient = cur_recipient
-                                else:
-                                    thinking_tokens.append(token_id)
-                            elif cur_channel == "commentary" and cur_recipient:
-                                if (cur_recipient.startswith("functions.") or 
-                                    cur_recipient.startswith("browser.") or 
-                                    cur_recipient == "python"):
-                                    current_tool_tokens.append(token_id)
-                                    current_tool_recipient = cur_recipient
-                            
-                            prev_recipient = cur_recipient
-                        
-                        # Handle any remaining tool call tokens
-                        if current_tool_tokens and current_tool_recipient:
-                            tool_calls_data.append((current_tool_recipient, list(current_tool_tokens)))
-                        
-                        # Decode using tokenizer (handles multi-byte UTF-8 correctly)
-                        # Respect user's skip_special_tokens setting even when parsing is enabled
-                        # Determine skip_special_tokens following the same priority as to_sampling_params
-                        if request.skip_special_tokens is not None:
-                            should_skip_special_tokens = request.skip_special_tokens
-                        else:
-                            should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
-                        
-                        output_text = ""
-                        output_thinking = None
-                        tool_calls_list: list[ToolCall] = []
-                        
-                        if tokenizer is not None:
-                            if final_tokens:
-                                output_text = tokenizer.decode(final_tokens, skip_special_tokens=should_skip_special_tokens)
-                            if thinking_tokens:
-                                output_thinking = tokenizer.decode(thinking_tokens, skip_special_tokens=should_skip_special_tokens)
-                            
-                            # Build tool calls with properly decoded arguments
-                            for recipient, tool_tokens in tool_calls_data:
-                                tool_content = tokenizer.decode(tool_tokens, skip_special_tokens=should_skip_special_tokens)
-                                function_name = None
-                                if recipient.startswith("functions."):
-                                    function_name = recipient.split("functions.", 1)[1]
-                                elif recipient.startswith("browser."):
-                                    function_name = recipient
-                                elif recipient == "python":
-                                    function_name = "python"
-                                
-                                if function_name:
-                                    tool_call_id = f"cmpl-tool-{random_uuid()}"
-                                    tool_calls_list.append(
-                                        ToolCall(
-                                            id=tool_call_id,
-                                            function=FunctionCall(
-                                                name=function_name,
-                                                arguments=tool_content,
-                                            )
-                                        )
-                                    )
-                        
-                        if tool_calls_list:
-                            output_tool_calls = tool_calls_list
-                        
-                        # Log final parsed result
-                        if tool_calls_list:
-                            tool_names = [tc.function.name for tc in tool_calls_list]
-                            logger.debug(
-                                f"[Harmony Output] Final parsed - content: {repr(output_text)}, "
-                                f"thinking: {repr(output_thinking)}, "
-                                f"tool_calls: {tool_names}"
-                            )
-                        else:
-                            logger.debug(
-                                f"[Harmony Output] Final parsed - content: {repr(output_text)}, "
-                                f"thinking: {repr(output_thinking)}"
-                            )
-                    else:
-                        # Parsing disabled - for gpt-oss models, decode with skip_special_tokens from request
-                        # Determine skip_special_tokens following the same priority as to_sampling_params
-                        if request.skip_special_tokens is not None:
-                            should_skip_special_tokens = request.skip_special_tokens
-                        else:
-                            should_skip_special_tokens = self.default_sampling_params.get("skip_special_tokens", True)
-                        
-                        if self.use_harmony and tokenizer is not None:
-                            try:
-                                output_text = tokenizer.decode(token_ids, skip_special_tokens=should_skip_special_tokens)
-                            except Exception:
-                                output_text = output.text
-                        else:
-                            output_text = output.text
+                    output_text = output.text
 
                 if request.logprobs is not None:
                     assert out_logprobs is not None, "Did not output logprobs"
@@ -1245,9 +750,6 @@ class OpenAIServingCompletion(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
-                    # Add Harmony-specific fields
-                    thinking=output_thinking,
-                    tool_calls=output_tool_calls,
                 )
                 choices.append(choice_data)
 
@@ -1310,18 +812,6 @@ class OpenAIServingCompletion(OpenAIServing):
         # Output logging for non-streaming response
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
-                # Log reasoning with [reasoning] prefix
-                if hasattr(choice, 'thinking') and choice.thinking:
-                    self.request_logger.log_outputs(
-                        request_id=request_id,
-                        outputs=f"[reasoning] {choice.thinking}",
-                        output_token_ids=None,
-                        finish_reason=None,
-                        is_streaming=False,
-                        delta=False,
-                    )
-
-                # Log content
                 if choice.text:
                     self.request_logger.log_outputs(
                         request_id=request_id,
@@ -1331,25 +821,6 @@ class OpenAIServingCompletion(OpenAIServing):
                         is_streaming=False,
                         delta=False,
                     )
-
-                # Log tool calls with [tool_calls] prefix
-                if hasattr(choice, 'tool_calls') and choice.tool_calls:
-                    tool_call_descriptions = []
-                    for tc in choice.tool_calls:
-                        if hasattr(tc.function, 'name') and hasattr(tc.function, 'arguments'):
-                            tool_call_descriptions.append(
-                                f"{tc.function.name}({tc.function.arguments})"
-                            )
-                    if tool_call_descriptions:
-                        tool_calls_str = ", ".join(tool_call_descriptions)
-                        self.request_logger.log_outputs(
-                            request_id=request_id,
-                            outputs=f"[tool_calls: {tool_calls_str}]",
-                            output_token_ids=None,
-                            finish_reason=choice.finish_reason,
-                            is_streaming=False,
-                            delta=False,
-                        )
 
         return CompletionResponse(
             id=request_id,

@@ -1524,21 +1524,6 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
 
             if self.use_harmony:
-                # Debug logging: raw model output for gpt-oss
-                logger.debug(
-                    "[Harmony Raw Output] token_ids (%d tokens): %s",
-                    len(token_ids), list(token_ids)
-                )
-                # Decode raw text for easier reading
-                try:
-                    raw_text = tokenizer.decode(token_ids, skip_special_tokens=False)
-                    logger.debug(
-                        "[Harmony Raw Output] decoded text (with special tokens):\n%s",
-                        raw_text
-                    )
-                except Exception as e:
-                    logger.debug("[Harmony Raw Output] Failed to decode: %s", e)
-                
                 reasoning, content, _ = parse_chat_output(token_ids)
                 if not request.include_reasoning:
                     reasoning = None
