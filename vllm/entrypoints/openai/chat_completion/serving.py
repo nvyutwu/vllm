@@ -315,7 +315,10 @@ class OpenAIServingChat(OpenAIServing):
                 )
             else:
                 # For GPT-OSS.
-                should_include_tools = tool_dicts is not None
+                should_include_tools = (
+                    tool_dicts is not None
+                    and request.tool_choice != "none"
+                )
                 conversation, engine_prompts = self._make_request_with_harmony(
                     request, should_include_tools
                 )
@@ -905,6 +908,7 @@ class OpenAIServingChat(OpenAIServing):
                                 token_states=token_states,
                                 prev_recipient=prev_recipient,
                                 include_reasoning=request.include_reasoning,
+                                tool_choice_none=request.tool_choice == "none",
                             )
                         )
                         harmony_tools_streamed[i] |= tools_streamed_flag
@@ -1565,7 +1569,8 @@ class OpenAIServingChat(OpenAIServing):
                 if not request.include_reasoning:
                     reasoning = None
 
-                if self.tool_parser is not None:
+                # Only extract and include tool calls if tool_choice is not "none"
+                if self.tool_parser is not None and request.tool_choice != "none":
                     if tokenizer is None:
                         raise ValueError(
                             "Tokenizer not available when `skip_tokenizer_init=True`"
@@ -2043,6 +2048,7 @@ class OpenAIServingChat(OpenAIServing):
         # if the model supports it. TODO: Support browsing.
         assert not self.supports_browsing
         assert not self.supports_code_interpreter
+
         sys_msg = get_system_message(
             reasoning_effort=request.reasoning_effort,
             browser_description=None,
@@ -2051,11 +2057,16 @@ class OpenAIServingChat(OpenAIServing):
         )
         messages.append(sys_msg)
 
-        # Add developer message.
-        if request.tools:
-            dev_msg = get_developer_message(
-                tools=request.tools if should_include_tools else None
+        # Add developer message only if there are function tools
+        tools_for_prompt = request.tools if should_include_tools else None
+        has_function_tools = False
+        if tools_for_prompt:
+            has_function_tools = any(
+                tool.type == "function" for tool in tools_for_prompt
             )
+
+        if has_function_tools:
+            dev_msg = get_developer_message(tools=tools_for_prompt)
             messages.append(dev_msg)
 
         # Add user message.

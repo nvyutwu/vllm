@@ -30,6 +30,7 @@ def extract_harmony_streaming_delta(
     token_states: list[TokenState],
     prev_recipient: str | None,
     include_reasoning: bool,
+    tool_choice_none: bool = False,
 ) -> tuple[DeltaMessage | None, bool]:
     """
     Extract a DeltaMessage from harmony parser state during streaming.
@@ -105,6 +106,7 @@ def extract_harmony_streaming_delta(
             (group.channel == "commentary" or group.channel == "analysis")
             and group.recipient
             and group.recipient.startswith("functions.")
+            and not tool_choice_none
         ):
             opened_new_call = False
             if prev_recipient != group.recipient:

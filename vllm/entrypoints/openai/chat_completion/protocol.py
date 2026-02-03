@@ -203,7 +203,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool | None = None
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1, le=_LONG_INFO.max)] | None = (
         None
@@ -448,6 +448,24 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     else replace(self.structured_outputs, **structured_outputs_kwargs)
                 )
 
+        # Merge stop_token_ids from request with default_sampling_params
+        # This is critical for gpt-oss models which need Harmony stop tokens
+        stop_token_ids = list(self.stop_token_ids) if self.stop_token_ids else []
+        default_stop_token_ids = default_sampling_params.get("stop_token_ids", [])
+        if default_stop_token_ids:
+            # Add default stop tokens that are not already in the request
+            for token_id in default_stop_token_ids:
+                if token_id not in stop_token_ids:
+                    stop_token_ids.append(token_id)
+
+        # Priority: user's explicit value > model's default > True (standard default)
+        if self.skip_special_tokens is not None:
+            skip_special_tokens = self.skip_special_tokens
+        else:
+            skip_special_tokens = default_sampling_params.get(
+                "skip_special_tokens", True
+            )
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -463,13 +481,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
+            stop_token_ids=stop_token_ids if stop_token_ids else None,
             logprobs=self.top_logprobs if self.logprobs else None,
             prompt_logprobs=prompt_logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens,
             min_tokens=self.min_tokens,
-            skip_special_tokens=self.skip_special_tokens,
+            skip_special_tokens=skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             logits_processors=get_logits_processors(
                 self.logits_processors, logits_processor_pattern

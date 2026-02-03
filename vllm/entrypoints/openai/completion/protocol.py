@@ -8,6 +8,8 @@ import time
 from dataclasses import replace
 from typing import Annotated, Any, Literal
 
+from vllm.entrypoints.chat_utils import make_tool_call_id
+
 import torch
 from pydantic import (
     Field,
@@ -72,7 +74,7 @@ class CompletionRequest(OpenAIBaseModel):
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
     min_tokens: int = 0
-    skip_special_tokens: bool = True
+    skip_special_tokens: bool | None = None
     spaces_between_special_tokens: bool = True
     truncate_prompt_tokens: Annotated[int, Field(ge=-1, le=_LONG_INFO.max)] | None = (
         None
@@ -278,6 +280,22 @@ class CompletionRequest(OpenAIBaseModel):
                     else replace(self.structured_outputs, **structured_outputs_kwargs)
                 )
 
+        # Merge stop_token_ids from request with default_sampling_params
+        merged_stop_token_ids = list(self.stop_token_ids or [])
+        default_stop_token_ids = default_sampling_params.get(
+            "stop_token_ids", [])
+        for token_id in default_stop_token_ids:
+            if token_id not in merged_stop_token_ids:
+                merged_stop_token_ids.append(token_id)
+
+        # Resolve skip_special_tokens priority:
+        # user's explicit value > model's default > True
+        if self.skip_special_tokens is not None:
+            resolved_skip_special_tokens = self.skip_special_tokens
+        else:
+            resolved_skip_special_tokens = default_sampling_params.get(
+                "skip_special_tokens", True)
+
         extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
@@ -293,13 +311,13 @@ class CompletionRequest(OpenAIBaseModel):
             min_p=min_p,
             seed=self.seed,
             stop=self.stop,
-            stop_token_ids=self.stop_token_ids,
+            stop_token_ids=merged_stop_token_ids,
             logprobs=self.logprobs,
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
             prompt_logprobs=prompt_logprobs,
-            skip_special_tokens=self.skip_special_tokens,
+            skip_special_tokens=resolved_skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
             logits_processors=get_logits_processors(
@@ -401,6 +419,17 @@ class CompletionRequest(OpenAIBaseModel):
         return data
 
 
+class FunctionCall(OpenAIBaseModel):
+    name: str
+    arguments: str
+
+
+class ToolCall(OpenAIBaseModel):
+    id: str = Field(default_factory=make_tool_call_id)
+    type: Literal["function"] = "function"
+    function: FunctionCall
+
+
 class CompletionLogProbs(OpenAIBaseModel):
     text_offset: list[int] = Field(default_factory=list)
     token_logprobs: list[float | None] = Field(default_factory=list)
@@ -424,6 +453,21 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
+    # vLLM-specific fields for Harmony/gpt-oss models (similar to Ollama)
+    thinking: str | None = Field(
+        default=None,
+        description=(
+            "Thinking/reasoning content from the model (e.g., from analysis channel "
+            "in Harmony format for gpt-oss models). Similar to Ollama's thinking field."
+        ),
+    )
+    tool_calls: list[ToolCall] | None = Field(
+        default=None,
+        description=(
+            "Tool calls made by the model (e.g., from commentary channel "
+            "in Harmony format for gpt-oss models). Similar to Ollama's tool_calls field."
+        ),
+    )
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -459,6 +503,23 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
+    # vLLM-specific fields for Harmony/gpt-oss models (similar to Ollama)
+    thinking: str | None = Field(
+        default=None,
+        description=(
+            "Thinking/reasoning content from the model during streaming "
+            "(e.g., from analysis channel in Harmony format for gpt-oss models). "
+            "Similar to Ollama's thinking field."
+        ),
+    )
+    tool_calls: list[ToolCall] | None = Field(
+        default=None,
+        description=(
+            "Tool calls made by the model during streaming "
+            "(e.g., from commentary channel in Harmony format for gpt-oss models). "
+            "Similar to Ollama's tool_calls field."
+        ),
+    )
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
