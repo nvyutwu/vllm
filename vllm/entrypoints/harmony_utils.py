@@ -47,7 +47,10 @@ from vllm.entrypoints.openai.protocol import (
     ResponseInputOutputItem,
     ResponsesRequest,
 )
+from vllm.logger import init_logger
 from vllm.utils import random_uuid
+
+logger = init_logger(__name__)
 
 REASONING_EFFORT = {
     "high": ReasoningEffort.HIGH,
@@ -277,12 +280,24 @@ def parse_input_to_harmony_message(chat_msg) -> list[Message]:
 
     # Default: user/assistant/system messages with content
     content = chat_msg.get("content", "")
+    
+    # Handle system messages - convert to developer role with plain text
+    # (matching parse_response_input behavior for Responses API)
+    # This avoids conflicts with the developer message already created by Chat Completion API
+    if role == "system":
+        role = "developer"
+        text_prefix = "# Instructions\n"
+    else:
+        text_prefix = ""
+    
+    # User/assistant/developer messages with content
     if isinstance(content, str):
-        contents = [TextContent(text=content)]
+        msg = Message.from_role_and_content(role, text_prefix + content)
     else:
         # TODO: Support refusal.
-        contents = [TextContent(text=c.get("text", "")) for c in content]
-    msg = Message.from_role_and_contents(role, contents)
+        contents = [TextContent(text=text_prefix + c.get("text", "")) for c in content]
+        msg = Message.from_role_and_contents(role, contents)
+    
     return [msg]
 
 
@@ -519,6 +534,20 @@ def parse_chat_output(
     parser = parse_output_into_messages(token_ids)
     output_msgs = parser.messages
     is_tool_call = False  # TODO: update this when tool call is supported
+    
+    # Debug logging
+    logger.debug(
+        "[parse_chat_output] parser state: messages=%d, current_content=%s, current_channel=%s",
+        len(output_msgs), repr(parser.current_content[:100] if parser.current_content else None),
+        parser.current_channel
+    )
+    for i, msg in enumerate(output_msgs):
+        msg_text = msg.content[0].text if msg.content else ""
+        logger.debug(
+            "[parse_chat_output] msg[%d]: channel=%s, content=%s",
+            i, msg.channel, repr(msg_text[:100])
+        )
+    
     if len(output_msgs) == 0:
         # The generation has stopped during reasoning.
         reasoning = parser.current_content
@@ -532,4 +561,10 @@ def parse_chat_output(
         final_msg = output_msgs[-1]
         reasoning = "\n".join([msg.content[0].text for msg in reasoning_msg])
         final_content = final_msg.content[0].text
+    
+    logger.debug(
+        "[parse_chat_output] result: reasoning=%s, final_content=%s",
+        repr(reasoning[:100] if reasoning else None),
+        repr(final_content[:100] if final_content else None)
+    )
     return reasoning, final_content, is_tool_call

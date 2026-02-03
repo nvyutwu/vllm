@@ -761,10 +761,16 @@ class OpenAIServingChat(OpenAIServing):
                     if self.use_harmony:
                         harmony_parser = harmony_parsers[i]
                         prev_recipient = harmony_parser.current_recipient
-                        delta_text = ""
+                        
+                        # Use engine's output.text (which has proper UTF-8 incremental decoding)
+                        # instead of harmony_parser.last_content_delta (which decodes tokens individually
+                        # and can produce "��" for multi-byte UTF-8 like emojis)
+                        # We process tokens through parser to track channel/recipient state only
                         for token_id in output.token_ids:
                             harmony_parser.process(token_id)
-                            delta_text += harmony_parser.last_content_delta or ""
+                        
+                        # Use properly decoded text from engine's detokenizer
+                        delta_text = output.text
                         cur_channel = harmony_parser.current_channel
                         cur_recipient = harmony_parser.current_recipient
                     else:
@@ -807,6 +813,7 @@ class OpenAIServingChat(OpenAIServing):
                             cur_channel == "commentary"
                             and cur_recipient
                             and cur_recipient.startswith("functions.")
+                            and request.tool_choice != "none"
                         ):
                             # Count completed tool calls to determine index
                             base_index = 0
@@ -1521,7 +1528,8 @@ class OpenAIServingChat(OpenAIServing):
                 if not request.include_reasoning:
                     reasoning = None
 
-                if self.tool_parser is not None:
+                # Only extract and include tool calls if tool_choice is not "none"
+                if self.tool_parser is not None and request.tool_choice != "none":
                     tool_parser = self.tool_parser(tokenizer)
                     # NOTE: We use token_ids for openai tool parser
                     tool_call_info = tool_parser.extract_tool_calls(
@@ -1970,17 +1978,31 @@ class OpenAIServingChat(OpenAIServing):
         # if the model supports it. TODO: Support browsing.
         assert not self.supports_browsing
         assert not self.supports_code_interpreter
+
+        # When tool_choice is "none", don't include tool definitions in the prompt
+        # so the model won't see or attempt to use tools
+        include_tools = request.tools is not None and request.tool_choice != "none"
+        tools_for_prompt = request.tools if include_tools else None
+
         sys_msg = get_system_message(
             reasoning_effort=request.reasoning_effort,
             browser_description=None,
             python_description=None,
-            with_custom_tools=request.tools is not None,
+            with_custom_tools=include_tools,
         )
         messages.append(sys_msg)
 
-        # Add developer message.
-        dev_msg = get_developer_message(tools=request.tools)
-        messages.append(dev_msg)
+        # Add developer message only if there are function tools
+        # Check if tools_for_prompt contains any "function" type tools
+        has_function_tools = False
+        if tools_for_prompt:
+            has_function_tools = any(
+                tool.type == "function" for tool in tools_for_prompt
+            )
+        
+        if has_function_tools:
+            dev_msg = get_developer_message(tools=tools_for_prompt)
+            messages.append(dev_msg)
 
         # Add user message.
         for chat_msg in request.messages:
