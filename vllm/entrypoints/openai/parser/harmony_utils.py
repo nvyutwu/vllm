@@ -368,15 +368,24 @@ def parse_chat_input_to_harmony_message(
         analysis_msg = analysis_msg.with_channel("analysis")
         msgs.append(analysis_msg)
 
-    # Default: user/assistant/system messages with content
+    # Handle system messages - convert to developer role with plain text
+    # so they don't conflict with the system message already created by
+    # the Chat Completion API's _build_harmony_messages.
+    if role == "system":
+        role = "developer"
+        text_prefix = "# Instructions\n"
+    else:
+        text_prefix = ""
+
+    # Default: user/assistant/developer messages with content
     content = chat_msg.get("content") or ""
     if content is None:
         content = ""
     if isinstance(content, str):
-        contents = [TextContent(text=content)]
+        contents = [TextContent(text=text_prefix + content)]
     else:
         # TODO: Support refusal.
-        contents = [TextContent(text=c.get("text", "")) for c in content]
+        contents = [TextContent(text=text_prefix + c.get("text", "")) for c in content]
 
     # Only add assistant messages if they have content, as reasoning or tool calling
     # assistant messages were already added above.
