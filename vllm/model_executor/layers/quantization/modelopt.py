@@ -23,6 +23,9 @@ from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoEMethodBase,
     FusedMoeWeightScaleSupported,
 )
+from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
+)
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
     Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
@@ -185,6 +188,8 @@ class ModelOptQuantConfigBase(QuantizationConfig):
         if self.is_layer_excluded(prefix):
             if isinstance(layer, LinearBase):
                 return UnquantizedLinearMethod()
+            elif isinstance(layer, FusedMoE):
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             return None
 
         # TODO: This special hard coded logic is not needed for quantized checkpoints
