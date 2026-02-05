@@ -84,13 +84,16 @@ class Glm4MoeMultiTokenPredictorLayer(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
         self.shared_head = SharedHead(
-            config=config, prefix=prefix, quant_config=quant_config
+            config=config, prefix=prefix, quant_config=None
         )
         self.enable_eplb = parallel_config.enable_eplb
+        # MTP layers are in BF16 (not quantized) according to hf_quant_config.json exclude_modules.
+        # Pass quant_config=None because exclude_modules didn't properly handle FusedMoE layers
+        # (fixed in modelopt.py, but keeping this for backward compatibility and safety).
         self.mtp_block = Glm4MoeDecoderLayer(
             config=config,
             cache_config=cache_config,
-            quant_config=quant_config,
+            quant_config=None,
             prefix=prefix,
             enable_eplb=self.enable_eplb,
         )
