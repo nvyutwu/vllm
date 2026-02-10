@@ -57,7 +57,7 @@ class StatLoggerBase(ABC):
     ): ...
 
     @abstractmethod
-    def log_engine_initialized(self): ...
+    def log_engine_initialized(self, startup_time: float | None = None): ...
 
     def log(self):  # noqa
         pass
@@ -266,7 +266,7 @@ class LoggingStatLogger(StatLoggerBase):
         if self._enable_perf_stats():
             self.perf_metrics_logging.log(log_fn=log_fn, log_prefix=self.log_prefix)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.debug(
                 "Engine %03d: vllm cache_config_info with initialization "
@@ -334,7 +334,7 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
     def log(self):
         LoggingStatLogger.log(self)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.info(
                 "%d Engines: vllm cache_config_info with initialization "
@@ -379,9 +379,9 @@ class PerEngineStatLoggerAdapter(AggregateStatLoggerBase):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
             per_engine_stat_logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
-            per_engine_stat_logger.log_engine_initialized()
+            per_engine_stat_logger.log_engine_initialized(startup_time)
 
 
 class PrometheusStatLogger(AggregateStatLoggerBase):
@@ -408,6 +408,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             vllm_config.observability_config.kv_cache_metrics
         )
 
+        # Throughput tracking (SGLang-compatible gen_throughput)
+        self._throughput_last_time: dict[int, float] = {}
+        self._throughput_accumulated_tokens: dict[int, int] = {}
+
         labelnames = ["model_name", "engine"]
         model_name = vllm_config.model_config.served_model_name
         max_model_len = vllm_config.model_config.max_model_len
@@ -427,7 +431,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Scheduler state
         #
         gauge_scheduler_running = self._gauge_cls(
-            name="vllm:num_requests_running",
+            name="num_requests_running",
             documentation="Number of requests in model execution batches.",
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
@@ -437,7 +441,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         gauge_scheduler_waiting = self._gauge_cls(
-            name="vllm:num_requests_waiting",
+            name="num_requests_waiting",
             documentation="Number of requests waiting to be processed.",
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
@@ -447,7 +451,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         gauge_engine_sleep_state = self._gauge_cls(
-            name="vllm:engine_sleep_state",
+            name="engine_sleep_state",
             documentation=(
                 "Engine sleep state; awake = 0 means engine is sleeping; "
                 "awake = 1 means engine is awake; "
@@ -473,7 +477,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.record_sleep_state()
 
         gauge_kv_cache_usage = self._gauge_cls(
-            name="vllm:kv_cache_usage_perc",
+            name="kv_cache_usage_perc",
             documentation="KV-cache usage. 1 means 100 percent usage.",
             multiprocess_mode="mostrecent",
             labelnames=labelnames,
@@ -482,9 +486,42 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             gauge_kv_cache_usage, engine_indexes, model_name
         )
 
+        #
+        # SGLang-compatible throughput and startup metrics
+        #
+        gauge_gen_throughput = self._gauge_cls(
+            name="gen_throughput",
+            documentation="Generation throughput in tokens per second.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_gen_throughput = make_per_engine(
+            gauge_gen_throughput, engine_indexes, model_name
+        )
+
+        gauge_engine_startup_time = self._gauge_cls(
+            name="engine_startup_time",
+            documentation="Time taken for the engine to start up in seconds.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_engine_startup_time = make_per_engine(
+            gauge_engine_startup_time, engine_indexes, model_name
+        )
+
+        gauge_engine_load_weights_time = self._gauge_cls(
+            name="engine_load_weights_time",
+            documentation="Time taken for the engine to load weights in seconds.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_engine_load_weights_time = make_per_engine(
+            gauge_engine_load_weights_time, engine_indexes, model_name
+        )
+
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
-                name="vllm:corrupted_requests",
+                name="corrupted_requests",
                 documentation=(
                     "Corrupted requests, in terms of total number of requests "
                     "with NaNs in logits."
@@ -496,7 +533,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
 
         counter_prefix_cache_queries = self._counter_cls(
-            name="vllm:prefix_cache_queries",
+            name="prefix_cache_queries",
             documentation=(
                 "Prefix cache queries, in terms of number of queried tokens."
             ),
@@ -507,7 +544,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_prefix_cache_hits = self._counter_cls(
-            name="vllm:prefix_cache_hits",
+            name="prefix_cache_hits",
             documentation=("Prefix cache hits, in terms of number of cached tokens."),
             labelnames=labelnames,
         )
@@ -520,7 +557,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
 
         counter_connector_prefix_cache_queries = self._counter_cls(
-            name="vllm:external_prefix_cache_queries",
+            name="external_prefix_cache_queries",
             documentation=(
                 "External prefix cache queries from KV connector "
                 "cross-instance cache sharing, in terms of number of queried tokens."
@@ -532,7 +569,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_connector_prefix_cache_hits = self._counter_cls(
-            name="vllm:external_prefix_cache_hits",
+            name="external_prefix_cache_hits",
             documentation=(
                 "External prefix cache hits from KV connector "
                 "cross-instance cache sharing, in terms of number of cached tokens."
@@ -548,7 +585,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
 
         counter_mm_cache_queries = self._counter_cls(
-            name="vllm:mm_cache_queries",
+            name="mm_cache_queries",
             documentation=(
                 "Multi-modal cache queries, in terms of number of queried items."
             ),
@@ -559,7 +596,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_mm_cache_hits = self._counter_cls(
-            name="vllm:mm_cache_hits",
+            name="mm_cache_hits",
             documentation=(
                 "Multi-modal cache hits, in terms of number of cached items."
             ),
@@ -573,7 +610,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Counters
         #
         counter_num_preempted_reqs = self._counter_cls(
-            name="vllm:num_preemptions",
+            name="num_preemptions",
             documentation="Cumulative number of preemption from the engine.",
             labelnames=labelnames,
         )
@@ -582,7 +619,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_prompt_tokens = self._counter_cls(
-            name="vllm:prompt_tokens",
+            name="prompt_tokens",
             documentation="Number of prefill tokens processed.",
             labelnames=labelnames,
         )
@@ -591,7 +628,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_generation_tokens = self._counter_cls(
-            name="vllm:generation_tokens",
+            name="generation_tokens",
             documentation="Number of generation tokens processed.",
             labelnames=labelnames,
         )
@@ -601,7 +638,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         self.counter_request_success: dict[FinishReason, dict[int, Counter]] = {}
         counter_request_success_base = self._counter_cls(
-            name="vllm:request_success",
+            name="request_success",
             documentation="Count of successfully processed requests.",
             labelnames=labelnames + ["finished_reason"],
         )
@@ -617,7 +654,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Histograms of counts
         #
         histogram_num_prompt_tokens_request = self._histogram_cls(
-            name="vllm:request_prompt_tokens",
+            name="request_prompt_tokens",
             documentation="Number of prefill tokens processed.",
             buckets=build_1_2_5_buckets(max_model_len),
             labelnames=labelnames,
@@ -627,7 +664,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_num_generation_tokens_request = self._histogram_cls(
-            name="vllm:request_generation_tokens",
+            name="request_generation_tokens",
             documentation="Number of generation tokens processed.",
             buckets=build_1_2_5_buckets(max_model_len),
             labelnames=labelnames,
@@ -640,7 +677,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # api_server counts which uses prometheus mp.
         # See: https://github.com/vllm-project/vllm/pull/18053
         histogram_iteration_tokens = self._histogram_cls(
-            name="vllm:iteration_tokens_total",
+            name="iteration_tokens_total",
             documentation="Histogram of number of tokens per engine_step.",
             buckets=[1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384],
             labelnames=labelnames,
@@ -650,7 +687,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_max_num_generation_tokens_request = self._histogram_cls(
-            name="vllm:request_max_num_generation_tokens",
+            name="request_max_num_generation_tokens",
             documentation="Histogram of maximum number of requested generation tokens.",
             buckets=build_1_2_5_buckets(max_model_len),
             labelnames=labelnames,
@@ -660,7 +697,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_n_request = self._histogram_cls(
-            name="vllm:request_params_n",
+            name="request_params_n",
             documentation="Histogram of the n request parameter.",
             buckets=[1, 2, 5, 10, 20],
             labelnames=labelnames,
@@ -670,7 +707,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_max_tokens_request = self._histogram_cls(
-            name="vllm:request_params_max_tokens",
+            name="request_params_max_tokens",
             documentation="Histogram of the max_tokens request parameter.",
             buckets=build_1_2_5_buckets(max_model_len),
             labelnames=labelnames,
@@ -683,7 +720,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Histogram of timing intervals
         #
         histogram_time_to_first_token = self._histogram_cls(
-            name="vllm:time_to_first_token_seconds",
+            name="time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
             buckets=[
                 0.001,
@@ -715,8 +752,45 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_time_to_first_token, engine_indexes, model_name
         )
 
+        # Deprecated in 0.11 - Renamed as vllm:inter_token_latency_seconds
+        # With 0.12.x you can enable with --show-hidden-metrics-for-version=0.11
+        # TODO: remove in 0.13.0
+        if self.show_hidden_metrics:
+            histogram_time_per_output_token = self._histogram_cls(
+                name="time_per_output_token_seconds",
+                documentation=(
+                    "Histogram of time per output token in seconds."
+                    "DEPRECATED: Use vllm:inter_token_latency_seconds instead."
+                ),
+                buckets=[
+                    0.01,
+                    0.025,
+                    0.05,
+                    0.075,
+                    0.1,
+                    0.15,
+                    0.2,
+                    0.3,
+                    0.4,
+                    0.5,
+                    0.75,
+                    1.0,
+                    2.5,
+                    5.0,
+                    7.5,
+                    10.0,
+                    20.0,
+                    40.0,
+                    80.0,
+                ],
+                labelnames=labelnames,
+            )
+            self.histogram_time_per_output_token = make_per_engine(
+                histogram_time_per_output_token, engine_indexes, model_name
+            )
+
         histogram_inter_token_latency = self._histogram_cls(
-            name="vllm:inter_token_latency_seconds",
+            name="inter_token_latency_seconds",
             documentation="Histogram of inter-token latency in seconds.",
             buckets=[
                 0.01,
@@ -746,7 +820,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_request_time_per_output_token = self._histogram_cls(
-            name="vllm:request_time_per_output_token_seconds",
+            name="request_time_per_output_token_seconds",
             documentation="Histogram of time_per_output_token_seconds per request.",
             buckets=[
                 0.01,
@@ -799,7 +873,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             7680.0,
         ]
         histogram_e2e_time_request = self._histogram_cls(
-            name="vllm:e2e_request_latency_seconds",
+            name="e2e_request_latency_seconds",
             documentation="Histogram of e2e request latency in seconds.",
             buckets=request_latency_buckets,
             labelnames=labelnames,
@@ -809,7 +883,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_queue_time_request = self._histogram_cls(
-            name="vllm:request_queue_time_seconds",
+            name="request_queue_time_seconds",
             documentation="Histogram of time spent in WAITING phase for request.",
             buckets=request_latency_buckets,
             labelnames=labelnames,
@@ -819,7 +893,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_inference_time_request = self._histogram_cls(
-            name="vllm:request_inference_time_seconds",
+            name="request_inference_time_seconds",
             documentation="Histogram of time spent in RUNNING phase for request.",
             buckets=request_latency_buckets,
             labelnames=labelnames,
@@ -829,7 +903,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_prefill_time_request = self._histogram_cls(
-            name="vllm:request_prefill_time_seconds",
+            name="request_prefill_time_seconds",
             documentation="Histogram of time spent in PREFILL phase for request.",
             buckets=request_latency_buckets,
             labelnames=labelnames,
@@ -839,7 +913,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_decode_time_request = self._histogram_cls(
-            name="vllm:request_decode_time_seconds",
+            name="request_decode_time_seconds",
             documentation="Histogram of time spent in DECODE phase for request.",
             buckets=request_latency_buckets,
             labelnames=labelnames,
@@ -849,7 +923,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         histogram_prefill_kv_computed_request = self._histogram_cls(
-            name="vllm:request_prefill_kv_computed_tokens",
+            name="request_prefill_kv_computed_tokens",
             documentation=(
                 "Histogram of new KV tokens computed during prefill "
                 "(excluding cached tokens)."
@@ -890,7 +964,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             ]
 
             histogram_kv_block_lifetime = self._histogram_cls(
-                name="vllm:kv_block_lifetime_seconds",
+                name="kv_block_lifetime_seconds",
                 documentation=(
                     "Histogram of KV cache block lifetime from allocation to eviction. "
                     "Sampled metrics (controlled by --kv-cache-metrics-sample)."
@@ -903,7 +977,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
 
             histogram_kv_block_idle_before_evict = self._histogram_cls(
-                name="vllm:kv_block_idle_before_evict_seconds",
+                name="kv_block_idle_before_evict_seconds",
                 documentation=(
                     "Histogram of idle time before KV cache block eviction. "
                     "Sampled metrics (controlled by --kv-cache-metrics-sample)."
@@ -916,7 +990,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
 
             histogram_kv_block_reuse_gap = self._histogram_cls(
-                name="vllm:kv_block_reuse_gap_seconds",
+                name="kv_block_reuse_gap_seconds",
                 documentation=(
                     "Histogram of time gaps between consecutive KV cache block "
                     "accesses. Only the most recent accesses are recorded "
@@ -941,10 +1015,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # TODO: This metric might be incorrect in case of using multiple
         # api_server counts which uses prometheus mp.
         self.gauge_lora_info: Gauge | None = None
+        self.gauge_lora_pool_utilization: dict[int, Gauge] | None = None
         if vllm_config.lora_config is not None:
             if len(self.engine_indexes) > 1:
                 logger.warning(
-                    "vllm:lora_requests_info prometheus metrics may be "
+                    "lora_requests_info prometheus metrics may be "
                     "incorrect/misleading with data parallel deployments."
                 )
             self.labelname_max_lora = "max_lora"
@@ -952,7 +1027,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.labelname_running_lora_adapters = "running_lora_adapters"
             self.max_lora = vllm_config.lora_config.max_loras
             self.gauge_lora_info = self._gauge_cls(
-                name="vllm:lora_requests_info",
+                name="lora_requests_info",
                 documentation="Running stats on lora requests.",
                 multiprocess_mode="sum",
                 labelnames=[
@@ -962,14 +1037,37 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 ],
             )
 
+            # SGLang-compatible: LoRA pool utilization gauge
+            gauge_lora_pool_utilization = self._gauge_cls(
+                name="lora_pool_utilization",
+                documentation=(
+                    "LoRA adapter pool utilization as a ratio (0-1). "
+                    "Computed as active_adapters / max_loras."
+                ),
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            )
+            self.gauge_lora_pool_utilization = make_per_engine(
+                gauge_lora_pool_utilization, engine_indexes, model_name
+            )
+
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
         metrics_info = config_obj.metrics_info()
         metrics_info["engine"] = ""
 
         name, documentation = None, None
         if type == "cache_config":
-            name = "vllm:cache_config_info"
+            name = "cache_config_info"
             documentation = "Information of the LLMEngine CacheConfig"
+        elif type == "model_config":
+            name = "model_config_info"
+            documentation = "Information of the LLMEngine ModelConfig"
+        elif type == "parallel_config":
+            name = "parallel_config_info"
+            documentation = "Information of the LLMEngine ParallelConfig"
+        elif type == "speculative_config":
+            name = "speculative_config_info"
+            documentation = "Information of the LLMEngine SpeculativeConfig"
         assert name is not None, f"Unknown metrics info type {type}"
 
         # Info type metrics are syntactic sugar for a gauge permanently set to 1
@@ -1056,6 +1154,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 }
                 self.gauge_lora_info.labels(**lora_info_labels).set_to_current_time()
 
+                # SGLang-compatible: Update LoRA pool utilization
+                if self.gauge_lora_pool_utilization is not None and self.max_lora > 0:
+                    num_active = len(scheduler_stats.running_lora_adapters)
+                    utilization = num_active / self.max_lora
+                    self.gauge_lora_pool_utilization[engine_idx].set(utilization)
+
         if mm_cache_stats is not None:
             self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)
             self.counter_mm_cache_hits[engine_idx].inc(mm_cache_stats.hits)
@@ -1076,6 +1180,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.histogram_iteration_tokens[engine_idx].observe(
             iteration_stats.num_prompt_tokens + iteration_stats.num_generation_tokens
         )
+
+        # Update gen_throughput gauge (SGLang-compatible)
+        now = time.monotonic()
+        if engine_idx not in self._throughput_last_time:
+            self._throughput_last_time[engine_idx] = now
+            self._throughput_accumulated_tokens[engine_idx] = 0
+        self._throughput_accumulated_tokens[engine_idx] += (
+            iteration_stats.num_generation_tokens
+        )
+        delta_time = now - self._throughput_last_time[engine_idx]
+        # Update throughput every 5 seconds (similar to SGLang's approach)
+        if delta_time >= 5.0:
+            throughput = (
+                self._throughput_accumulated_tokens[engine_idx] / delta_time
+                if delta_time > 0
+                else 0.0
+            )
+            self.gauge_gen_throughput[engine_idx].set(throughput)
+            self._throughput_last_time[engine_idx] = now
+            self._throughput_accumulated_tokens[engine_idx] = 0
 
         for max_gen_tokens in iteration_stats.max_num_generation_tokens_iter:
             self.histogram_max_num_generation_tokens_request[engine_idx].observe(
@@ -1147,8 +1271,30 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
-    def log_engine_initialized(self):
+    def log(self):
+        """Flush per-interval gauges.
+
+        Called periodically by StatLoggerManager.log() on the same
+        interval as the logging stat logger. This updates spec decode
+        gauges with per-interval values and resets the interval
+        accumulators, matching SGLang's per-interval gauge behavior.
+        Cumulative values remain available via the Prometheus counters
+        and PromQL rate()/increase() queries.
+        """
+        self.spec_decoding_prom.flush_gauges()
+
+    def log_engine_initialized(self, startup_time: float | None = None):
+        # Log all config info metrics for performance correlation
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+        self.log_metrics_info("model_config", self.vllm_config.model_config)
+        self.log_metrics_info("parallel_config", self.vllm_config.parallel_config)
+        if self.vllm_config.speculative_config is not None:
+            self.log_metrics_info(
+                "speculative_config", self.vllm_config.speculative_config
+            )
+        if startup_time is not None:
+            for engine_idx in self.engine_indexes:
+                self.gauge_engine_startup_time[engine_idx].set(startup_time)
 
 
 PromMetric: TypeAlias = Gauge | Counter | Histogram
@@ -1276,6 +1422,6 @@ class StatLoggerManager:
         for logger in self.stat_loggers:
             logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for agg_logger in self.stat_loggers:
-            agg_logger.log_engine_initialized()
+            agg_logger.log_engine_initialized(startup_time)

@@ -83,9 +83,16 @@ def get_metrics_snapshot() -> list[Metric]:
         ...         for bucket_le, value in metrics.buckets.items():
         ...             print(f"    {bucket_le} = {value}")
     """
+    # Prefixes for metrics we want to exclude (standard Prometheus/system metrics)
+    EXCLUDE_PREFIXES = (
+        "python_",
+        "process_",
+        "prometheus_",
+        "gc_",
+    )
     collected: list[Metric] = []
     for metric in REGISTRY.collect():
-        if not metric.name.startswith("vllm:"):
+        if metric.name.startswith(EXCLUDE_PREFIXES):
             continue
         if metric.type == "gauge":
             samples = _get_samples(metric)
@@ -95,9 +102,9 @@ def get_metrics_snapshot() -> list[Metric]:
                 )
         elif metric.type == "counter":
             samples = _get_samples(metric, "_total")
-            if metric.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
+            if metric.name == "spec_decode_num_accepted_tokens_per_pos":
                 #
-                # Ugly vllm:num_accepted_tokens_per_pos special case.
+                # Ugly spec_decode_num_accepted_tokens_per_pos special case.
                 #
                 # This metric is a vector of counters - for each spec
                 # decoding token position, we observe the number of
