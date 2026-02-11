@@ -105,6 +105,10 @@ class OpenAIServingCompletion(OpenAIServing):
         self.use_harmony = HARMONY_AVAILABLE and self.model_config.hf_config.model_type == "gpt_oss"
         if self.use_harmony:
             logger.info("Enabling Harmony format for gpt-oss model in Completion API")
+            if self.default_sampling_params is None:
+                self.default_sampling_params = {}
+            # Preserve special tokens (e.g. <|channel|>, <|message|>, <|end|>) in output
+            self.default_sampling_params["skip_special_tokens"] = False
             # Add stop tokens for Harmony assistant actions
             if "stop_token_ids" not in self.default_sampling_params:
                 self.default_sampling_params["stop_token_ids"] = []
