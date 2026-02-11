@@ -53,7 +53,7 @@ payload_logger = logging.getLogger("vllm.payload")
 
 # Import Harmony utilities for gpt-oss models
 try:
-    from vllm.entrypoints.harmony_utils import (
+    from vllm.entrypoints.openai.parser.harmony_utils import (
         get_stop_tokens_for_assistant_actions,
     )
     HARMONY_AVAILABLE = True

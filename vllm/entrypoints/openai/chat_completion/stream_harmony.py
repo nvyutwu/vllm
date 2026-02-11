@@ -76,16 +76,31 @@ def extract_harmony_streaming_delta(
     tool_messages = []
     content_encountered = False
 
-    # Calculate base_index once before the loop
-    # This counts completed tool calls in messages
+    # Calculate base_index: count completed tool call messages.
+    # If prev_recipient indicates an ongoing function call and the parser
+    # has already moved that message into its completed list, exclude it
+    # so the ongoing call keeps its original index.
     base_index = 0
+    func_messages_in_parser = []
     for msg in harmony_parser.messages:
         if (
             (msg.channel == "commentary" or msg.channel == "analysis")
             and msg.recipient
             and msg.recipient.startswith("functions.")
         ):
+            func_messages_in_parser.append(msg)
             base_index += 1
+
+    # If prev_recipient is an ongoing function call and the last function
+    # message in the parser matches it, the parser completed that message
+    # mid-stream.  Don't count it as a finished prior call.
+    if (
+        prev_recipient
+        and prev_recipient.startswith("functions.")
+        and func_messages_in_parser
+        and func_messages_in_parser[-1].recipient == prev_recipient
+    ):
+        base_index = max(0, base_index - 1)
 
     # If there's an ongoing tool call from previous chunk,
     # the next new tool call starts at base_index + 1
@@ -109,9 +124,19 @@ def extract_harmony_streaming_delta(
             and not tool_choice_none
         ):
             opened_new_call = False
-            if prev_recipient != group.recipient:
+            tool_name = group.recipient.split("functions.", 1)[1]
+            # Parser can emit recipient="functions." (empty name) for tokens in the
+            # middle of the same tool call's arguments, creating a new group and
+            # making prev_recipient != group.recipient. Treat that as continuation,
+            # not a new tool call, so one logical call is not split into two.
+            is_continuation_glitch = (
+                not tool_name
+                and prev_recipient
+                and prev_recipient.startswith("functions.")
+                and tool_messages
+            )
+            if not is_continuation_glitch and prev_recipient != group.recipient:
                 # New tool call - emit the opening message
-                tool_name = group.recipient.split("functions.", 1)[1]
                 tool_messages.append(
                     DeltaToolCall(
                         id=make_tool_call_id(),
@@ -129,26 +154,34 @@ def extract_harmony_streaming_delta(
                 next_tool_index += 1
 
             if group.text:
-                # Stream arguments for the ongoing tool call
                 if opened_new_call:
-                    # Just opened in this group
-                    tool_call_index = next_tool_index - 1
+                    # We just created the opening entry in tool_messages;
+                    # append arguments directly to it instead of creating
+                    # a second DeltaToolCall with the same index.
+                    tool_messages[-1].function.arguments = group.text
+                elif tool_messages:
+                    # There is already a tool call entry in this chunk.
+                    # Append arguments to it rather than creating a
+                    # duplicate entry with the same index.
+                    existing = tool_messages[-1]
+                    if existing.function.arguments is None:
+                        existing.function.arguments = group.text
+                    else:
+                        existing.function.arguments += group.text
                 else:
-                    # Continuing from previous chunk
-                    # If ongoing_tool_index is None here, it means
-                    # we're continuing a call but prev_recipient
-                    # wasn't a function. Use base_index.
+                    # First arguments-only entry in this chunk (continuing
+                    # a tool call that was opened in a previous chunk).
                     tool_call_index = (
                         ongoing_tool_index
                         if ongoing_tool_index is not None
                         else base_index
                     )
-                tool_messages.append(
-                    DeltaToolCall(
-                        index=tool_call_index,
-                        function=DeltaFunctionCall(arguments=group.text),
+                    tool_messages.append(
+                        DeltaToolCall(
+                            index=tool_call_index,
+                            function=DeltaFunctionCall(arguments=group.text),
+                        )
                     )
-                )
         elif group.channel == "commentary":
             # Tool call preambles meant to be shown to the user
             combined_content += group.text
