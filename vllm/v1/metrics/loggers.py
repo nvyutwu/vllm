@@ -643,12 +643,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             labelnames=labelnames + ["finished_reason"],
         )
         for reason in FinishReason:
+            if reason == FinishReason.ABORT:
+                continue
             self.counter_request_success[reason] = {
                 idx: counter_request_success_base.labels(
                     model_name, str(idx), str(reason)
                 )
                 for idx in engine_indexes
             }
+
+        counter_num_aborted_requests = self._counter_cls(
+            name="num_aborted_requests_total",
+            documentation="Number of requests aborted.",
+            labelnames=labelnames,
+        )
+        self.counter_num_aborted_requests = make_per_engine(
+            counter_num_aborted_requests, engine_indexes, model_name
+        )
 
         #
         # Histograms of counts
@@ -1213,9 +1224,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_inter_token_latency[engine_idx].observe(itl)
 
         for finished_request in iteration_stats.finished_requests:
-            self.counter_request_success[finished_request.finish_reason][
-                engine_idx
-            ].inc()
+            if finished_request.finish_reason == FinishReason.ABORT:
+                self.counter_num_aborted_requests[engine_idx].inc()
+            else:
+                self.counter_request_success[finished_request.finish_reason][
+                    engine_idx
+                ].inc()
             self.histogram_e2e_time_request[engine_idx].observe(
                 finished_request.e2e_latency
             )
