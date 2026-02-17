@@ -537,6 +537,15 @@ class ParallelConfig:
         factors = get_hash_factors(self, ignored_factors)
         return hash_factors(factors)
 
+    def metrics_info(self) -> dict[str, str]:
+        """Return key parallel configuration as a dict for Prometheus info metrics."""
+        return {
+            "tensor_parallel_size": str(self.tensor_parallel_size),
+            "pipeline_parallel_size": str(self.pipeline_parallel_size),
+            "data_parallel_size": str(self.data_parallel_size),
+            "enable_expert_parallel": str(self.enable_expert_parallel),
+        }
+
     def __post_init__(self) -> None:
         # Set all2all_backend from env var if not specified, with deprecation warning
         if envs.is_set("VLLM_ALL2ALL_BACKEND"):
