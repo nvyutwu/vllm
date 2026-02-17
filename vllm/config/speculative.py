@@ -178,6 +178,19 @@ class SpeculativeConfig:
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
+    def metrics_info(self) -> dict[str, str]:
+        """Return speculative config info for Prometheus metrics.
+
+        Returns a dict of key config fields for monitoring and A/B testing.
+        """
+        return {
+            "spec_enabled": "true",
+            "spec_method": str(self.method) if self.method else "none",
+            "spec_num_tokens": str(self.num_speculative_tokens or 0),
+            "spec_draft_model": str(self.model) if self.model else "none",
+            "spec_draft_tp_size": str(self.draft_tensor_parallel_size or 1),
+        }
+
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
         initial_architecture = hf_config.architectures[0]

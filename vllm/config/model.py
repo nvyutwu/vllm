@@ -408,6 +408,17 @@ class ModelConfig:
                 # It's a dict-valued parameter - set it directly
                 setattr(config, key, value)
 
+    def metrics_info(self) -> dict[str, str]:
+        """Return key model configuration as a dict for Prometheus info metrics."""
+        return {
+            "model": str(self.model),
+            "served_model_name": str(self.served_model_name or self.model),
+            "dtype": str(self.dtype),
+            "max_model_len": str(self.max_model_len),
+            "quantization": str(self.quantization or "none"),
+            "enforce_eager": str(self.enforce_eager),
+        }
+
     def __post_init__(
         self,
         # Multimodal config init vars

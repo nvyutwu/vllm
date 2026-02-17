@@ -76,38 +76,38 @@ def _get_expected_values(num_requests: int, prompt_ids: list[int], max_tokens: i
 
     # {metric_family: [(suffix, expected_value)]}
     return {
-        "vllm:time_to_first_token_seconds": [("_count", num_requests)],
-        "vllm:inter_token_latency_seconds": [
+        "time_to_first_token_seconds": [("_count", num_requests)],
+        "time_per_output_token_seconds": [
             ("_count", num_requests * (max_tokens - 1))
         ],
-        "vllm:e2e_request_latency_seconds": [("_count", num_requests)],
-        "vllm:request_queue_time_seconds": [("_count", num_requests)],
-        "vllm:request_inference_time_seconds": [("_count", num_requests)],
-        "vllm:request_prefill_time_seconds": [("_count", num_requests)],
-        "vllm:request_decode_time_seconds": [("_count", num_requests)],
-        "vllm:request_prompt_tokens": [
+        "e2e_request_latency_seconds": [("_count", num_requests)],
+        "request_queue_time_seconds": [("_count", num_requests)],
+        "request_inference_time_seconds": [("_count", num_requests)],
+        "request_prefill_time_seconds": [("_count", num_requests)],
+        "request_decode_time_seconds": [("_count", num_requests)],
+        "request_prompt_tokens": [
             ("_sum", num_requests * num_prompt_tokens),
             ("_count", num_requests),
         ],
-        "vllm:request_generation_tokens": [
+        "request_generation_tokens": [
             ("_sum", num_requests * max_tokens),
             ("_count", num_requests),
         ],
-        "vllm:request_params_n": [("_count", num_requests)],
-        "vllm:request_params_max_tokens": [
+        "request_params_n": [("_count", num_requests)],
+        "request_params_max_tokens": [
             ("_sum", num_requests * max_tokens),
             ("_count", num_requests),
         ],
-        "vllm:iteration_tokens_total": [
+        "iteration_tokens_total": [
             (
                 "_sum",
                 num_requests * (num_prompt_tokens + max_tokens),
             ),
             ("_count", num_requests * max_tokens),
         ],
-        "vllm:prompt_tokens": [("_total", num_requests * num_prompt_tokens)],
-        "vllm:generation_tokens": [("_total", num_requests * max_tokens)],
-        "vllm:request_success": [("_total", num_requests)],
+        "prompt_tokens": [("_total", num_requests * num_prompt_tokens)],
+        "generation_tokens": [("_total", num_requests * max_tokens)],
+        "request_success": [("_total", num_requests)],
     }
 
 
@@ -180,58 +180,68 @@ async def test_metrics_counts(
 
 
 EXPECTED_METRICS_V1 = [
-    "vllm:num_requests_running",
-    "vllm:num_requests_waiting",
-    "vllm:kv_cache_usage_perc",
-    "vllm:prefix_cache_queries",
-    "vllm:prefix_cache_hits",
-    "vllm:num_preemptions_total",
-    "vllm:prompt_tokens_total",
-    "vllm:generation_tokens_total",
-    "vllm:iteration_tokens_total",
-    "vllm:cache_config_info",
-    "vllm:request_success_total",
-    "vllm:request_prompt_tokens_sum",
-    "vllm:request_prompt_tokens_bucket",
-    "vllm:request_prompt_tokens_count",
-    "vllm:request_generation_tokens_sum",
-    "vllm:request_generation_tokens_bucket",
-    "vllm:request_generation_tokens_count",
-    "vllm:request_params_n_sum",
-    "vllm:request_params_n_bucket",
-    "vllm:request_params_n_count",
-    "vllm:request_params_max_tokens_sum",
-    "vllm:request_params_max_tokens_bucket",
-    "vllm:request_params_max_tokens_count",
-    "vllm:time_to_first_token_seconds_sum",
-    "vllm:time_to_first_token_seconds_bucket",
-    "vllm:time_to_first_token_seconds_count",
-    "vllm:inter_token_latency_seconds_sum",
-    "vllm:inter_token_latency_seconds_bucket",
-    "vllm:inter_token_latency_seconds_count",
-    "vllm:e2e_request_latency_seconds_sum",
-    "vllm:e2e_request_latency_seconds_bucket",
-    "vllm:e2e_request_latency_seconds_count",
-    "vllm:request_queue_time_seconds_sum",
-    "vllm:request_queue_time_seconds_bucket",
-    "vllm:request_queue_time_seconds_count",
-    "vllm:request_inference_time_seconds_sum",
-    "vllm:request_inference_time_seconds_bucket",
-    "vllm:request_inference_time_seconds_count",
-    "vllm:request_prefill_time_seconds_sum",
-    "vllm:request_prefill_time_seconds_bucket",
-    "vllm:request_prefill_time_seconds_count",
-    "vllm:request_decode_time_seconds_sum",
-    "vllm:request_decode_time_seconds_bucket",
-    "vllm:request_decode_time_seconds_count",
+    "num_requests_running",
+    "num_requests_waiting",
+    "kv_cache_usage_perc",
+    "prefix_cache_queries",
+    "prefix_cache_hits",
+    "num_preemptions_total",
+    "prompt_tokens_total",
+    "generation_tokens_total",
+    "iteration_tokens_total",
+    "cache_config_info",
+    "request_success_total",
+    "request_prompt_tokens_sum",
+    "request_prompt_tokens_bucket",
+    "request_prompt_tokens_count",
+    "request_generation_tokens_sum",
+    "request_generation_tokens_bucket",
+    "request_generation_tokens_count",
+    "request_params_n_sum",
+    "request_params_n_bucket",
+    "request_params_n_count",
+    "request_params_max_tokens_sum",
+    "request_params_max_tokens_bucket",
+    "request_params_max_tokens_count",
+    "time_per_output_token_seconds_sum",
+    "time_per_output_token_seconds_bucket",
+    "time_per_output_token_seconds_count",
+    "time_to_first_token_seconds_sum",
+    "time_to_first_token_seconds_bucket",
+    "time_to_first_token_seconds_count",
+    "inter_token_latency_seconds_sum",
+    "inter_token_latency_seconds_bucket",
+    "inter_token_latency_seconds_count",
+    "e2e_request_latency_seconds_sum",
+    "e2e_request_latency_seconds_bucket",
+    "e2e_request_latency_seconds_count",
+    "request_queue_time_seconds_sum",
+    "request_queue_time_seconds_bucket",
+    "request_queue_time_seconds_count",
+    "request_inference_time_seconds_sum",
+    "request_inference_time_seconds_bucket",
+    "request_inference_time_seconds_count",
+    "request_prefill_time_seconds_sum",
+    "request_prefill_time_seconds_bucket",
+    "request_prefill_time_seconds_count",
+    "request_decode_time_seconds_sum",
+    "request_decode_time_seconds_bucket",
+    "request_decode_time_seconds_count",
 ]
 
 EXPECTED_METRICS_MM = [
-    "vllm:mm_cache_queries",
-    "vllm:mm_cache_hits",
+    "mm_cache_queries",
+    "mm_cache_hits",
 ]
 
-HIDDEN_DEPRECATED_METRICS: list[str] = []
+HIDDEN_DEPRECATED_METRICS: list[str] = [
+    "gpu_cache_usage_perc",
+    "gpu_prefix_cache_queries",
+    "gpu_prefix_cache_hits",
+    "time_per_output_token_seconds_sum",
+    "time_per_output_token_seconds_bucket",
+    "time_per_output_token_seconds_count",
+]
 
 
 @pytest.mark.asyncio
@@ -369,17 +379,17 @@ def _get_running_metrics_from_api(server: RemoteOpenAIServer):
     # Verify running and waiting requests counts and KV cache usage are zero
     running_requests, waiting_requests, kv_cache_usage = None, None, None
 
-    kv_cache_usage_metric = "vllm:kv_cache_usage_perc"
+    kv_cache_usage_metric = "kv_cache_usage_perc"
 
     for family in text_string_to_metric_families(response.text):
-        if family.name == "vllm:num_requests_running":
+        if family.name == "num_requests_running":
             for sample in family.samples:
-                if sample.name == "vllm:num_requests_running":
+                if sample.name == "num_requests_running":
                     running_requests = sample.value
                     break
-        elif family.name == "vllm:num_requests_waiting":
+        elif family.name == "num_requests_waiting":
             for sample in family.samples:
-                if sample.name == "vllm:num_requests_waiting":
+                if sample.name == "num_requests_waiting":
                     waiting_requests = sample.value
                     break
         elif family.name == kv_cache_usage_metric:

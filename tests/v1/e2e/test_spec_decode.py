@@ -208,9 +208,9 @@ def test_suffix_decoding_acceptance(
         # Collect draft and acceptance stats.
         metrics = spec_llm.get_metrics()
         for metric in metrics:
-            if metric.name == "vllm:spec_decode_num_draft_tokens":
+            if metric.name == "spec_decode_num_draft_tokens":
                 num_draft.append(metric.value)
-            if metric.name == "vllm:spec_decode_num_accepted_tokens":
+            if metric.name == "spec_decode_num_accepted_tokens":
                 num_accept.append(metric.value)
 
     # Calculate the acceptance rates for the first and last runs.
