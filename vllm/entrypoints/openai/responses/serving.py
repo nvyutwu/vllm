@@ -3,6 +3,8 @@
 
 import asyncio
 import json
+import logging
+import os
 import time
 import uuid
 from collections import deque
@@ -128,6 +130,7 @@ from vllm.tokenizers import TokenizerLike
 from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
+payload_logger = logging.getLogger("vllm.payload")
 
 
 @dataclass
@@ -412,6 +415,37 @@ class OpenAIServingResponses(OpenAIServing):
         request_metadata = RequestResponseMetadata(request_id=request.request_id)
         if raw_request:
             raw_request.state.request_metadata = request_metadata
+
+        # Log request payload BEFORE any processing
+        rid_hint = request.request_id
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            headers_json = ""
+            try:
+                if raw_request is not None:
+                    headers_to_log = {k: v for k, v in raw_request.headers.items()}
+                    headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+            except Exception:
+                headers_json = ""
+            try:
+                req_dump = request.model_dump()
+            except Exception:
+                req_dump = None
+            try:
+                req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
+            except Exception:
+                req_str = ""
+            try:
+                payload_logger.info(
+                    "openai.request",
+                    extra={
+                        "rid": rid_hint or "",
+                        "endpoint": self.__class__.__name__,
+                        "payload": req_str,
+                        "headers": headers_json,
+                    },
+                )
+            except Exception:
+                pass
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[ConversationContext, None]] = []
@@ -709,6 +743,45 @@ class OpenAIServingResponses(OpenAIServing):
                     self._raise_if_error(context.finish_reason, request.request_id)
             else:
                 status = "incomplete"
+
+            # Output logging for Harmony models (gpt-oss)
+            if self.enable_log_outputs and self.request_logger:
+                for item in output:
+                    if isinstance(item, ResponseReasoningItem):
+                        # Log reasoning with [reasoning] prefix
+                        for content_item in item.content:
+                            if hasattr(content_item, 'text') and content_item.text:
+                                self.request_logger.log_outputs(
+                                    request_id=request.request_id,
+                                    outputs=f"[reasoning] {content_item.text}",
+                                    output_token_ids=None,
+                                    finish_reason=None,
+                                    is_streaming=False,
+                                    delta=False,
+                                )
+                    elif isinstance(item, ResponseOutputMessage):
+                        # Log content
+                        for content_item in item.content:
+                            if hasattr(content_item, 'text') and content_item.text:
+                                self.request_logger.log_outputs(
+                                    request_id=request.request_id,
+                                    outputs=content_item.text,
+                                    output_token_ids=None,
+                                    finish_reason="stop",
+                                    is_streaming=False,
+                                    delta=False,
+                                )
+                    elif isinstance(item, ResponseFunctionToolCall):
+                        # Log tool calls with [tool_calls] prefix
+                        self.request_logger.log_outputs(
+                            request_id=request.request_id,
+                            outputs=f"[tool_calls: {item.name}({item.arguments})]",
+                            output_token_ids=None,
+                            finish_reason="tool_calls",
+                            is_streaming=False,
+                            delta=False,
+                        )
+
         elif isinstance(context, ParsableContext):
             output = context.parser.make_response_output_items_from_parsable_context()
 
@@ -796,6 +869,39 @@ class OpenAIServingResponses(OpenAIServing):
                 # If the response is already cancelled, don't update it.
                 if stored_response is None or stored_response.status != "cancelled":
                     self.response_store[response.id] = response
+
+        # Payload logging for non-streaming response
+        if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+            try:
+                usage_dict = usage.model_dump() if usage else None
+            except Exception:
+                usage_dict = None
+            resp_summary = {
+                "id": request.request_id,
+                "object": "response",
+                "created": created_time,
+                "model": model_name,
+                "output_count": len(output),
+                "status": status,
+                "usage": usage_dict,
+                "stream": False,
+            }
+            try:
+                payload_str = json.dumps(resp_summary, ensure_ascii=False)
+            except Exception:
+                payload_str = ""
+            try:
+                payload_logger.info(
+                    "openai.response",
+                    extra={
+                        "rid": request.request_id,
+                        "endpoint": self.__class__.__name__,
+                        "payload": payload_str,
+                    },
+                )
+            except Exception:
+                pass
+
         return response
 
     def _is_mcp_tool_by_namespace(self, recipient: str | None) -> bool:
