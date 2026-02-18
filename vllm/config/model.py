@@ -413,6 +413,10 @@ class ModelConfig:
 
     def metrics_info(self) -> dict[str, str]:
         """Return key model configuration as a dict for Prometheus info metrics."""
+        try:
+            gpu_type = current_platform.get_device_name(0)
+        except Exception:
+            gpu_type = "unknown"
         return {
             "model": str(self.model),
             "served_model_name": str(self.served_model_name or self.model),
@@ -420,6 +424,7 @@ class ModelConfig:
             "max_model_len": str(self.max_model_len),
             "quantization": str(self.quantization or "none"),
             "enforce_eager": str(self.enforce_eager),
+            "gpu_type": gpu_type,
         }
 
     def __post_init__(
