@@ -521,7 +521,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
-                name="corrupted_requests",
+                name="corrupted_requests_total",
                 documentation=(
                     "Corrupted requests, in terms of total number of requests "
                     "with NaNs in logits."
@@ -533,7 +533,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
 
         counter_prefix_cache_queries = self._counter_cls(
-            name="prefix_cache_queries",
+            name="prefix_cache_queries_total",
             documentation=(
                 "Prefix cache queries, in terms of number of queried tokens."
             ),
@@ -544,7 +544,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_prefix_cache_hits = self._counter_cls(
-            name="prefix_cache_hits",
+            name="prefix_cache_hits_total",
             documentation=("Prefix cache hits, in terms of number of cached tokens."),
             labelnames=labelnames,
         )
@@ -557,7 +557,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
 
         counter_connector_prefix_cache_queries = self._counter_cls(
-            name="external_prefix_cache_queries",
+            name="external_prefix_cache_queries_total",
             documentation=(
                 "External prefix cache queries from KV connector "
                 "cross-instance cache sharing, in terms of number of queried tokens."
@@ -569,7 +569,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_connector_prefix_cache_hits = self._counter_cls(
-            name="external_prefix_cache_hits",
+            name="external_prefix_cache_hits_total",
             documentation=(
                 "External prefix cache hits from KV connector "
                 "cross-instance cache sharing, in terms of number of cached tokens."
@@ -585,7 +585,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
 
         counter_mm_cache_queries = self._counter_cls(
-            name="mm_cache_queries",
+            name="mm_cache_queries_total",
             documentation=(
                 "Multi-modal cache queries, in terms of number of queried items."
             ),
@@ -596,7 +596,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_mm_cache_hits = self._counter_cls(
-            name="mm_cache_hits",
+            name="mm_cache_hits_total",
             documentation=(
                 "Multi-modal cache hits, in terms of number of cached items."
             ),
@@ -610,7 +610,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # Counters
         #
         counter_num_preempted_reqs = self._counter_cls(
-            name="num_preemptions",
+            name="num_preemptions_total",
             documentation="Cumulative number of preemption from the engine.",
             labelnames=labelnames,
         )
@@ -619,7 +619,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_prompt_tokens = self._counter_cls(
-            name="prompt_tokens",
+            name="prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
             labelnames=labelnames,
         )
@@ -628,7 +628,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_generation_tokens = self._counter_cls(
-            name="generation_tokens",
+            name="generation_tokens_total",
             documentation="Number of generation tokens processed.",
             labelnames=labelnames,
         )
@@ -638,7 +638,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         self.counter_request_success: dict[FinishReason, dict[int, Counter]] = {}
         counter_request_success_base = self._counter_cls(
-            name="request_success",
+            name="request_success_total",
             documentation="Count of successfully processed requests.",
             labelnames=labelnames + ["finished_reason"],
         )
