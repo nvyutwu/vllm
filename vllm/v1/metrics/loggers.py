@@ -609,13 +609,14 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
         # Counters
         #
-        counter_num_preempted_reqs = self._counter_cls(
-            name="num_preemptions_total",
-            documentation="Cumulative number of preemption from the engine.",
+        counter_num_retracted_reqs = self._counter_cls(
+            name="num_retracted_requests_total",
+            documentation="Cumulative number of retracted (preempted) "
+            "requests from the engine.",
             labelnames=labelnames,
         )
-        self.counter_num_preempted_reqs = make_per_engine(
-            counter_num_preempted_reqs, engine_indexes, model_name
+        self.counter_num_retracted_reqs = make_per_engine(
+            counter_num_retracted_reqs, engine_indexes, model_name
         )
 
         counter_prompt_tokens = self._counter_cls(
@@ -1192,7 +1193,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_corrupted_requests[engine_idx].inc(
                 iteration_stats.num_corrupted_reqs
             )
-        self.counter_num_preempted_reqs[engine_idx].inc(
+        self.counter_num_retracted_reqs[engine_idx].inc(
             iteration_stats.num_preempted_reqs
         )
         self.counter_prompt_tokens[engine_idx].inc(iteration_stats.num_prompt_tokens)
