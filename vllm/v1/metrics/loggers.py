@@ -727,6 +727,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             histogram_max_tokens_request, engine_indexes, model_name
         )
 
+        histogram_num_preemptions_request = self._histogram_cls(
+            name="num_retractions",
+            documentation="Histogram of preemption counts per request.",
+            buckets=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30,
+                     40, 50, 75, 100],
+            labelnames=labelnames,
+        )
+        self.histogram_num_preemptions_request = make_per_engine(
+            histogram_num_preemptions_request, engine_indexes, model_name
+        )
+
         #
         # Histogram of timing intervals
         #
@@ -1265,6 +1276,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+            self.histogram_num_preemptions_request[engine_idx].observe(
+                finished_request.num_preemptions
+            )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1
