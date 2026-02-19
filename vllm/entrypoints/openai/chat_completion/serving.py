@@ -107,7 +107,7 @@ _request_type_tool_call = Counter(
 _request_type_structured_output = Counter(
     name="request_type_structured_output_total",
     documentation="Total chat completion requests with structured output "
-    "(json_schema or json_object)",
+    "(json_schema, json_object, structural_tag, regex, choice, or grammar)",
 )
 
 
@@ -134,9 +134,11 @@ def _classify_chat_request(request: "ChatCompletionRequest") -> None:
     if request.tools and request.tool_choice != "none":
         _request_type_tool_call.inc()
     if (
-        request.response_format is not None
-        and hasattr(request.response_format, "type")
-        and request.response_format.type in ("json_schema", "json_object")
+        (request.response_format is not None
+         and hasattr(request.response_format, "type")
+         and request.response_format.type
+         in ("json_schema", "json_object", "structural_tag"))
+        or request.structured_outputs is not None
     ):
         _request_type_structured_output.inc()
 
