@@ -1297,6 +1297,54 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         """
         self.spec_decoding_prom.flush_gauges()
 
+    def _log_detailed_config_info(self):
+        """Log a single detailed_config_info gauge bundling scheduler,
+        compilation, attention, and environment settings."""
+        cfg = self.vllm_config
+
+        # Helper to safely read nested config attributes
+        def _cfg_val(config_obj, attr, default="N/A"):
+            val = getattr(config_obj, attr, None) if config_obj else None
+            if val is None:
+                return default
+            # Enum values: use .name for readability
+            if hasattr(val, "name"):
+                return str(val.name)
+            return str(val)
+
+        sched = cfg.scheduler_config
+        comp = cfg.compilation_config
+        attn = cfg.attention_config
+
+        labels: dict[str, str] = {
+            # Scheduler config
+            "stream_interval": _cfg_val(sched, "stream_interval", "1"),
+            # Compilation config
+            "compilation_mode": _cfg_val(comp, "mode", "none"),
+            "compilation_backend": _cfg_val(comp, "backend", "default"),
+            "cudagraph_mode": _cfg_val(comp, "cudagraph_mode", "none"),
+            # Attention config
+            "attention_backend": _cfg_val(attn, "backend", "auto"),
+            "flash_attn_version": _cfg_val(attn, "flash_attn_version",
+                                           "auto"),
+            # Environment-level settings
+            "flashinfer_moe_backend": str(
+                getattr(envs, "VLLM_FLASHINFER_MOE_BACKEND", "N/A")),
+        }
+
+        # Add engine label for multi-engine support
+        labels["engine"] = ""
+        info_gauge = self._gauge_cls(
+            name="detailed_config_info",
+            documentation="Additional engine configuration details "
+            "(scheduler, compilation, attention, env settings)",
+            multiprocess_mode="mostrecent",
+            labelnames=labels.keys(),
+        )
+        for engine_index in self.engine_indexes:
+            labels["engine"] = str(engine_index)
+            info_gauge.labels(**labels).set(1)
+
     def log_engine_initialized(self, startup_time: float | None = None):
         # Log all config info metrics for performance correlation
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
@@ -1306,6 +1354,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.log_metrics_info(
                 "speculative_config", self.vllm_config.speculative_config
             )
+        self._log_detailed_config_info()
         if startup_time is not None:
             for engine_idx in self.engine_indexes:
                 self.gauge_engine_startup_time[engine_idx].set(startup_time)
