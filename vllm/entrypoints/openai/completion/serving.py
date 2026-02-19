@@ -35,6 +35,7 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.request_metrics import classify_completion_request
 from vllm.entrypoints.renderer import RenderConfig
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.exceptions import VLLMValidationError
@@ -145,6 +146,8 @@ class OpenAIServingCompletion(OpenAIServing):
         result = await self.render_completion_request(request)
         if isinstance(result, ErrorResponse):
             return result
+
+        classify_completion_request(request)
 
         engine_prompts = result
 
