@@ -523,7 +523,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             counter_corrupted_requests = self._counter_cls(
-                name="corrupted_requests",
+                name="corrupted_requests_total",
                 documentation=(
                     "Corrupted requests, in terms of total number of requests "
                     "with NaNs in logits."
@@ -535,7 +535,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
 
         counter_prefix_cache_queries = self._counter_cls(
-            name="prefix_cache_queries",
+            name="prefix_cache_queries_total",
             documentation=(
                 "Prefix cache queries, in terms of number of queried tokens."
             ),
@@ -546,7 +546,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_prefix_cache_hits = self._counter_cls(
-            name="prefix_cache_hits",
+            name="prefix_cache_hits_total",
             documentation=("Prefix cache hits, in terms of number of cached tokens."),
             labelnames=labelnames,
         )
@@ -559,7 +559,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
 
         counter_connector_prefix_cache_queries = self._counter_cls(
-            name="external_prefix_cache_queries",
+            name="external_prefix_cache_queries_total",
             documentation=(
                 "External prefix cache queries from KV connector "
                 "cross-instance cache sharing, in terms of number of queried tokens."
@@ -571,7 +571,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_connector_prefix_cache_hits = self._counter_cls(
-            name="external_prefix_cache_hits",
+            name="external_prefix_cache_hits_total",
             documentation=(
                 "External prefix cache hits from KV connector "
                 "cross-instance cache sharing, in terms of number of cached tokens."
@@ -587,7 +587,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
 
         counter_mm_cache_queries = self._counter_cls(
-            name="mm_cache_queries",
+            name="mm_cache_queries_total",
             documentation=(
                 "Multi-modal cache queries, in terms of number of queried items."
             ),
@@ -598,7 +598,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_mm_cache_hits = self._counter_cls(
-            name="mm_cache_hits",
+            name="mm_cache_hits_total",
             documentation=(
                 "Multi-modal cache hits, in terms of number of cached items."
             ),
@@ -611,17 +611,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
         # Counters
         #
-        counter_num_preempted_reqs = self._counter_cls(
-            name="num_preemptions",
-            documentation="Cumulative number of preemption from the engine.",
+        counter_num_retracted_reqs = self._counter_cls(
+            name="num_retracted_requests_total",
+            documentation="Cumulative number of retracted (preempted) "
+            "requests from the engine.",
             labelnames=labelnames,
         )
-        self.counter_num_preempted_reqs = make_per_engine(
-            counter_num_preempted_reqs, engine_indexes, model_name
+        self.counter_num_retracted_reqs = make_per_engine(
+            counter_num_retracted_reqs, engine_indexes, model_name
         )
 
         counter_prompt_tokens = self._counter_cls(
-            name="prompt_tokens",
+            name="prompt_tokens_total",
             documentation="Number of prefill tokens processed.",
             labelnames=labelnames,
         )
@@ -665,7 +666,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
 
         counter_generation_tokens = self._counter_cls(
-            name="generation_tokens",
+            name="generation_tokens_total",
             documentation="Number of generation tokens processed.",
             labelnames=labelnames,
         )
@@ -675,7 +676,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
         self.counter_request_success: dict[FinishReason, dict[int, Counter]] = {}
         counter_request_success_base = self._counter_cls(
-            name="request_success",
+            name="request_success_total",
             documentation="Count of successfully processed requests.",
             labelnames=labelnames + ["finished_reason"],
         )
@@ -762,6 +763,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.histogram_max_tokens_request = make_per_engine(
             histogram_max_tokens_request, engine_indexes, model_name
+        )
+
+        histogram_num_preemptions_request = self._histogram_cls(
+            name="num_retractions",
+            documentation="Histogram of preemption counts per request.",
+            buckets=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30,
+                     40, 50, 75, 100],
+            labelnames=labelnames,
+        )
+        self.histogram_num_preemptions_request = make_per_engine(
+            histogram_num_preemptions_request, engine_indexes, model_name
         )
 
         #
@@ -1218,7 +1230,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_corrupted_requests[engine_idx].inc(
                 iteration_stats.num_corrupted_reqs
             )
-        self.counter_num_preempted_reqs[engine_idx].inc(
+        self.counter_num_retracted_reqs[engine_idx].inc(
             iteration_stats.num_preempted_reqs
         )
         self.counter_prompt_tokens[engine_idx].inc(iteration_stats.num_prompt_tokens)
@@ -1310,6 +1322,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+            self.histogram_num_preemptions_request[engine_idx].observe(
+                finished_request.num_preemptions
+            )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1
@@ -1342,6 +1357,54 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         """
         self.spec_decoding_prom.flush_gauges()
 
+    def _log_detailed_config_info(self):
+        """Log a single detailed_config_info gauge bundling scheduler,
+        compilation, attention, and environment settings."""
+        cfg = self.vllm_config
+
+        # Helper to safely read nested config attributes
+        def _cfg_val(config_obj, attr, default="N/A"):
+            val = getattr(config_obj, attr, None) if config_obj else None
+            if val is None:
+                return default
+            # Enum values: use .name for readability
+            if hasattr(val, "name"):
+                return str(val.name)
+            return str(val)
+
+        sched = cfg.scheduler_config
+        comp = cfg.compilation_config
+        attn = cfg.attention_config
+
+        labels: dict[str, str] = {
+            # Scheduler config
+            "stream_interval": _cfg_val(sched, "stream_interval", "1"),
+            # Compilation config
+            "compilation_mode": _cfg_val(comp, "mode", "none"),
+            "compilation_backend": _cfg_val(comp, "backend", "default"),
+            "cudagraph_mode": _cfg_val(comp, "cudagraph_mode", "none"),
+            # Attention config
+            "attention_backend": _cfg_val(attn, "backend", "auto"),
+            "flash_attn_version": _cfg_val(attn, "flash_attn_version",
+                                           "auto"),
+            # Environment-level settings
+            "flashinfer_moe_backend": str(
+                getattr(envs, "VLLM_FLASHINFER_MOE_BACKEND", "N/A")),
+        }
+
+        # Add engine label for multi-engine support
+        labels["engine"] = ""
+        info_gauge = self._gauge_cls(
+            name="detailed_config_info",
+            documentation="Additional engine configuration details "
+            "(scheduler, compilation, attention, env settings)",
+            multiprocess_mode="mostrecent",
+            labelnames=labels.keys(),
+        )
+        for engine_index in self.engine_indexes:
+            labels["engine"] = str(engine_index)
+            info_gauge.labels(**labels).set(1)
+
     def log_engine_initialized(self, startup_time: float | None = None):
         # Log all config info metrics for performance correlation
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
@@ -1351,6 +1414,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.log_metrics_info(
                 "speculative_config", self.vllm_config.speculative_config
             )
+        self._log_detailed_config_info()
         if startup_time is not None:
             for engine_idx in self.engine_indexes:
                 self.gauge_engine_startup_time[engine_idx].set(startup_time)

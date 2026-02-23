@@ -90,6 +90,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from vllm.entrypoints.openai.request_metrics import classify_responses_request
 from vllm.entrypoints.openai.responses.context import (
     ConversationContext,
     HarmonyContext,
@@ -363,6 +364,8 @@ class OpenAIServingResponses(OpenAIServing):
         maybe_validation_error = self._validate_create_responses_input(request)
         if maybe_validation_error is not None:
             return maybe_validation_error
+
+        classify_responses_request(request)
 
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a

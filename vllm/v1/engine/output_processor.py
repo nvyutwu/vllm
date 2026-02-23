@@ -172,6 +172,7 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.num_preemptions = 0
 
         self.stats = RequestStateStats(arrival_time=arrival_time) if log_stats else None
 
@@ -628,6 +629,7 @@ class OutputProcessor:
             kv_transfer_params = engine_core_output.kv_transfer_params
             routed_experts = engine_core_output.routed_experts
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
+            req_state.num_preemptions = engine_core_output.num_preemptions
             req_state.is_prefilling = False
 
             if pooling_output is None:
@@ -812,6 +814,7 @@ class OutputProcessor:
             max_tokens_param=req_state.max_tokens_param,
             req_stats=req_state.stats,
             num_cached_tokens=req_state.num_cached_tokens,
+            num_preemptions=req_state.num_preemptions,
         )
         self.lora_states.request_finished(req_state.request_id, req_state.lora_name)
 

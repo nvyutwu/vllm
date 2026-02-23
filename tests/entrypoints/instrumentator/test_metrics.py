@@ -185,7 +185,7 @@ EXPECTED_METRICS_V1 = [
     "kv_cache_usage_perc",
     "prefix_cache_queries",
     "prefix_cache_hits",
-    "num_preemptions_total",
+    "num_retracted_requests_total",
     "prompt_tokens_total",
     "generation_tokens_total",
     "iteration_tokens_total",
