@@ -1388,6 +1388,7 @@ class Scheduler(SchedulerInterface):
                         num_cached_tokens=request.num_cached_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        num_preemptions=request.num_preemptions,
                     )
                 )
             else:
