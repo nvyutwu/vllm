@@ -4678,7 +4678,16 @@ class GPUModelRunner(
         # Set num_scheduled_tokens based on num_tokens and max_num_seqs
         # for dummy run with LoRA so that the num_reqs collectively
         # has num_tokens in total.
-        assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+        # For speculative decoding with eagle/MTP, the drafter can get longer
+        # sequences than the target model. The max_num_tokens for the drafter
+        # is max_num_batched_tokens + max_num_seqs. See eagle.py:78-81.
+        # The compile range is extended accordingly, so we need to account for
+        # this extension in the assertion.
+        max_allowed_tokens = self.scheduler_config.max_num_batched_tokens
+        if (self.speculative_config is not None
+                and self.speculative_config.use_eagle()):
+            max_allowed_tokens += self.scheduler_config.max_num_seqs
+        assert num_tokens <= max_allowed_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
         if create_mixed_batch:
             assert not uniform_decode
