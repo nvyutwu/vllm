@@ -160,29 +160,26 @@ class OpenAIServingCompletion(OpenAIServing):
         # Log request payload BEFORE any processing
         rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
         if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-            headers_json = ""
+            # Collect all incoming headers unfiltered
+            headers_obj = None
             try:
                 if raw_request is not None:
-                    headers_to_log = {k: v for k, v in raw_request.headers.items()}
-                    headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+                    headers_obj = {k: v for k, v in raw_request.headers.items()}
             except Exception:
-                headers_json = ""
+                headers_obj = None
             try:
                 req_dump = request.model_dump()
             except Exception:
                 req_dump = None
-            try:
-                req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
-            except Exception:
-                req_str = ""
             try:
                 payload_logger.info(
                     "openai.request",
                     extra={
                         "rid": rid_hint or "",
                         "endpoint": self.__class__.__name__,
-                        "payload": req_str,
-                        "headers": headers_json,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": req_dump,
+                        "headers": headers_obj,
                     },
                 )
             except Exception:
@@ -554,16 +551,13 @@ class OpenAIServingCompletion(OpenAIServing):
                     "stream": True,
                 }
                 try:
-                    payload_str = json.dumps(resp_summary, ensure_ascii=False)
-                except Exception:
-                    payload_str = ""
-                try:
                     payload_logger.info(
                         "openai.response",
                         extra={
                             "rid": rid_hint,
                             "endpoint": self.__class__.__name__,
-                            "payload": payload_str,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": resp_summary,
                         },
                     )
                 except Exception:
@@ -718,16 +712,13 @@ class OpenAIServingCompletion(OpenAIServing):
                 "stream": False,
             }
             try:
-                payload_str = json.dumps(resp_summary, ensure_ascii=False)
-            except Exception:
-                payload_str = ""
-            try:
                 payload_logger.info(
                     "openai.response",
                     extra={
                         "rid": rid_hint,
                         "endpoint": self.__class__.__name__,
-                        "payload": payload_str,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": resp_summary,
                     },
                 )
             except Exception:
