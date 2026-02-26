@@ -371,6 +371,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
         # Track accumulated content for output logging
         previous_texts = [""] * num_choices * num_prompts
+        previous_finish_reasons: list[str | None] = [None] * num_choices * num_prompts
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -467,6 +468,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     previous_num_tokens[i] += len(output.token_ids)
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
+                    previous_finish_reasons[i] = finish_reason
 
                     self._raise_if_error(finish_reason, request_id)
 
@@ -541,12 +543,19 @@ class OpenAIServingCompletion(OpenAIServing):
                     usage_dict = final_usage_info.model_dump() if final_usage_info else None
                 except Exception:
                     usage_dict = None
+                choices_list = []
+                for i in range(num_choices * num_prompts):
+                    choices_list.append({
+                        "index": i,
+                        "text": previous_texts[i],
+                        "finish_reason": previous_finish_reasons[i] or "stop",
+                    })
                 resp_summary = {
                     "id": rid_hint,
                     "object": "text_completion",
                     "created": created_time,
                     "model": model_name,
-                    "choices": [],
+                    "choices": choices_list,
                     "usage": usage_dict,
                     "stream": True,
                 }
@@ -702,12 +711,19 @@ class OpenAIServingCompletion(OpenAIServing):
                 usage_dict = usage.model_dump() if usage else None
             except Exception:
                 usage_dict = None
+            choices_list = []
+            for choice in choices:
+                choices_list.append({
+                    "index": choice.index,
+                    "text": choice.text,
+                    "finish_reason": choice.finish_reason,
+                })
             resp_summary = {
                 "id": rid_hint,
                 "object": "text_completion",
                 "created": created_time,
                 "model": model_name,
-                "choices": [],
+                "choices": choices_list,
                 "usage": usage_dict,
                 "stream": False,
             }

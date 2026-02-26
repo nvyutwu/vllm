@@ -876,12 +876,35 @@ class OpenAIServingResponses(OpenAIServing):
                 usage_dict = usage.model_dump() if usage else None
             except Exception:
                 usage_dict = None
+            output_items = []
+            for item in output:
+                if isinstance(item, ResponseReasoningItem):
+                    texts = [c.text for c in item.content
+                             if hasattr(c, 'text') and c.text]
+                    output_items.append({
+                        "type": "reasoning",
+                        "content": " ".join(texts),
+                    })
+                elif isinstance(item, ResponseOutputMessage):
+                    texts = [c.text for c in item.content
+                             if hasattr(c, 'text') and c.text]
+                    output_items.append({
+                        "type": "message",
+                        "content": " ".join(texts),
+                    })
+                elif isinstance(item, ResponseFunctionToolCall):
+                    output_items.append({
+                        "type": "function_call",
+                        "name": item.name,
+                        "arguments": item.arguments,
+                        "call_id": item.call_id,
+                    })
             resp_summary = {
                 "id": request.request_id,
                 "object": "response",
                 "created": created_time,
                 "model": model_name,
-                "output_count": len(output),
+                "output": output_items,
                 "status": status,
                 "usage": usage_dict,
                 "stream": False,
@@ -2624,6 +2647,63 @@ class OpenAIServingResponses(OpenAIServing):
                 request_metadata,
                 created_time=created_time,
             )
+
+            # Payload logging for streaming response summary
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    resp_usage = None
+                    resp_output_items: list[dict] = []
+                    resp_status = "completed"
+                    if isinstance(final_response, ResponsesResponse):
+                        try:
+                            resp_usage = final_response.usage.model_dump() if final_response.usage else None
+                        except Exception:
+                            resp_usage = None
+                        resp_status = final_response.status
+                        for item in final_response.output:
+                            if isinstance(item, ResponseReasoningItem):
+                                texts = [c.text for c in item.content
+                                         if hasattr(c, 'text') and c.text]
+                                resp_output_items.append({
+                                    "type": "reasoning",
+                                    "content": " ".join(texts),
+                                })
+                            elif isinstance(item, ResponseOutputMessage):
+                                texts = [c.text for c in item.content
+                                         if hasattr(c, 'text') and c.text]
+                                resp_output_items.append({
+                                    "type": "message",
+                                    "content": " ".join(texts),
+                                })
+                            elif isinstance(item, ResponseFunctionToolCall):
+                                resp_output_items.append({
+                                    "type": "function_call",
+                                    "name": item.name,
+                                    "arguments": item.arguments,
+                                    "call_id": item.call_id,
+                                })
+                    resp_summary = {
+                        "id": request.request_id,
+                        "object": "response",
+                        "created": created_time,
+                        "model": model_name,
+                        "output": resp_output_items,
+                        "status": resp_status,
+                        "usage": resp_usage,
+                        "stream": True,
+                    }
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": request.request_id,
+                            "endpoint": self.__class__.__name__,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": resp_summary,
+                        },
+                    )
+                except Exception:
+                    pass
+
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",
