@@ -35,6 +35,8 @@ from vllm.entrypoints.openai.engine.serving import (
     clamp_prompt_logprobs,
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
+from vllm.entrypoints.openai.request_metrics import classify_completion_request
+from vllm.entrypoints.renderer import RenderConfig
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
@@ -144,6 +146,8 @@ class OpenAIServingCompletion(OpenAIServing):
         if isinstance(result, ErrorResponse):
             return result
 
+        classify_completion_request(request)
+
         engine_prompts = result
 
         request_id = f"cmpl-{self._base_request_id(raw_request, request.request_id)}"
@@ -156,29 +160,26 @@ class OpenAIServingCompletion(OpenAIServing):
         # Log request payload BEFORE any processing
         rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
         if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-            headers_json = ""
+            # Collect all incoming headers unfiltered
+            headers_obj = None
             try:
                 if raw_request is not None:
-                    headers_to_log = {k: v for k, v in raw_request.headers.items()}
-                    headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+                    headers_obj = {k: v for k, v in raw_request.headers.items()}
             except Exception:
-                headers_json = ""
+                headers_obj = None
             try:
                 req_dump = request.model_dump()
             except Exception:
                 req_dump = None
-            try:
-                req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
-            except Exception:
-                req_str = ""
             try:
                 payload_logger.info(
                     "openai.request",
                     extra={
                         "rid": rid_hint or "",
                         "endpoint": self.__class__.__name__,
-                        "payload": req_str,
-                        "headers": headers_json,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": req_dump,
+                        "headers": headers_obj,
                     },
                 )
             except Exception:
@@ -370,6 +371,7 @@ class OpenAIServingCompletion(OpenAIServing):
 
         # Track accumulated content for output logging
         previous_texts = [""] * num_choices * num_prompts
+        previous_finish_reasons: list[str | None] = [None] * num_choices * num_prompts
 
         stream_options = request.stream_options
         include_usage, include_continuous_usage = should_include_usage(
@@ -466,6 +468,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     previous_num_tokens[i] += len(output.token_ids)
                     finish_reason = output.finish_reason
                     stop_reason = output.stop_reason
+                    previous_finish_reasons[i] = finish_reason
 
                     self._raise_if_error(finish_reason, request_id)
 
@@ -540,26 +543,30 @@ class OpenAIServingCompletion(OpenAIServing):
                     usage_dict = final_usage_info.model_dump() if final_usage_info else None
                 except Exception:
                     usage_dict = None
+                choices_list = []
+                for i in range(num_choices * num_prompts):
+                    choices_list.append({
+                        "index": i,
+                        "text": previous_texts[i],
+                        "finish_reason": previous_finish_reasons[i] or "stop",
+                    })
                 resp_summary = {
                     "id": rid_hint,
                     "object": "text_completion",
                     "created": created_time,
                     "model": model_name,
-                    "choices": [],
+                    "choices": choices_list,
                     "usage": usage_dict,
                     "stream": True,
                 }
-                try:
-                    payload_str = json.dumps(resp_summary, ensure_ascii=False)
-                except Exception:
-                    payload_str = ""
                 try:
                     payload_logger.info(
                         "openai.response",
                         extra={
                             "rid": rid_hint,
                             "endpoint": self.__class__.__name__,
-                            "payload": payload_str,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": resp_summary,
                         },
                     )
                 except Exception:
@@ -704,26 +711,30 @@ class OpenAIServingCompletion(OpenAIServing):
                 usage_dict = usage.model_dump() if usage else None
             except Exception:
                 usage_dict = None
+            choices_list = []
+            for choice in choices:
+                choices_list.append({
+                    "index": choice.index,
+                    "text": choice.text,
+                    "finish_reason": choice.finish_reason,
+                })
             resp_summary = {
                 "id": rid_hint,
                 "object": "text_completion",
                 "created": created_time,
                 "model": model_name,
-                "choices": [],
+                "choices": choices_list,
                 "usage": usage_dict,
                 "stream": False,
             }
-            try:
-                payload_str = json.dumps(resp_summary, ensure_ascii=False)
-            except Exception:
-                payload_str = ""
             try:
                 payload_logger.info(
                     "openai.response",
                     extra={
                         "rid": rid_hint,
                         "endpoint": self.__class__.__name__,
-                        "payload": payload_str,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": resp_summary,
                     },
                 )
             except Exception:

@@ -483,6 +483,15 @@ async def run_server_worker(
                     # Exclude other high-volume internal logs
                     if record.name.startswith('vllm.v1.metrics'):
                         return False
+                    # Exclude request_logger messages that overlap with
+                    # payload_logger structured records (openai.request/
+                    # openai.response). The payload_logger already sends
+                    # the same data in structured form to OTEL.
+                    msg = record.getMessage()
+                    if 'Received request' in msg:
+                        return False
+                    if 'Generated response' in msg:
+                        return False
                     return True
 
             _otel_handler.addFilter(OtelLogFilter())

@@ -90,6 +90,7 @@ from vllm.entrypoints.openai.parser.harmony_utils import (
     parse_response_input,
     render_for_completion,
 )
+from vllm.entrypoints.openai.request_metrics import classify_responses_request
 from vllm.entrypoints.openai.responses.context import (
     ConversationContext,
     HarmonyContext,
@@ -364,6 +365,8 @@ class OpenAIServingResponses(OpenAIServing):
         if maybe_validation_error is not None:
             return maybe_validation_error
 
+        classify_responses_request(request)
+
         # If the engine is dead, raise the engine's DEAD_ERROR.
         # This is required for the streaming case, where we return a
         # success status before we actually start generating text :).
@@ -419,29 +422,26 @@ class OpenAIServingResponses(OpenAIServing):
         # Log request payload BEFORE any processing
         rid_hint = request.request_id
         if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-            headers_json = ""
+            # Collect all incoming headers unfiltered
+            headers_obj = None
             try:
                 if raw_request is not None:
-                    headers_to_log = {k: v for k, v in raw_request.headers.items()}
-                    headers_json = json.dumps(headers_to_log, ensure_ascii=False)
+                    headers_obj = {k: v for k, v in raw_request.headers.items()}
             except Exception:
-                headers_json = ""
+                headers_obj = None
             try:
                 req_dump = request.model_dump()
             except Exception:
                 req_dump = None
-            try:
-                req_str = json.dumps(req_dump, ensure_ascii=False) if req_dump is not None else ""
-            except Exception:
-                req_str = ""
             try:
                 payload_logger.info(
                     "openai.request",
                     extra={
                         "rid": rid_hint or "",
                         "endpoint": self.__class__.__name__,
-                        "payload": req_str,
-                        "headers": headers_json,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": req_dump,
+                        "headers": headers_obj,
                     },
                 )
             except Exception:
@@ -876,27 +876,47 @@ class OpenAIServingResponses(OpenAIServing):
                 usage_dict = usage.model_dump() if usage else None
             except Exception:
                 usage_dict = None
+            output_items = []
+            for item in output:
+                if isinstance(item, ResponseReasoningItem):
+                    texts = [c.text for c in item.content
+                             if hasattr(c, 'text') and c.text]
+                    output_items.append({
+                        "type": "reasoning",
+                        "content": " ".join(texts),
+                    })
+                elif isinstance(item, ResponseOutputMessage):
+                    texts = [c.text for c in item.content
+                             if hasattr(c, 'text') and c.text]
+                    output_items.append({
+                        "type": "message",
+                        "content": " ".join(texts),
+                    })
+                elif isinstance(item, ResponseFunctionToolCall):
+                    output_items.append({
+                        "type": "function_call",
+                        "name": item.name,
+                        "arguments": item.arguments,
+                        "call_id": item.call_id,
+                    })
             resp_summary = {
                 "id": request.request_id,
                 "object": "response",
                 "created": created_time,
                 "model": model_name,
-                "output_count": len(output),
+                "output": output_items,
                 "status": status,
                 "usage": usage_dict,
                 "stream": False,
             }
-            try:
-                payload_str = json.dumps(resp_summary, ensure_ascii=False)
-            except Exception:
-                payload_str = ""
             try:
                 payload_logger.info(
                     "openai.response",
                     extra={
                         "rid": request.request_id,
                         "endpoint": self.__class__.__name__,
-                        "payload": payload_str,
+                        # Pass dict directly for proper OTEL structured logging
+                        "payload": resp_summary,
                     },
                 )
             except Exception:
@@ -2627,6 +2647,63 @@ class OpenAIServingResponses(OpenAIServing):
                 request_metadata,
                 created_time=created_time,
             )
+
+            # Payload logging for streaming response summary
+            if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
+                try:
+                    resp_usage = None
+                    resp_output_items: list[dict] = []
+                    resp_status = "completed"
+                    if isinstance(final_response, ResponsesResponse):
+                        try:
+                            resp_usage = final_response.usage.model_dump() if final_response.usage else None
+                        except Exception:
+                            resp_usage = None
+                        resp_status = final_response.status
+                        for item in final_response.output:
+                            if isinstance(item, ResponseReasoningItem):
+                                texts = [c.text for c in item.content
+                                         if hasattr(c, 'text') and c.text]
+                                resp_output_items.append({
+                                    "type": "reasoning",
+                                    "content": " ".join(texts),
+                                })
+                            elif isinstance(item, ResponseOutputMessage):
+                                texts = [c.text for c in item.content
+                                         if hasattr(c, 'text') and c.text]
+                                resp_output_items.append({
+                                    "type": "message",
+                                    "content": " ".join(texts),
+                                })
+                            elif isinstance(item, ResponseFunctionToolCall):
+                                resp_output_items.append({
+                                    "type": "function_call",
+                                    "name": item.name,
+                                    "arguments": item.arguments,
+                                    "call_id": item.call_id,
+                                })
+                    resp_summary = {
+                        "id": request.request_id,
+                        "object": "response",
+                        "created": created_time,
+                        "model": model_name,
+                        "output": resp_output_items,
+                        "status": resp_status,
+                        "usage": resp_usage,
+                        "stream": True,
+                    }
+                    payload_logger.info(
+                        "openai.response",
+                        extra={
+                            "rid": request.request_id,
+                            "endpoint": self.__class__.__name__,
+                            # Pass dict directly for proper OTEL structured logging
+                            "payload": resp_summary,
+                        },
+                    )
+                except Exception:
+                    pass
+
             yield _increment_sequence_number_and_return(
                 ResponseCompletedEvent(
                     type="response.completed",

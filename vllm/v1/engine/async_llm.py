@@ -145,6 +145,7 @@ class AsyncLLM(EngineClient):
             self.output_processor.tracing_enabled = True
 
         # EngineCore (starts the engine in background process).
+        engine_startup_time_start = time.perf_counter()
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
             executor_class=executor_class,
@@ -153,6 +154,7 @@ class AsyncLLM(EngineClient):
             client_count=client_count,
             client_index=client_index,
         )
+        engine_startup_time = time.perf_counter() - engine_startup_time_start
 
         # Loggers.
         self.logger_manager: StatLoggerManager | None = None
@@ -165,7 +167,9 @@ class AsyncLLM(EngineClient):
                 client_count=client_count,
                 aggregate_engine_logging=aggregate_engine_logging,
             )
-            self.logger_manager.log_engine_initialized()
+            self.logger_manager.log_engine_initialized(
+                startup_time=engine_startup_time
+            )
 
         # Pause / resume state for async RL workflows.
         self._pause_cond = asyncio.Condition()

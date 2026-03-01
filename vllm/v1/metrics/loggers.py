@@ -58,7 +58,7 @@ class StatLoggerBase(ABC):
     ): ...
 
     @abstractmethod
-    def log_engine_initialized(self): ...
+    def log_engine_initialized(self, startup_time: float | None = None): ...
 
     def log(self):  # noqa
         pass
@@ -268,7 +268,7 @@ class LoggingStatLogger(StatLoggerBase):
         if self._enable_perf_stats():
             self.perf_metrics_logging.log(log_fn=log_fn, log_prefix=self.log_prefix)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.debug(
                 "Engine %03d: vllm cache_config_info with initialization "
@@ -336,7 +336,7 @@ class AggregatedLoggingStatLogger(LoggingStatLogger, AggregateStatLoggerBase):
     def log(self):
         LoggingStatLogger.log(self)
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         if self.vllm_config.cache_config.num_gpu_blocks:
             logger.info(
                 "%d Engines: vllm cache_config_info with initialization "
@@ -381,9 +381,9 @@ class PerEngineStatLoggerAdapter(AggregateStatLoggerBase):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
             per_engine_stat_logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for per_engine_stat_logger in self.per_engine_stat_loggers.values():
-            per_engine_stat_logger.log_engine_initialized()
+            per_engine_stat_logger.log_engine_initialized(startup_time)
 
 
 class PrometheusStatLogger(AggregateStatLoggerBase):
@@ -409,6 +409,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.kv_cache_metrics_enabled = (
             vllm_config.observability_config.kv_cache_metrics
         )
+
+        # Throughput tracking (SGLang-compatible gen_throughput)
+        self._throughput_last_time: dict[int, float] = {}
+        self._throughput_accumulated_tokens: dict[int, int] = {}
 
         labelnames = ["model_name", "engine"]
         model_name = vllm_config.model_config.served_model_name
@@ -482,6 +486,39 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.gauge_kv_cache_usage = make_per_engine(
             gauge_kv_cache_usage, engine_indexes, model_name
+        )
+
+        #
+        # SGLang-compatible throughput and startup metrics
+        #
+        gauge_gen_throughput = self._gauge_cls(
+            name="vllm:gen_throughput",
+            documentation="Generation throughput in tokens per second.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_gen_throughput = make_per_engine(
+            gauge_gen_throughput, engine_indexes, model_name
+        )
+
+        gauge_engine_startup_time = self._gauge_cls(
+            name="vllm:engine_startup_time",
+            documentation="Time taken for the engine to start up in seconds.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_engine_startup_time = make_per_engine(
+            gauge_engine_startup_time, engine_indexes, model_name
+        )
+
+        gauge_engine_load_weights_time = self._gauge_cls(
+            name="vllm:engine_load_weights_time",
+            documentation="Time taken for the engine to load weights in seconds.",
+            multiprocess_mode="mostrecent",
+            labelnames=labelnames,
+        )
+        self.gauge_engine_load_weights_time = make_per_engine(
+            gauge_engine_load_weights_time, engine_indexes, model_name
         )
 
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -576,7 +613,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         #
         counter_num_preempted_reqs = self._counter_cls(
             name="vllm:num_preemptions",
-            documentation="Cumulative number of preemption from the engine.",
+            documentation="Cumulative number of retracted (preempted) "
+            "requests from the engine.",
             labelnames=labelnames,
         )
         self.counter_num_preempted_reqs = make_per_engine(
@@ -643,12 +681,23 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             labelnames=labelnames + ["finished_reason"],
         )
         for reason in FinishReason:
+            if reason == FinishReason.ABORT:
+                continue
             self.counter_request_success[reason] = {
                 idx: counter_request_success_base.labels(
                     model_name, str(idx), str(reason)
                 )
                 for idx in engine_indexes
             }
+
+        counter_num_aborted_requests = self._counter_cls(
+            name="vllm:num_aborted_requests",
+            documentation="Number of requests aborted.",
+            labelnames=labelnames,
+        )
+        self.counter_num_aborted_requests = make_per_engine(
+            counter_num_aborted_requests, engine_indexes, model_name
+        )
 
         #
         # Histograms of counts
@@ -714,6 +763,17 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.histogram_max_tokens_request = make_per_engine(
             histogram_max_tokens_request, engine_indexes, model_name
+        )
+
+        histogram_num_preemptions_request = self._histogram_cls(
+            name="vllm:num_retractions",
+            documentation="Histogram of preemption counts per request.",
+            buckets=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30,
+                     40, 50, 75, 100],
+            labelnames=labelnames,
+        )
+        self.histogram_num_preemptions_request = make_per_engine(
+            histogram_num_preemptions_request, engine_indexes, model_name
         )
 
         #
@@ -978,10 +1038,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         # TODO: This metric might be incorrect in case of using multiple
         # api_server counts which uses prometheus mp.
         self.gauge_lora_info: Gauge | None = None
+        self.gauge_lora_pool_utilization: dict[int, Gauge] | None = None
         if vllm_config.lora_config is not None:
             if len(self.engine_indexes) > 1:
                 logger.warning(
-                    "vllm:lora_requests_info prometheus metrics may be "
+                    "lora_requests_info prometheus metrics may be "
                     "incorrect/misleading with data parallel deployments."
                 )
             self.labelname_max_lora = "max_lora"
@@ -999,6 +1060,20 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 ],
             )
 
+            # SGLang-compatible: LoRA pool utilization gauge
+            gauge_lora_pool_utilization = self._gauge_cls(
+                name="vllm:lora_pool_utilization",
+                documentation=(
+                    "LoRA adapter pool utilization as a ratio (0-1). "
+                    "Computed as active_adapters / max_loras."
+                ),
+                labelnames=labelnames,
+                multiprocess_mode="mostrecent",
+            )
+            self.gauge_lora_pool_utilization = make_per_engine(
+                gauge_lora_pool_utilization, engine_indexes, model_name
+            )
+
     def log_metrics_info(self, type: str, config_obj: SupportsMetricsInfo):
         metrics_info = config_obj.metrics_info()
         metrics_info["engine"] = ""
@@ -1007,6 +1082,15 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         if type == "cache_config":
             name = "vllm:cache_config_info"
             documentation = "Information of the LLMEngine CacheConfig"
+        elif type == "model_config":
+            name = "vllm:model_config_info"
+            documentation = "Information of the LLMEngine ModelConfig"
+        elif type == "parallel_config":
+            name = "vllm:parallel_config_info"
+            documentation = "Information of the LLMEngine ParallelConfig"
+        elif type == "speculative_config":
+            name = "vllm:speculative_config_info"
+            documentation = "Information of the LLMEngine SpeculativeConfig"
         assert name is not None, f"Unknown metrics info type {type}"
 
         # Info type metrics are syntactic sugar for a gauge permanently set to 1
@@ -1093,6 +1177,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 }
                 self.gauge_lora_info.labels(**lora_info_labels).set_to_current_time()
 
+                # SGLang-compatible: Update LoRA pool utilization
+                if self.gauge_lora_pool_utilization is not None and self.max_lora > 0:
+                    num_active = len(scheduler_stats.running_lora_adapters)
+                    utilization = num_active / self.max_lora
+                    self.gauge_lora_pool_utilization[engine_idx].set(utilization)
+
         if mm_cache_stats is not None:
             self.counter_mm_cache_queries[engine_idx].inc(mm_cache_stats.queries)
             self.counter_mm_cache_hits[engine_idx].inc(mm_cache_stats.hits)
@@ -1122,6 +1212,26 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             iteration_stats.num_prompt_tokens + iteration_stats.num_generation_tokens
         )
 
+        # Update gen_throughput gauge (SGLang-compatible)
+        now = time.monotonic()
+        if engine_idx not in self._throughput_last_time:
+            self._throughput_last_time[engine_idx] = now
+            self._throughput_accumulated_tokens[engine_idx] = 0
+        self._throughput_accumulated_tokens[engine_idx] += (
+            iteration_stats.num_generation_tokens
+        )
+        delta_time = now - self._throughput_last_time[engine_idx]
+        # Update throughput every 5 seconds (similar to SGLang's approach)
+        if delta_time >= 5.0:
+            throughput = (
+                self._throughput_accumulated_tokens[engine_idx] / delta_time
+                if delta_time > 0
+                else 0.0
+            )
+            self.gauge_gen_throughput[engine_idx].set(throughput)
+            self._throughput_last_time[engine_idx] = now
+            self._throughput_accumulated_tokens[engine_idx] = 0
+
         for max_gen_tokens in iteration_stats.max_num_generation_tokens_iter:
             self.histogram_max_num_generation_tokens_request[engine_idx].observe(
                 max_gen_tokens
@@ -1134,9 +1244,12 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.histogram_inter_token_latency[engine_idx].observe(itl)
 
         for finished_request in iteration_stats.finished_requests:
-            self.counter_request_success[finished_request.finish_reason][
-                engine_idx
-            ].inc()
+            if finished_request.finish_reason == FinishReason.ABORT:
+                self.counter_num_aborted_requests[engine_idx].inc()
+            else:
+                self.counter_request_success[finished_request.finish_reason][
+                    engine_idx
+                ].inc()
             self.histogram_e2e_time_request[engine_idx].observe(
                 finished_request.e2e_latency
             )
@@ -1172,6 +1285,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.histogram_max_tokens_request[engine_idx].observe(
                     finished_request.max_tokens_param
                 )
+            self.histogram_num_preemptions_request[engine_idx].observe(
+                finished_request.num_preemptions
+            )
 
     def record_sleep_state(self, sleep: int = 0, level: int = 0):
         awake = 1
@@ -1192,8 +1308,79 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             )
             self.gauge_engine_sleep_state["awake"][engine_idx].set(awake)
 
-    def log_engine_initialized(self):
+    def log(self):
+        """Flush per-interval gauges.
+
+        Called periodically by StatLoggerManager.log() on the same
+        interval as the logging stat logger. This updates spec decode
+        gauges with per-interval values and resets the interval
+        accumulators, matching SGLang's per-interval gauge behavior.
+        Cumulative values remain available via the Prometheus counters
+        and PromQL rate()/increase() queries.
+        """
+        self.spec_decoding_prom.flush_gauges()
+
+    def _log_detailed_config_info(self):
+        """Log a single detailed_config_info gauge bundling scheduler,
+        compilation, attention, and environment settings."""
+        cfg = self.vllm_config
+
+        # Helper to safely read nested config attributes
+        def _cfg_val(config_obj, attr, default="N/A"):
+            val = getattr(config_obj, attr, None) if config_obj else None
+            if val is None:
+                return default
+            # Enum values: use .name for readability
+            if hasattr(val, "name"):
+                return str(val.name)
+            return str(val)
+
+        sched = cfg.scheduler_config
+        comp = cfg.compilation_config
+        attn = cfg.attention_config
+
+        labels: dict[str, str] = {
+            # Scheduler config
+            "stream_interval": _cfg_val(sched, "stream_interval", "1"),
+            # Compilation config
+            "compilation_mode": _cfg_val(comp, "mode", "none"),
+            "compilation_backend": _cfg_val(comp, "backend", "default"),
+            "cudagraph_mode": _cfg_val(comp, "cudagraph_mode", "none"),
+            # Attention config
+            "attention_backend": _cfg_val(attn, "backend", "auto"),
+            "flash_attn_version": _cfg_val(attn, "flash_attn_version",
+                                           "auto"),
+            # Environment-level settings
+            "flashinfer_moe_backend": str(
+                getattr(envs, "VLLM_FLASHINFER_MOE_BACKEND", "N/A")),
+        }
+
+        # Add engine label for multi-engine support
+        labels["engine"] = ""
+        info_gauge = self._gauge_cls(
+            name="vllm:detailed_config_info",
+            documentation="Additional engine configuration details "
+            "(scheduler, compilation, attention, env settings)",
+            multiprocess_mode="mostrecent",
+            labelnames=labels.keys(),
+        )
+        for engine_index in self.engine_indexes:
+            labels["engine"] = str(engine_index)
+            info_gauge.labels(**labels).set(1)
+
+    def log_engine_initialized(self, startup_time: float | None = None):
+        # Log all config info metrics for performance correlation
         self.log_metrics_info("cache_config", self.vllm_config.cache_config)
+        self.log_metrics_info("model_config", self.vllm_config.model_config)
+        self.log_metrics_info("parallel_config", self.vllm_config.parallel_config)
+        if self.vllm_config.speculative_config is not None:
+            self.log_metrics_info(
+                "speculative_config", self.vllm_config.speculative_config
+            )
+        self._log_detailed_config_info()
+        if startup_time is not None:
+            for engine_idx in self.engine_indexes:
+                self.gauge_engine_startup_time[engine_idx].set(startup_time)
 
 
 PromMetric: TypeAlias = Gauge | Counter | Histogram
@@ -1321,6 +1508,6 @@ class StatLoggerManager:
         for logger in self.stat_loggers:
             logger.log()
 
-    def log_engine_initialized(self):
+    def log_engine_initialized(self, startup_time: float | None = None):
         for agg_logger in self.stat_loggers:
-            agg_logger.log_engine_initialized()
+            agg_logger.log_engine_initialized(startup_time)

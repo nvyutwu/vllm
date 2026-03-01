@@ -90,6 +90,8 @@ from vllm.tool_parsers.utils import partial_json_loads
 from vllm.utils.collection_utils import as_list
 from vllm.v1.sample.logits_processor import validate_logits_processors_parameters
 
+from vllm.entrypoints.openai.request_metrics import classify_chat_request
+
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
 
@@ -244,18 +246,27 @@ class OpenAIServingChat(OpenAIServing):
         try:
             # Log request payload BEFORE any chat template is applied
             if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-                payload_logger = logging.getLogger("vllm.entrypoints.openai.payload")
+                # Collect all incoming headers unfiltered
+                headers_obj = None
+                try:
+                    if raw_request is not None:
+                        headers_obj = {k: v for k, v in raw_request.headers.items()}
+                except Exception:
+                    headers_obj = None
                 try:
                     req_dump = request.model_dump()
                 except Exception:
                     req_dump = None
+                rid_hint = self._base_request_id(raw_request, getattr(request, "request_id", None))
                 try:
                     payload_logger.info(
                         "openai.request",
                         extra={
-                            "rid": getattr(request, "request_id", "") or "",
+                            "rid": rid_hint or "",
                             "endpoint": self.__class__.__name__,
+                            # Pass dict directly for proper OTEL structured logging
                             "payload": req_dump,
+                            "headers": headers_obj,
                         },
                     )
                 except Exception:
@@ -372,6 +383,8 @@ class OpenAIServingChat(OpenAIServing):
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
+
+        classify_chat_request(request)
 
         conversation, engine_prompts = result
 

@@ -97,7 +97,7 @@ def get_metrics_snapshot() -> list[Metric]:
             samples = _get_samples(metric, "_total")
             if metric.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
                 #
-                # Ugly vllm:num_accepted_tokens_per_pos special case.
+                # Ugly vllm:spec_decode_num_accepted_tokens_per_pos special case.
                 #
                 # This metric is a vector of counters - for each spec
                 # decoding token position, we observe the number of

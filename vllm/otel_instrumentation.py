@@ -710,8 +710,41 @@ def get_otel_meter():
     return _GLOBAL_METER
 
 
+_METRIC_NAME_MAP: dict[str, str] = {
+    # vLLM counter suffix alignment — safety net in case Prometheus client
+    # does not append _total to sample names. If it does, prefix stripping
+    # handles it automatically (vllm_prompt_tokens_total → prompt_tokens_total).
+    "vllm_prompt_tokens": "prompt_tokens_total",
+    "vllm_generation_tokens": "generation_tokens_total",
+    "vllm_request_success": "request_success_total",
+    "vllm_num_preemptions": "num_preemptions_total",
+    "vllm_prefix_cache_queries": "prefix_cache_queries_total",
+    "vllm_prefix_cache_hits": "prefix_cache_hits_total",
+    "vllm_external_prefix_cache_queries": "external_prefix_cache_queries_total",
+    "vllm_external_prefix_cache_hits": "external_prefix_cache_hits_total",
+    "vllm_mm_cache_queries": "mm_cache_queries_total",
+    "vllm_mm_cache_hits": "mm_cache_hits_total",
+    "vllm_corrupted_requests": "corrupted_requests_total",
+    "vllm_num_aborted_requests": "num_aborted_requests_total",
+    "vllm_request_type_image_total": "request_type_image_total",
+    "vllm_request_type_video_total": "request_type_video_total",
+    "vllm_request_type_tool_call_total": "request_type_tool_call_total",
+    "vllm_request_type_structured_output_total": "request_type_structured_output_total",
+    # Spec decode counters
+    "vllm_spec_decode_num_drafts": "spec_decode_num_drafts_total",
+    "vllm_spec_decode_num_draft_tokens": "spec_decode_num_draft_tokens_total",
+    "vllm_spec_decode_num_accepted_tokens": "spec_decode_num_accepted_tokens_total",
+    "vllm_spec_decode_num_accepted_tokens_per_pos": "spec_decode_num_accepted_tokens_per_pos_total",
+}
+
+
 def _sanitize_metric_name(name: str) -> str:
-    return name.replace(":", "_")
+    sanitized = name.replace(":", "_")
+    if sanitized in _METRIC_NAME_MAP:
+        return _METRIC_NAME_MAP[sanitized]
+    if sanitized.startswith("vllm_"):
+        return sanitized[len("vllm_"):]
+    return sanitized
 
 
 def _labels_to_attributes(labels: Dict[str, str]) -> Dict[str, str]:
