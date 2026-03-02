@@ -20,6 +20,7 @@ from vllm.logger import init_logger
 from vllm.plugins import STAT_LOGGER_PLUGINS_GROUP, load_plugins_by_group
 from vllm.v1.engine import FinishReason
 from vllm.v1.metrics.perf import PerfMetricsLogging
+from vllm.entrypoints.openai.request_metrics import register_request_type_counters
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     CachingMetrics,
@@ -402,6 +403,8 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         self.engine_indexes = engine_indexes
 
         unregister_vllm_metrics()
+        # Register request type counters after cleanup to ensure they survive
+        register_request_type_counters()
         self.vllm_config = vllm_config
         # Use this flag to hide metrics that were deprecated in
         # a previous release and which will be removed future

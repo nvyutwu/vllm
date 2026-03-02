@@ -2,31 +2,71 @@
 
 These counters track workload composition (images, videos, tool calls,
 structured output) across chat, completion, and responses APIs.
+
+Note: Counters are registered lazily via register_request_type_counters()
+which is called by PrometheusStatLogger after unregister_vllm_metrics().
+This ensures counters survive the metric cleanup during engine startup.
 """
 
-from prometheus_client import Counter
+from __future__ import annotations
 
-request_type_image = Counter(
-    name="vllm:request_type_image_total",
-    documentation="Total requests containing images",
-)
-request_type_video = Counter(
-    name="vllm:request_type_video_total",
-    documentation="Total requests containing videos",
-)
-request_type_tool_call = Counter(
-    name="vllm:request_type_tool_call_total",
-    documentation="Total requests with tool calls enabled",
-)
-request_type_structured_output = Counter(
-    name="vllm:request_type_structured_output_total",
-    documentation="Total requests with structured output "
-    "(json_schema, json_object, structural_tag, regex, choice, or grammar)",
-)
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from prometheus_client import Counter
+
+# Module-level counter references (populated by register_request_type_counters)
+request_type_image: Counter | None = None
+request_type_video: Counter | None = None
+request_type_tool_call: Counter | None = None
+request_type_structured_output: Counter | None = None
+
+_counters_registered = False
+
+
+def register_request_type_counters() -> None:
+    """Register request type counters with Prometheus.
+
+    This function must be called AFTER unregister_vllm_metrics() to ensure
+    the counters are not removed during engine startup cleanup.
+
+    Called by PrometheusStatLogger.__init__ in vllm/v1/metrics/loggers.py.
+    """
+    global request_type_image, request_type_video
+    global request_type_tool_call, request_type_structured_output
+    global _counters_registered
+
+    if _counters_registered:
+        return
+
+    from prometheus_client import Counter
+
+    request_type_image = Counter(
+        name="vllm:request_type_image_total",
+        documentation="Total requests containing images",
+    )
+    request_type_video = Counter(
+        name="vllm:request_type_video_total",
+        documentation="Total requests containing videos",
+    )
+    request_type_tool_call = Counter(
+        name="vllm:request_type_tool_call_total",
+        documentation="Total requests with tool calls enabled",
+    )
+    request_type_structured_output = Counter(
+        name="vllm:request_type_structured_output_total",
+        documentation="Total requests with structured output "
+        "(json_schema, json_object, structural_tag, regex, choice, or grammar)",
+    )
+
+    _counters_registered = True
 
 
 def classify_chat_request(request) -> None:
     """Classify a ChatCompletionRequest and increment counters."""
+    if not _counters_registered:
+        return
+
     has_image = False
     has_video = False
     for msg in request.messages:
@@ -57,6 +97,8 @@ def classify_completion_request(request) -> None:
     Completions support structured output (response_format, structured_outputs)
     but not images, videos, or tool calls.
     """
+    if not _counters_registered:
+        return
     _classify_structured_output_chat_completion(request)
 
 
@@ -66,6 +108,9 @@ def classify_responses_request(request) -> None:
     Responses support tools, structured output (via text.format),
     and images in input.
     """
+    if not _counters_registered:
+        return
+
     # Images in input
     _classify_responses_images(request)
 
