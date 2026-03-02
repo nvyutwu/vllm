@@ -51,6 +51,16 @@ from vllm.v1.sample.logits_processor import validate_logits_processors_parameter
 logger = init_logger(__name__)
 payload_logger = logging.getLogger("vllm.payload")
 
+# Import Harmony utilities for gpt-oss models
+try:
+    from vllm.entrypoints.openai.parser.harmony_utils import (
+        get_stop_tokens_for_assistant_actions,
+    )
+    HARMONY_AVAILABLE = True
+except ImportError:
+    HARMONY_AVAILABLE = False
+    logger.warning("Harmony utilities not available. gpt-oss models will not be supported in Completion API.")
+
 
 class OpenAIServingCompletion(OpenAIServing):
     def __init__(
@@ -81,6 +91,30 @@ class OpenAIServingCompletion(OpenAIServing):
         self.enable_force_include_usage = enable_force_include_usage
 
         self.default_sampling_params = self.model_config.get_diff_sampling_param()
+
+        if self.default_sampling_params:
+            source = self.model_config.generation_config
+            source = "model" if source == "auto" else source
+            logger.info(
+                "Using default completion sampling params from %s: %s",
+                source,
+                self.default_sampling_params,
+            )
+
+        # Check if model is gpt-oss and needs Harmony format
+        self.use_harmony = HARMONY_AVAILABLE and self.model_config.hf_config.model_type == "gpt_oss"
+        if self.use_harmony:
+            logger.info("Enabling Harmony format for gpt-oss model in Completion API")
+            if self.default_sampling_params is None:
+                self.default_sampling_params = {}
+            # Preserve special tokens (e.g. <|channel|>, <|message|>, <|end|>) in output
+            self.default_sampling_params["skip_special_tokens"] = False
+            # Add stop tokens for Harmony assistant actions
+            if "stop_token_ids" not in self.default_sampling_params:
+                self.default_sampling_params["stop_token_ids"] = []
+            self.default_sampling_params["stop_token_ids"].extend(
+                get_stop_tokens_for_assistant_actions()
+            )
 
     async def render_completion_request(
         self,
@@ -471,25 +505,25 @@ class OpenAIServingCompletion(OpenAIServing):
 
                     self._raise_if_error(finish_reason, request_id)
 
+                    choice = CompletionResponseStreamChoice(
+                        index=i,
+                        text=delta_text,
+                        logprobs=logprobs,
+                        finish_reason=finish_reason,
+                        stop_reason=stop_reason,
+                        prompt_token_ids=prompt_token_ids_to_return,
+                        token_ids=(
+                            as_list(output.token_ids)
+                            if request.return_token_ids
+                            else None
+                        ),
+                    )
+
                     chunk = CompletionStreamResponse(
                         id=request_id,
                         created=created_time,
                         model=model_name,
-                        choices=[
-                            CompletionResponseStreamChoice(
-                                index=i,
-                                text=delta_text,
-                                logprobs=logprobs,
-                                finish_reason=finish_reason,
-                                stop_reason=stop_reason,
-                                prompt_token_ids=prompt_token_ids_to_return,
-                                token_ids=(
-                                    as_list(output.token_ids)
-                                    if request.return_token_ids
-                                    else None
-                                ),
-                            )
-                        ],
+                        choices=[choice],
                     )
                     if include_continuous_usage:
                         prompt_tokens = num_prompt_tokens[prompt_idx]
