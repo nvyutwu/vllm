@@ -94,7 +94,7 @@ async def render_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     try:
-        result = await handler.render_chat_request(request)
+        result = await handler.render_chat_request(request, raw_request)
     except Exception as e:
         return handler.create_error_response(e)
 

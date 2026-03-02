@@ -224,6 +224,7 @@ class OpenAIServingChat(OpenAIServing):
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
+        raw_request: Request | None = None,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]] | ErrorResponse:
         """
         render chat request by validating and preprocessing inputs.
@@ -380,7 +381,7 @@ class OpenAIServingChat(OpenAIServing):
         except RuntimeError as e:
             logger.exception("Error in reasoning parser creation.")
             return self.create_error_response(str(e))
-        result = await self.render_chat_request(request)
+        result = await self.render_chat_request(request, raw_request)
         if isinstance(result, ErrorResponse):
             return result
 

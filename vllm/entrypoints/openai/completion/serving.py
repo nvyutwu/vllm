@@ -36,7 +36,6 @@ from vllm.entrypoints.openai.engine.serving import (
 )
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.request_metrics import classify_completion_request
-from vllm.entrypoints.renderer import RenderConfig
 from vllm.entrypoints.utils import get_max_tokens, should_include_usage
 from vllm.exceptions import VLLMValidationError
 from vllm.logger import init_logger
