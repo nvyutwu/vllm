@@ -1683,28 +1683,7 @@ class OpenAIServingChat(OpenAIServing):
                 logprobs = None
 
             if self.use_harmony:
-                # Log raw output tokens before Harmony parsing
-                if logger.isEnabledFor(logging.DEBUG):
-                    raw_text = tokenizer.decode(
-                        token_ids, skip_special_tokens=False
-                    ) if tokenizer else "<no tokenizer>"
-                    logger.debug(
-                        "[%s] Raw output token_ids (%d tokens): %s",
-                        rid_hint, len(token_ids), list(token_ids),
-                    )
-                    logger.debug(
-                        "[%s] Raw decoded text (skip_special_tokens=False):\n%s",
-                        rid_hint, raw_text,
-                    )
-
                 reasoning, content, _ = parse_chat_output(token_ids)
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "[%s] Harmony parsed -> reasoning=%s, content=%s",
-                        rid_hint,
-                        repr(reasoning[:200]) if reasoning else None,
-                        repr(content[:500]) if content else None,
-                    )
                 if not request.include_reasoning:
                     reasoning = None
 

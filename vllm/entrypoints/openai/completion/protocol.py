@@ -8,8 +8,6 @@ import time
 from dataclasses import replace
 from typing import Annotated, Any, Literal
 
-from vllm.entrypoints.chat_utils import make_tool_call_id
-
 import torch
 from pydantic import Field, model_validator
 
@@ -429,17 +427,6 @@ class CompletionRequest(OpenAIBaseModel):
         return data
 
 
-class FunctionCall(OpenAIBaseModel):
-    name: str
-    arguments: str
-
-
-class ToolCall(OpenAIBaseModel):
-    id: str = Field(default_factory=make_tool_call_id)
-    type: Literal["function"] = "function"
-    function: FunctionCall
-
-
 class CompletionLogProbs(OpenAIBaseModel):
     text_offset: list[int] = Field(default_factory=list)
     token_logprobs: list[float | None] = Field(default_factory=list)
@@ -463,21 +450,6 @@ class CompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None  # For response
     prompt_logprobs: list[dict[int, Logprob] | None] | None = None
     prompt_token_ids: list[int] | None = None  # For prompt
-    # vLLM-specific fields for Harmony/gpt-oss models (similar to Ollama)
-    thinking: str | None = Field(
-        default=None,
-        description=(
-            "Thinking/reasoning content from the model (e.g., from analysis channel "
-            "in Harmony format for gpt-oss models). Similar to Ollama's thinking field."
-        ),
-    )
-    tool_calls: list[ToolCall] | None = Field(
-        default=None,
-        description=(
-            "Tool calls made by the model (e.g., from commentary channel "
-            "in Harmony format for gpt-oss models). Similar to Ollama's tool_calls field."
-        ),
-    )
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -513,23 +485,6 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     # prompt tokens is put into choice to align with CompletionResponseChoice
     prompt_token_ids: list[int] | None = None
     token_ids: list[int] | None = None
-    # vLLM-specific fields for Harmony/gpt-oss models (similar to Ollama)
-    thinking: str | None = Field(
-        default=None,
-        description=(
-            "Thinking/reasoning content from the model during streaming "
-            "(e.g., from analysis channel in Harmony format for gpt-oss models). "
-            "Similar to Ollama's thinking field."
-        ),
-    )
-    tool_calls: list[ToolCall] | None = Field(
-        default=None,
-        description=(
-            "Tool calls made by the model during streaming "
-            "(e.g., from commentary channel in Harmony format for gpt-oss models). "
-            "Similar to Ollama's tool_calls field."
-        ),
-    )
 
 
 class CompletionStreamResponse(OpenAIBaseModel):

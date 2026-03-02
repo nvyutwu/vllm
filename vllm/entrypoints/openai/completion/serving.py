@@ -505,25 +505,25 @@ class OpenAIServingCompletion(OpenAIServing):
 
                     self._raise_if_error(finish_reason, request_id)
 
-                    choice = CompletionResponseStreamChoice(
-                        index=i,
-                        text=delta_text,
-                        logprobs=logprobs,
-                        finish_reason=finish_reason,
-                        stop_reason=stop_reason,
-                        prompt_token_ids=prompt_token_ids_to_return,
-                        token_ids=(
-                            as_list(output.token_ids)
-                            if request.return_token_ids
-                            else None
-                        ),
-                    )
-
                     chunk = CompletionStreamResponse(
                         id=request_id,
                         created=created_time,
                         model=model_name,
-                        choices=[choice],
+                        choices=[
+                            CompletionResponseStreamChoice(
+                                index=i,
+                                text=delta_text,
+                                logprobs=logprobs,
+                                finish_reason=finish_reason,
+                                stop_reason=stop_reason,
+                                prompt_token_ids=prompt_token_ids_to_return,
+                                token_ids=(
+                                    as_list(output.token_ids)
+                                    if request.return_token_ids
+                                    else None
+                                ),
+                            )
+                        ],
                     )
                     if include_continuous_usage:
                         prompt_tokens = num_prompt_tokens[prompt_idx]
