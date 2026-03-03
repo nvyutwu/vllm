@@ -239,6 +239,10 @@ class OpenAIServingCompletion(OpenAIServing):
                     self._extract_prompt_len(engine_prompt),
                     self.default_sampling_params,
                 )
+                # Resolve request.max_tokens so downstream code
+                # (echo logic, assertions) sees an int, not None.
+                if request.max_tokens is None:
+                    request.max_tokens = max_tokens
 
                 sampling_params: SamplingParams | BeamSearchParams
                 if request.use_beam_search:
