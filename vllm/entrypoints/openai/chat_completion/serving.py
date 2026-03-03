@@ -1278,31 +1278,9 @@ class OpenAIServingChat(OpenAIServing):
 
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
-                        delta_content_parts = []
-                        if delta_message.content:
-                            delta_content_parts.append(delta_message.content)
-                        if delta_message.reasoning:
-                            reasoning = delta_message.reasoning
-                            delta_content_parts.append(f"[reasoning: {reasoning}]")
-                        if delta_message.tool_calls:
-                            tool_args = "".join(
-                                tc.function.arguments
-                                for tc in delta_message.tool_calls
-                                if tc.function and tc.function.arguments
-                            )
-                            if tool_args:
-                                delta_content_parts.append(f"[tool_calls: {tool_args}]")
-
-                        if delta_content_parts and self.enable_log_deltas:
-                            delta_content = " ".join(delta_content_parts)
-                            self.request_logger.log_outputs(
-                                request_id=request_id,
-                                outputs=delta_content,
-                                output_token_ids=as_list(output.token_ids),
-                                finish_reason=output.finish_reason,
-                                is_streaming=True,
-                                delta=True,
-                            )
+                        # Skip logging individual streaming deltas to reduce log volume
+                        # We'll log the complete response at the end instead
+                        pass
 
                     if output.finish_reason is None:
                         # Send token-by-token response for each request.n
