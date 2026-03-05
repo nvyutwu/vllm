@@ -13,7 +13,7 @@ from openai.types.chat.chat_completion_audio import (
     ChatCompletionAudio as OpenAIChatCompletionAudio,
 )
 from openai.types.chat.chat_completion_message import Annotation as OpenAIAnnotation
-from pydantic import Field, model_validator
+from pydantic import Field, computed_field, model_validator
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -63,6 +63,11 @@ class ChatMessage(OpenAIBaseModel):
 
     # vLLM-specific fields that are not in OpenAI spec
     reasoning: str | None = None
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def reasoning_content(self) -> str | None:
+        return self.reasoning
 
 
 class ChatCompletionLogProb(OpenAIBaseModel):
