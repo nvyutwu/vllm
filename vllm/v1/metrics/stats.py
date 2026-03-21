@@ -373,8 +373,13 @@ class IterationStats:
         if is_prefilling:
             req_stats.first_token_ts = engine_core_timestamp
         else:
-            itl = engine_core_timestamp - req_stats.last_token_ts
-            self.inter_token_latencies_iter.append(itl)
+            # Normalize by token count so ITL is per-token, not per-step.
+            # This matters for speculative decoding where a single step can
+            # produce multiple tokens; matches Dynamo and SGLang conventions.
+            raw_gap = engine_core_timestamp - req_stats.last_token_ts
+            itl = raw_gap / max(num_new_generation_tokens, 1)
+            for _ in range(max(num_new_generation_tokens, 1)):
+                self.inter_token_latencies_iter.append(itl)
 
         req_stats.last_token_ts = engine_core_timestamp
 
