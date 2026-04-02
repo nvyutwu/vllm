@@ -717,7 +717,7 @@ _METRIC_NAME_MAP: dict[str, str] = {
     "vllm_prompt_tokens": "prompt_tokens_total",
     "vllm_generation_tokens": "generation_tokens_total",
     "vllm_request_success": "request_success_total",
-    "vllm_num_preemptions": "num_preemptions_total",
+    "vllm_num_preemptions": "num_retracted_requests_total",
     "vllm_prefix_cache_queries": "prefix_cache_queries_total",
     "vllm_prefix_cache_hits": "prefix_cache_hits_total",
     "vllm_external_prefix_cache_queries": "external_prefix_cache_queries_total",
