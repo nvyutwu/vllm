@@ -3,6 +3,7 @@
 
 import asyncio
 import atexit
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, TypeVar
@@ -23,6 +24,8 @@ from .base import MediaIO
 from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoMediaIO
 
+logger = logging.getLogger(__name__)
+
 _M = TypeVar("_M")
 
 global_thread_pool = ThreadPoolExecutor(
@@ -35,6 +38,17 @@ MEDIA_CONNECTOR_REGISTRY = ExtensionManager()
 
 @MEDIA_CONNECTOR_REGISTRY.register("http")
 class MediaConnector:
+    _default_nvcf_assets: dict[str, Path] | None = None
+
+    @classmethod
+    def set_default_nvcf_assets(cls, assets: dict[str, Path] | None):
+        """Set the default NVCF assets mapping for all MediaConnector
+        instances. This function can be called by higher level serving
+        components (e.g. API server) when they parse the request headers for
+        NVCF assets.
+        """
+        cls._default_nvcf_assets = assets
+
     def __init__(
         self,
         media_io_kwargs: dict[str, dict[str, Any]] | None = None,
@@ -93,11 +107,25 @@ class MediaConnector:
         # media_type starts with a leading "/" (e.g., "/video/jpeg")
         media_type = media_type.lstrip("/")
 
-        if data_type != "base64":
-            msg = "Only base64 data URLs are supported for now."
+        if data_type == "base64":
+            logger.debug(f"Loading media from base64 data URL: media_type={media_type}")
+            return media_io.load_base64(media_type, data)
+        elif data_type == "asset_id":
+            # Retrieve the asset from the provided mapping.
+            assets = self._default_nvcf_assets
+            if assets is None or data not in assets:
+                raise ValueError(
+                    f"The NVCF asset ID {data} is not available. Make sure the client "
+                    "passes 'NVCF-ASSET-DIR' and 'NVCF-FUNCTION-ASSET-IDS' headers correctly."
+                )
+            asset_path = assets[data]
+            logger.debug(f"Loading media from NVCF asset_id: asset_id={data}, media_type={media_type}, path={asset_path}")
+            result = media_io.load_file(asset_path)
+            logger.debug(f"Successfully loaded NVCF asset: asset_id={data}, media_type={media_type}")
+            return result
+        else:
+            msg = "Only base64 and asset_id data URLs are supported for now."
             raise NotImplementedError(msg)
-
-        return media_io.load_base64(media_type, data)
 
     def _load_file_url(
         self,

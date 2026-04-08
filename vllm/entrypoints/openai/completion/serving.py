@@ -556,7 +556,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         "finish_reason": previous_finish_reasons[i] or "stop",
                     })
                 resp_summary = {
-                    "id": rid_hint,
+                    "id": request_id,
                     "object": "text_completion",
                     "created": created_time,
                     "model": model_name,
@@ -723,7 +723,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     "finish_reason": choice.finish_reason,
                 })
             resp_summary = {
-                "id": rid_hint,
+                "id": request_id,
                 "object": "text_completion",
                 "created": created_time,
                 "model": model_name,
