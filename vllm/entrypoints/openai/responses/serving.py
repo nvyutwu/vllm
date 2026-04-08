@@ -420,28 +420,29 @@ class OpenAIServingResponses(OpenAIServing):
             raw_request.state.request_metadata = request_metadata
 
         # Log request payload BEFORE any processing
-        rid_hint = request.request_id
+        rid_hint = request.request_id.removeprefix("resp_")
         if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-            # Collect all incoming headers unfiltered
-            headers_obj = None
+            headers_json = ""
             try:
                 if raw_request is not None:
-                    headers_obj = {k: v for k, v in raw_request.headers.items()}
+                    headers_json = json.dumps(
+                        {k: v for k, v in raw_request.headers.items()},
+                        ensure_ascii=False,
+                    )
             except Exception:
-                headers_obj = None
+                headers_json = ""
             try:
-                req_dump = request.model_dump()
+                req_str = request.model_dump_json()
             except Exception:
-                req_dump = None
+                req_str = ""
             try:
                 payload_logger.info(
                     "openai.request",
                     extra={
                         "rid": rid_hint or "",
                         "endpoint": self.__class__.__name__,
-                        # Pass dict directly for proper OTEL structured logging
-                        "payload": req_dump,
-                        "headers": headers_obj,
+                        "payload": req_str,
+                        "headers": headers_json,
                     },
                 )
             except Exception:
@@ -913,10 +914,9 @@ class OpenAIServingResponses(OpenAIServing):
                 payload_logger.info(
                     "openai.response",
                     extra={
-                        "rid": request.request_id,
+                        "rid": request.request_id.removeprefix("resp_"),
                         "endpoint": self.__class__.__name__,
-                        # Pass dict directly for proper OTEL structured logging
-                        "payload": resp_summary,
+                        "payload": json.dumps(resp_summary, ensure_ascii=False),
                     },
                 )
             except Exception:
@@ -2695,10 +2695,9 @@ class OpenAIServingResponses(OpenAIServing):
                     payload_logger.info(
                         "openai.response",
                         extra={
-                            "rid": request.request_id,
+                            "rid": request.request_id.removeprefix("resp_"),
                             "endpoint": self.__class__.__name__,
-                            # Pass dict directly for proper OTEL structured logging
-                            "payload": resp_summary,
+                            "payload": json.dumps(resp_summary, ensure_ascii=False),
                         },
                     )
                 except Exception:

@@ -157,28 +157,30 @@ class OpenAIServingCompletion(OpenAIServing):
             raw_request.state.request_metadata = request_metadata
 
         # Log request payload BEFORE any processing
-        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
+        # Use raw UUID (without API prefix) as the correlation ID across all APIs
+        rid_hint = self._base_request_id(raw_request, request.request_id)
         if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-            # Collect all incoming headers unfiltered
-            headers_obj = None
+            headers_json = ""
             try:
                 if raw_request is not None:
-                    headers_obj = {k: v for k, v in raw_request.headers.items()}
+                    headers_json = json.dumps(
+                        {k: v for k, v in raw_request.headers.items()},
+                        ensure_ascii=False,
+                    )
             except Exception:
-                headers_obj = None
+                headers_json = ""
             try:
-                req_dump = request.model_dump()
+                req_str = request.model_dump_json()
             except Exception:
-                req_dump = None
+                req_str = ""
             try:
                 payload_logger.info(
                     "openai.request",
                     extra={
                         "rid": rid_hint or "",
                         "endpoint": self.__class__.__name__,
-                        # Pass dict directly for proper OTEL structured logging
-                        "payload": req_dump,
-                        "headers": headers_obj,
+                        "payload": req_str,
+                        "headers": headers_json,
                     },
                 )
             except Exception:
@@ -370,7 +372,7 @@ class OpenAIServingCompletion(OpenAIServing):
         num_prompt_tokens = [0] * num_prompts
         num_cached_tokens = None
         first_iteration = True
-        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
+        rid_hint = request_id.removeprefix("cmpl-")
 
         # Track accumulated content for output logging
         previous_texts = [""] * num_choices * num_prompts
@@ -568,8 +570,7 @@ class OpenAIServingCompletion(OpenAIServing):
                         extra={
                             "rid": rid_hint,
                             "endpoint": self.__class__.__name__,
-                            # Pass dict directly for proper OTEL structured logging
-                            "payload": resp_summary,
+                            "payload": json.dumps(resp_summary, ensure_ascii=False),
                         },
                     )
                 except Exception:
@@ -706,7 +707,7 @@ class OpenAIServingCompletion(OpenAIServing):
         if final_res_batch:
             kv_transfer_params = final_res_batch[0].kv_transfer_params
 
-        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("cmpl-") else request_id
+        rid_hint = request_id.removeprefix("cmpl-")
 
         # Payload logging for non-streaming response
         if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
@@ -736,8 +737,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     extra={
                         "rid": rid_hint,
                         "endpoint": self.__class__.__name__,
-                        # Pass dict directly for proper OTEL structured logging
-                        "payload": resp_summary,
+                        "payload": json.dumps(resp_summary, ensure_ascii=False),
                     },
                 )
             except Exception:

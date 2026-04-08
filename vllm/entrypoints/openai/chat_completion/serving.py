@@ -247,17 +247,19 @@ class OpenAIServingChat(OpenAIServing):
         try:
             # Log request payload BEFORE any chat template is applied
             if os.getenv("VLLM_LOG_PAYLOADS", "1") == "1":
-                # Collect all incoming headers unfiltered
-                headers_obj = None
+                headers_json = ""
                 try:
                     if raw_request is not None:
-                        headers_obj = {k: v for k, v in raw_request.headers.items()}
+                        headers_json = json.dumps(
+                            {k: v for k, v in raw_request.headers.items()},
+                            ensure_ascii=False,
+                        )
                 except Exception:
-                    headers_obj = None
+                    headers_json = ""
                 try:
-                    req_dump = request.model_dump()
+                    req_str = request.model_dump_json()
                 except Exception:
-                    req_dump = None
+                    req_str = ""
                 rid_hint = self._base_request_id(raw_request, getattr(request, "request_id", None))
                 try:
                     payload_logger.info(
@@ -265,9 +267,8 @@ class OpenAIServingChat(OpenAIServing):
                         extra={
                             "rid": rid_hint or "",
                             "endpoint": self.__class__.__name__,
-                            # Pass dict directly for proper OTEL structured logging
-                            "payload": req_dump,
-                            "headers": headers_obj,
+                            "payload": req_str,
+                            "headers": headers_json,
                         },
                     )
                 except Exception:
@@ -695,7 +696,7 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
-        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
+        rid_hint = request_id.removeprefix("chatcmpl-")
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -731,10 +732,11 @@ class OpenAIServingChat(OpenAIServing):
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
         
-        # Track reasoning, content and tool calls separately for proper logging
+        # Track reasoning, content, tool calls, and finish reasons for logging
         previous_reasoning_texts = [""] * num_choices
         previous_content_texts = [""] * num_choices
         previous_tool_calls: list[list[DeltaToolCall]] = [[] for _ in range(num_choices)]
+        previous_finish_reasons = ["stop"] * num_choices
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1382,6 +1384,7 @@ class OpenAIServingChat(OpenAIServing):
                             ),
                         )
 
+                        previous_finish_reasons[i] = finish_reason_
                         finish_reason_sent[i] = True
 
                     choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
@@ -1450,7 +1453,7 @@ class OpenAIServingChat(OpenAIServing):
                     )
                 except Exception:
                     usage_dict = None
-                # Build choices with actual content, reasoning, and tool_calls
+                # Build choices with actual content, reasoning, tool_calls and finish_reason
                 choices_list = []
                 for i in range(num_choices):
                     choice_data = {
@@ -1458,7 +1461,7 @@ class OpenAIServingChat(OpenAIServing):
                         "message": {
                             "role": "assistant",
                         },
-                        "finish_reason": "stop",
+                        "finish_reason": previous_finish_reasons[i],
                     }
                     # Add reasoning if present
                     if previous_reasoning_texts[i]:
@@ -1483,7 +1486,6 @@ class OpenAIServingChat(OpenAIServing):
                                 })
                         if tool_calls_list:
                             choice_data["message"]["tool_calls"] = tool_calls_list
-                            choice_data["finish_reason"] = "tool_calls"
                     choices_list.append(choice_data)
                 resp_summary = {
                     "id": request_id,
@@ -1500,8 +1502,7 @@ class OpenAIServingChat(OpenAIServing):
                         extra={
                             "rid": rid_hint,
                             "endpoint": self.__class__.__name__,
-                            # Pass dict directly for proper OTEL structured logging
-                            "payload": resp_summary,
+                            "payload": json.dumps(resp_summary, ensure_ascii=False),
                         },
                     )
                 except Exception:
@@ -1615,7 +1616,7 @@ class OpenAIServingChat(OpenAIServing):
         from vllm.tokenizers.mistral import MistralTokenizer
 
         created_time = int(time.time())
-        rid_hint = request_id.split("-", 1)[1] if request_id.startswith("chatcmpl-") else request_id
+        rid_hint = request_id.removeprefix("chatcmpl-")
         final_res: RequestOutput | None = None
 
         try:
@@ -2015,8 +2016,7 @@ class OpenAIServingChat(OpenAIServing):
                     extra={
                         "rid": rid_hint,
                         "endpoint": self.__class__.__name__,
-                        # Pass dict directly for proper OTEL structured logging
-                        "payload": resp_summary,
+                        "payload": json.dumps(resp_summary, ensure_ascii=False),
                     },
                 )
             except Exception:
