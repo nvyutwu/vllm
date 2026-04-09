@@ -234,8 +234,23 @@ class Glm4MoeModelToolParser(ToolParser):
 
         self._buffer += delta_text
 
+        # Accumulate tool-args fragments across loop iterations so that
+        # a single call can process multiple phases (e.g. string close +
+        # tool_call close) and return a combined delta.  This prevents the
+        # serving layer's "unstreamed tokens" recovery logic from seeing
+        # stale prev_tool_call_arr state when finish_reason is set on the
+        # same delta that closes the tool call (common with MTP / multi-
+        # token speculative decoding).
+        _acc: str = ""
+
         while True:
             if not self._in_tool_call:
+                # Flush any accumulated tool-args before switching to
+                # content mode (happens after a tool call is closed and
+                # more content follows).
+                if _acc:
+                    return self._emit_tool_args_delta(_acc)
+
                 start_idx = self._buffer.find(self.tool_call_start_token)
                 if start_idx == -1:
                     # Check for partial start token at end of buffer
@@ -259,6 +274,11 @@ class Glm4MoeModelToolParser(ToolParser):
 
             # Parse tool name first
             if not self.current_tool_name_sent:
+                # Flush accumulated args before emitting a tool-name delta
+                # (can happen when a second tool call follows immediately).
+                if _acc:
+                    return self._emit_tool_args_delta(_acc)
+
                 nl = self._buffer.find("\n")
                 ak = self._buffer.find(self.arg_key_start)
                 end = self._buffer.find(self.tool_call_end_token)
@@ -298,7 +318,10 @@ class Glm4MoeModelToolParser(ToolParser):
                     escaped = self._json_escape_string_content(raw_content)
                     frag = escaped + '"'
                     self.streamed_args_for_tool[self.current_tool_id] += frag
-                    return self._emit_tool_args_delta(frag)
+                    _acc += frag
+                    # Continue processing the buffer (e.g. </tool_call>
+                    # may follow immediately) instead of returning here.
+                    continue
                 else:
                     # Check for partial </arg_value> at end
                     safe_len = len(self._buffer)
@@ -313,14 +336,14 @@ class Glm4MoeModelToolParser(ToolParser):
                         escaped = self._json_escape_string_content(to_emit)
                         if escaped:
                             self.streamed_args_for_tool[self.current_tool_id] += escaped
-                            return self._emit_tool_args_delta(escaped)
-                    return None
+                            _acc += escaped
+                    return self._emit_tool_args_delta(_acc) if _acc else None
 
             # If we have a pending key, parse its value
             if self._pending_key is not None:
                 val_pos = self._buffer.find(self.arg_val_start)
                 if val_pos == -1:
-                    return None
+                    return self._emit_tool_args_delta(_acc) if _acc else None
                 if val_pos > 0:
                     self._buffer = self._buffer[val_pos:]
 
@@ -349,12 +372,15 @@ class Glm4MoeModelToolParser(ToolParser):
 
                     self.streamed_args_for_tool[self.current_tool_id] += frag
                     self._streaming_string_value = True
-                    return self._emit_tool_args_delta(frag)
+                    _acc += frag
+                    # Return here because we need more data for the string
+                    # value content (incremental streaming).
+                    return self._emit_tool_args_delta(_acc)
                 else:
                     # Non-string type: wait for complete value
                     val_end = self._buffer.find(self.arg_val_end)
                     if val_end == -1:
-                        return None
+                        return self._emit_tool_args_delta(_acc) if _acc else None
 
                     raw_val = self._buffer[len(self.arg_val_start) : val_end].strip()
                     self._buffer = self._buffer[val_end + len(self.arg_val_end) :]
@@ -362,7 +388,7 @@ class Glm4MoeModelToolParser(ToolParser):
 
                     frag_or_none = self._append_arg_fragment(key=key, raw_val=raw_val)
                     if frag_or_none:
-                        return self._emit_tool_args_delta(frag_or_none)
+                        _acc += frag_or_none
                     continue
 
             # Parse next arg or close
@@ -371,6 +397,8 @@ class Glm4MoeModelToolParser(ToolParser):
             if end_pos != -1 and (key_pos == -1 or end_pos < key_pos):
                 self._buffer = self._buffer[end_pos + len(self.tool_call_end_token) :]
                 frag_or_none = self._close_args_if_needed()
+                if frag_or_none:
+                    _acc += frag_or_none
                 # Finalize prev_tool_call_arr with complete parsed arguments
                 if self._current_tool_name:
                     try:
@@ -389,17 +417,18 @@ class Glm4MoeModelToolParser(ToolParser):
                             e,
                         )
                 self._finish_tool_call()
-                return (
-                    self._emit_tool_args_delta(frag_or_none) if frag_or_none else None
-                )
+                # Continue the loop: there may be another <tool_call> or
+                # trailing content in the buffer.  The accumulated _acc
+                # will be flushed at the next exit point.
+                continue
 
             if key_pos == -1:
-                return None
+                return self._emit_tool_args_delta(_acc) if _acc else None
             if key_pos > 0:
                 self._buffer = self._buffer[key_pos:]
             key_end = self._buffer.find(self.arg_key_end)
             if key_end == -1:
-                return None
+                return self._emit_tool_args_delta(_acc) if _acc else None
             key = self._buffer[len(self.arg_key_start) : key_end]
             self._buffer = self._buffer[key_end + len(self.arg_key_end) :]
             self._pending_key = key
