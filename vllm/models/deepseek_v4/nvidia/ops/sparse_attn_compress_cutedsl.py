@@ -320,13 +320,21 @@ class SparseAttnCompressNormRopeStoreC4Kernel:
                 bits = _recast_val(scale_raw, Uint32)
                 ue8m0 = ((bits + Uint32(0x7FFFFF)) >> Uint32(23)) & Uint32(0xFF)
                 inv_scale = _recast_val((Uint32(254) - ue8m0) << Uint32(23), Float32)
-                y0 = cute.arch.fmin(
-                    cute.arch.fmax(q0 * inv_scale, Float32(-self.fp8_max)),
-                    Float32(self.fp8_max),
+                # min(x, c) as -max(-x, -c): cute.arch.fmin needs
+                # nvidia-cutlass-dsl >= 4.6, but flashinfer's cute_dsl
+                # kernels require the 4.5.x API (cute.core.ThrMma et al.),
+                # so 4.5.x must stay installed. Clamp range is symmetric,
+                # hence -fp8_max on both sides. Inputs are finite (scaled
+                # bf16 roundtrips), so fmin/fmax NaN semantics don't differ.
+                y0 = Float32(-1.0) * cute.arch.fmax(
+                    Float32(-1.0)
+                    * cute.arch.fmax(q0 * inv_scale, Float32(-self.fp8_max)),
+                    Float32(-self.fp8_max),
                 )
-                y1 = cute.arch.fmin(
-                    cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max)),
-                    Float32(self.fp8_max),
+                y1 = Float32(-1.0) * cute.arch.fmax(
+                    Float32(-1.0)
+                    * cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max)),
+                    Float32(-self.fp8_max),
                 )
                 packed_fp8 = _fp32x2_to_fp8e4m3x2(y0, y1)
                 out_base = value_base + (warp_id * self.quant_block + lane_id * 2).to(
@@ -978,13 +986,21 @@ class SparseAttnNormRopeStoreKernel:
                 bits = _recast_val(scale_raw, Uint32)
                 ue8m0 = ((bits + Uint32(0x7FFFFF)) >> Uint32(23)) & Uint32(0xFF)
                 inv_scale = _recast_val((Uint32(254) - ue8m0) << Uint32(23), Float32)
-                y0 = cute.arch.fmin(
-                    cute.arch.fmax(q0 * inv_scale, Float32(-self.fp8_max)),
-                    Float32(self.fp8_max),
+                # min(x, c) as -max(-x, -c): cute.arch.fmin needs
+                # nvidia-cutlass-dsl >= 4.6, but flashinfer's cute_dsl
+                # kernels require the 4.5.x API (cute.core.ThrMma et al.),
+                # so 4.5.x must stay installed. Clamp range is symmetric,
+                # hence -fp8_max on both sides. Inputs are finite (scaled
+                # bf16 roundtrips), so fmin/fmax NaN semantics don't differ.
+                y0 = Float32(-1.0) * cute.arch.fmax(
+                    Float32(-1.0)
+                    * cute.arch.fmax(q0 * inv_scale, Float32(-self.fp8_max)),
+                    Float32(-self.fp8_max),
                 )
-                y1 = cute.arch.fmin(
-                    cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max)),
-                    Float32(self.fp8_max),
+                y1 = Float32(-1.0) * cute.arch.fmax(
+                    Float32(-1.0)
+                    * cute.arch.fmax(q1 * inv_scale, Float32(-self.fp8_max)),
+                    Float32(-self.fp8_max),
                 )
                 packed_fp8 = _fp32x2_to_fp8e4m3x2(y0, y1)
                 out_base = value_base + (warp_id * self.quant_block + lane_id * 2).to(
