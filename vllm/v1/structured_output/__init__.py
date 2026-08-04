@@ -314,7 +314,9 @@ class StructuredOutputManager:
                             history_len = len(history)
                             simulated_buf = history + list(req_tokens)
                         simulated = simulated_buf[: history_len + i + 1]
-                        if reasoner.is_reasoning_end_streaming(simulated, [token]):
+                        if reasoner.is_grammar_constraint_end_streaming(
+                            simulated, [token]
+                        ):
                             # Reasoning ended mid-window. Constrain the rest
                             # of the window via bitmask. Skip grammar advance
                             # through the marker (it is reasoning content);
@@ -385,7 +387,7 @@ class StructuredOutputManager:
                 # is an independent code path, it is kept for now.
                 # After unifying the `openai_gptoss` and non-`openai_gptoss` styles,
                 # it can be removed.
-                structured_req.reasoning_ended = reasoner.is_reasoning_end(
+                structured_req.reasoning_ended = reasoner.is_grammar_constraint_end(
                     request.prompt_token_ids or []
                 )
             return structured_req.reasoning_ended
@@ -440,7 +442,7 @@ class StructuredOutputManager:
                 else max(len(all_token_ids) + delta_from, 0)
             )
             delta_ids = itertools.islice(all_token_ids, start, None)
-        if reasoner.is_reasoning_end_streaming(all_token_ids, delta_ids):
+        if reasoner.is_grammar_constraint_end_streaming(all_token_ids, delta_ids):
             structured_req.reasoning_ended = True
 
             # Record the boundary so the scheduler can exclude reasoning tokens.
@@ -468,7 +470,7 @@ class StructuredOutputManager:
         for idx in range(start, len(all_token_ids)):
             token = all_token_ids[idx]
             prefix.append(token)
-            if reasoner.is_reasoning_end_streaming(prefix, [token]):
+            if reasoner.is_grammar_constraint_end_streaming(prefix, [token]):
                 return idx
         return len(all_token_ids) - 1
 
