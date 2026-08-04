@@ -112,6 +112,37 @@ class ReasoningParser:
         """
         return self.is_reasoning_end(input_ids)
 
+    def is_grammar_constraint_end(self, input_ids: Sequence[int]) -> bool:
+        """Check whether the grammar constraint should begin for *input_ids*.
+
+        By default this is identical to :meth:`is_reasoning_end`.  Override in
+        parsers where the model emits structural wrapper tokens between the
+        reasoning-end marker and actual grammar-constrained content (e.g.
+        Kimi K3 emits ``<|open|>response<|sep|>`` after ``</think>``).  The
+        grammar bitmask should only apply to the tokens that follow those
+        structural wrappers, not to the wrappers themselves; otherwise the
+        wrappers can corrupt the grammar FSM state and release all constraints.
+
+        Parameters:
+        input_ids: list[int]
+            The entire model output (prompt + generated tokens).
+
+        Returns:
+        bool
+            True when it is safe to start applying the grammar constraint.
+        """
+        return self.is_reasoning_end(input_ids)
+
+    def is_grammar_constraint_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        """Streaming variant of :meth:`is_grammar_constraint_end`.
+
+        Called once per decode step.  Default delegates to
+        :meth:`is_grammar_constraint_end`.
+        """
+        return self.is_grammar_constraint_end(input_ids)
+
     @abstractmethod
     def extract_content_ids(self, input_ids: list[int]) -> list[int]:
         """

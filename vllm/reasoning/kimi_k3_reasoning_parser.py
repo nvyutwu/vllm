@@ -104,6 +104,9 @@ class KimiK3ReasoningParser(ReasoningParser):
         self._think_close_ids = tokenizer.encode(
             self._think_close, add_special_tokens=False
         )
+        self._response_open_ids = tokenizer.encode(
+            self._response_open, add_special_tokens=False
+        )
         self._last_streaming_delta_token_ids: tuple[int, ...] | None = None
         self._last_streaming_content_token_ids: list[int] | None = None
 
@@ -141,6 +144,42 @@ class KimiK3ReasoningParser(ReasoningParser):
             # generation prefix): a close marker means reasoning has ended.
             return last_close != -1
         return last_close > last_open
+
+    def is_grammar_constraint_end(self, input_ids: Sequence[int]) -> bool:
+        """Grammar constraint begins only after ``<|open|>response<|sep|>``.
+
+        With thinking ON the model emits ``<|open|>response<|sep|>`` between
+        the think-close marker and the actual response content.  Activating the
+        grammar bitmask at the think-close boundary exposes those three
+        structural tokens to the JSON FSM, which can either be rejected (FSM
+        stays at initial state then mis-advances on subsequent tokens) or
+        accepted as special-token bypasses that corrupt the FSM state.  Either
+        way the constraint is released before the actual content begins.
+
+        Delaying grammar activation to after ``<|open|>response<|sep|>`` ensures
+        the FSM sees only valid JSON from its very first constrained token.
+
+        With thinking OFF the response wrapper is already in the prompt (not
+        generated), so the base-class behaviour (constrain from the first
+        generated token) is correct and this override delegates to it.
+        """
+        if not self._thinking_enabled:
+            return True
+
+        # First confirm think-close has been seen (same logic as is_reasoning_end)
+        last_close = _subseq_index(input_ids, self._think_close_ids)
+        last_open = _subseq_index(input_ids, self._think_open_ids)
+        think_closed = last_close != -1 if last_open == -1 else last_close > last_open
+
+        if not think_closed:
+            return False
+
+        # Then confirm the response wrapper has opened after think-close.
+        last_resp_open = _subseq_index(input_ids, self._response_open_ids)
+        if last_resp_open == -1:
+            return False
+        # Response-open must come after the think-close start index.
+        return last_resp_open > last_close
 
     def _extract_content_ids(self, input_ids: list[int]) -> list[int]:
         if not self._thinking_enabled:

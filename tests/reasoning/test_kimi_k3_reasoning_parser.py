@@ -30,6 +30,8 @@ class DummyTokenizer:
             return [1, 2, 3]
         if text == THINK_CLOSE:
             return [4, 2, 3]
+        if text == RESPONSE_OPEN:
+            return [5, 6, 7]
         return [ord(ch) for ch in text]
 
 
@@ -248,3 +250,68 @@ def test_adjust_request_keeps_xtml_markers_contiguous():
     assert adjusted.skip_special_tokens is False
     if hasattr(adjusted, "spaces_between_special_tokens"):
         assert adjusted.spaces_between_special_tokens is False
+
+
+# DummyTokenizer: THINK_OPEN->[1,2,3], THINK_CLOSE->[4,2,3], RESPONSE_OPEN->[5,6,7]
+
+def test_grammar_constraint_end_false_before_think_close():
+    parser = KimiK3ReasoningParser(DummyTokenizer())
+
+    # Only think-open seen; reasoning still active.
+    assert not parser.is_grammar_constraint_end([1, 2, 3, 9, 10])
+
+
+def test_grammar_constraint_end_false_at_think_close_only():
+    # think-close reached but response-open wrapper not yet emitted — grammar
+    # FSM must NOT activate yet, otherwise structural XTML tokens corrupt the FSM.
+    parser = KimiK3ReasoningParser(DummyTokenizer())
+
+    think_open = [1, 2, 3]
+    think_close = [4, 2, 3]
+    assert not parser.is_grammar_constraint_end([*think_open, 9, *think_close])
+
+
+def test_grammar_constraint_end_true_after_response_open():
+    # response-open fully emitted after think-close → safe to activate FSM.
+    parser = KimiK3ReasoningParser(DummyTokenizer())
+
+    think_open = [1, 2, 3]
+    think_close = [4, 2, 3]
+    response_open = [5, 6, 7]
+    ids = [*think_open, 9, *think_close, *response_open]
+    assert parser.is_grammar_constraint_end(ids)
+
+
+def test_grammar_constraint_end_thinking_disabled_returns_true():
+    # With thinking OFF the response-open is in the prompt, not generated.
+    # Grammar constraint should activate from the first generated token.
+    parser = KimiK3ReasoningParser(
+        DummyTokenizer(), chat_template_kwargs={"thinking": False}
+    )
+
+    assert parser.is_grammar_constraint_end([])
+    assert parser.is_grammar_constraint_end([10, 20, 30])
+
+
+def test_grammar_constraint_end_multiturn_stale_close_not_enough():
+    # Multi-turn: a prior-turn think-close is in the sequence but the current
+    # turn has opened a new think block that has not closed yet.  The response
+    # wrapper has not appeared after the new open, so grammar must stay off.
+    parser = KimiK3ReasoningParser(DummyTokenizer())
+
+    stale_close = [4, 2, 3]
+    new_open = [1, 2, 3]
+    assert not parser.is_grammar_constraint_end([*stale_close, *new_open, 9])
+
+
+def test_grammar_constraint_end_multiturn_full_sequence():
+    # Multi-turn: stale close → new open → new close → response-open.
+    parser = KimiK3ReasoningParser(DummyTokenizer())
+
+    stale_close = [4, 2, 3]
+    new_open = [1, 2, 3]
+    new_close = [4, 2, 3]
+    response_open = [5, 6, 7]
+    assert parser.is_grammar_constraint_end(
+        [*stale_close, *new_open, 9, *new_close, *response_open]
+    )
