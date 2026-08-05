@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
 from collections.abc import AsyncGenerator
 from http import HTTPStatus
 
@@ -21,6 +22,10 @@ from vllm.entrypoints.serve.utils.api_utils import (
     with_cancellation,
 )
 from vllm.logger import init_logger
+from vllm.payload_sanitization import (
+    has_nvcf_asset_headers,
+    materialize_nvcf_asset_refs,
+)
 
 logger = init_logger(__name__)
 
@@ -29,6 +34,26 @@ router = APIRouter()
 
 def responses(request: Request) -> OpenAIServingResponses | None:
     return request.app.state.openai_serving_responses
+
+
+async def _materialize_nvcf_assets(
+    request: ResponsesRequest, raw_request: Request
+) -> ResponsesRequest:
+    if not has_nvcf_asset_headers(raw_request.headers):
+        return request
+    try:
+        body = await raw_request.body()
+        payload = json.loads(body) if body else None
+    except Exception:
+        payload = None
+    if payload is None:
+        return request
+    materialized = materialize_nvcf_asset_refs(
+        payload, headers={k: v for k, v in raw_request.headers.items()}
+    )
+    if materialized is payload or materialized == payload:
+        return request
+    return ResponsesRequest.model_validate(materialized)
 
 
 async def _convert_stream_to_sse_events(
@@ -58,6 +83,7 @@ async def _convert_stream_to_sse_events(
 @with_cancellation
 @load_aware_call
 async def create_responses(request: ResponsesRequest, raw_request: Request):
+    request = await _materialize_nvcf_assets(request, raw_request)
     handler = responses(raw_request)
     if handler is None:
         raise NotImplementedError("The model does not support Responses API")

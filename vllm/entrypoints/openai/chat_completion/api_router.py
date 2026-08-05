@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import json
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -22,6 +23,10 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.logger import init_logger
+from vllm.payload_sanitization import (
+    has_nvcf_asset_headers,
+    materialize_nvcf_asset_refs,
+)
 
 logger = init_logger(__name__)
 
@@ -35,6 +40,26 @@ def chat(request: Request) -> OpenAIServingChat | None:
 
 def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
     return request.app.state.openai_serving_chat_batch
+
+
+async def _materialize_nvcf_assets(
+    request: ChatCompletionRequest, raw_request: Request
+) -> ChatCompletionRequest:
+    if not has_nvcf_asset_headers(raw_request.headers):
+        return request
+    try:
+        body = await raw_request.body()
+        payload = json.loads(body) if body else None
+    except Exception:
+        payload = None
+    if payload is None:
+        return request
+    materialized = materialize_nvcf_asset_refs(
+        payload, headers={k: v for k, v in raw_request.headers.items()}
+    )
+    if materialized is payload or materialized == payload:
+        return request
+    return ChatCompletionRequest.model_validate(materialized)
 
 
 @router.post(
@@ -54,6 +79,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )
+    request = await _materialize_nvcf_assets(request, raw_request)
     handler = chat(raw_request)
     if handler is None:
         raise NotImplementedError("The model does not support Chat Completions API")
