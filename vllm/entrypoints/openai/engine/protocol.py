@@ -184,6 +184,33 @@ def structured_outputs_from_response_format(
     if response_format is None or response_format.type == "text":
         return structured_outputs
 
+    # A forced/auto tool call may have already installed a structured-output
+    # constraint on ``structured_outputs`` before we get here -- e.g. the
+    # Kimi-K3 XTML tool-channel ``structural_tag`` attached by
+    # ``DelegatingParser._apply_structural_tag`` for ``tool_choice="required"``,
+    # or a tool-schema ``json`` from the generic required/named path.
+    # ``StructuredOutputsParams`` permits exactly ONE constraint, and the
+    # ``dataclasses.replace(...)`` below does NOT clear the existing field, so
+    # composing a ``response_format`` json / json_object / json_schema
+    # constraint on top would build a params object carrying two
+    # mutually-exclusive constraints. Its ``__post_init__`` then raises
+    # ``VLLMValidationError`` -- and because this runs inside
+    # ``to_sampling_params`` (AFTER request validation, during generator
+    # setup) that error is not mapped to a 400 but surfaces to the client as a
+    # 500 "Internal server error". This is the failure observed for
+    # ``tool_choice="required"`` + ``response_format={"type":"json_object"}``
+    # (and ``"json_schema"``) against Kimi-K3.
+    #
+    # When a tool call is forced, the tool grammar already fully constrains the
+    # output shape, so it takes precedence and the ``response_format`` is
+    # subsumed rather than composed. Keep the existing constraint instead of
+    # colliding with it. Single-constraint requests are unaffected: a
+    # response_format-only request has ``structured_outputs is None`` (or a
+    # constraint-free params carrying only options such as
+    # ``disable_any_whitespace``), so the override path below still runs.
+    if structured_outputs is not None and not structured_outputs.all_constraints_none():
+        return structured_outputs
+
     overrides: dict[str, Any]
     if response_format.type == "json_object":
         overrides = {"json_object": True}
