@@ -598,6 +598,7 @@ def _chunk_kda_fwd_with_cumulative_g(
     chunk_indices: torch.Tensor | None = None,
     chunk_size: int = FLA_CHUNK_SIZE,
     safe_gate: bool = False,
+    output_intermediate_states: bool = False,
 ):
     # `g` must already be chunk-local cumulatively-summed AND scaled by
     # RCP_LN2 (so the downstream exp2-based kernels reproduce exp(g)).
@@ -648,6 +649,11 @@ def _chunk_kda_fwd_with_cumulative_g(
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
     )
+    if output_intermediate_states:
+        # h holds the per-chunk recurrent states [B, NT, H, V, K]; keep it so the
+        # caller can snapshot per-block boundary states for all-mode prefix caching.
+        del Aqk, v_new
+        return o, final_state, h
     del Aqk, v_new, h
     return o, final_state
 
@@ -706,6 +712,7 @@ def chunk_kda_with_fused_gate_fwd(
     output_final_state: bool,
     lower_bound: float | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    output_intermediate_states: bool = False,
 ):
     chunk_size = FLA_CHUNK_SIZE
     chunk_indices = (
@@ -736,6 +743,7 @@ def chunk_kda_with_fused_gate_fwd(
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
         safe_gate=lower_bound is not None,
+        output_intermediate_states=output_intermediate_states,
     )
 
 
@@ -787,9 +795,15 @@ def chunk_kda_with_fused_gate(
     lower_bound: float | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    output_intermediate_states: bool = False,
     **kwargs,
 ):
-    """Run chunk KDA from raw gate and beta projections."""
+    """Run chunk KDA from raw gate and beta projections.
+
+    When ``output_intermediate_states`` is True, also returns the per-chunk
+    recurrent states ``h`` (shape ``[B, NT, H, V, K]``) as a third element, so
+    all-mode prefix caching can snapshot every block-boundary state.
+    """
     if scale is None:
         scale = k.shape[-1] ** -0.5
 
@@ -797,7 +811,7 @@ def chunk_kda_with_fused_gate(
         q = l2norm_fwd(q.contiguous())
         k = l2norm_fwd(k.contiguous())
 
-    o, final_state = chunk_kda_with_fused_gate_fwd(
+    return chunk_kda_with_fused_gate_fwd(
         q=q,
         k=k,
         v=v.contiguous(),
@@ -810,8 +824,8 @@ def chunk_kda_with_fused_gate(
         output_final_state=output_final_state,
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
+        output_intermediate_states=output_intermediate_states,
     )
-    return o, final_state
 
 
 @triton.autotune(

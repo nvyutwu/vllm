@@ -505,6 +505,55 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         return self.o_proj(core_attn_out)[0]
 
+    def _kda_write_all_mode_states(
+        self,
+        m: "KimiK3KDAMetadata",
+        recurrent_state: torch.Tensor,
+        h_states: torch.Tensor,
+        last_recurrent_state: torch.Tensor,
+        write_idx: torch.Tensor,
+        non_spec_query_start_loc: torch.Tensor,
+    ) -> None:
+        """Snapshot per-mamba-block recurrent boundary states (all mode).
+
+        ``h_states`` is ``[B, NT, H, V, K]`` of per-FLA-chunk recurrent states.
+        For each request we write the state at every mamba-block boundary into
+        its cache block, then the final (possibly partial) state into the
+        last-scheduled block. Mirrors ``mamba_mixer2``'s all-mode write loop.
+        """
+        from vllm.third_party.flash_linear_attention.ops.utils import FLA_CHUNK_SIZE
+
+        bs = m.kda_mamba_block_size
+        assert bs % FLA_CHUNK_SIZE == 0, (
+            f"mamba block size {bs} must be a multiple of FLA chunk size "
+            f"{FLA_CHUNK_SIZE} for all-mode KDA prefix caching"
+        )
+        chunk_stride = bs // FLA_CHUNK_SIZE
+        hs = h_states[0]  # [NT, H, V, K], chunk-major over all scheduled chunks
+        st2d = m.kda_state_indices_2d
+        blk_first = m.kda_block_idx_first_scheduled
+        blk_last = m.kda_block_idx_last_scheduled
+        ncomp = m.kda_num_computed_tokens_p
+        qlens = (
+            non_spec_query_start_loc[1:] - non_spec_query_start_loc[:-1]
+        ).tolist()
+        first_chunk = 0
+        for si, qlen in enumerate(qlens):
+            fs = int(blk_first[si].item())
+            ls = int(blk_last[si].item())
+            n_fill = ls - fs
+            if n_fill > 0:
+                nun = int(ncomp[si].item()) % bs
+                first_aligned = first_chunk + chunk_stride - 1 - (nun // FLA_CHUNK_SIZE)
+                cache_blocks = st2d[si, fs:ls]
+                recurrent_state[cache_blocks] = hs[
+                    first_aligned : first_aligned + n_fill * chunk_stride : chunk_stride
+                ].to(recurrent_state.dtype)
+            first_chunk += (qlen + FLA_CHUNK_SIZE - 1) // FLA_CHUNK_SIZE
+        # Final (possibly partial) state per request -> its last-scheduled block.
+        r = len(qlens)
+        recurrent_state[write_idx[:r]] = last_recurrent_state[:r]
+
     @eager_break_during_capture
     def _forward(
         self,
@@ -548,6 +597,22 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if not is_conv_state_dim_first():
             conv_state = conv_state.transpose(-1, -2)
 
+        # ---- all-mode (mamba_cache_mode="all") prefix-cache block indices ----
+        # None in align/none, where non_spec_state_indices_tensor (== block[:, 0])
+        # is already the correct boundary/current slot. In all mode we READ the
+        # recurrent+conv state from the last-computed-token block and WRITE to
+        # the scheduled block(s), mirroring mamba2's multi-slot contract so that
+        # a prefix-cache hit at block i>0 restores the correct boundary state.
+        kda_is_all = m.kda_mamba_block_size is not None
+        if kda_is_all:
+            _kda_st2d = m.kda_state_indices_2d
+            kda_read_idx = _kda_st2d.gather(
+                1, m.kda_block_idx_last_computed.unsqueeze(1)
+            ).squeeze(1)
+            kda_write_idx = _kda_st2d.gather(
+                1, m.kda_block_idx_last_scheduled.unsqueeze(1)
+            ).squeeze(1)
+
         if (
             self.decode_conv1d_weight is not None
             and self.decode_norm_weight is not None
@@ -556,6 +621,22 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             and m.num_decodes > 0
         ):
             assert non_spec_state_indices_tensor is not None
+            if kda_is_all:
+                # Read from the last-computed block, write to the current
+                # (last-scheduled) block; copy the state across when a decode
+                # step crosses a mamba block boundary so the boundary block is
+                # preserved for future reuse and the new block continues it.
+                _ri = kda_read_idx[:num_actual_tokens]
+                _wi = kda_write_idx[:num_actual_tokens]
+                _cross = _ri != _wi
+                if bool(_cross.any()):
+                    recurrent_state[_wi[_cross]] = recurrent_state[_ri[_cross]]
+                    conv_state[_wi[_cross]] = conv_state[_ri[_cross]]
+                _decode_state_indices = _wi
+            else:
+                _decode_state_indices = non_spec_state_indices_tensor[
+                    :num_actual_tokens
+                ]
             ops.fused_kda_decode(
                 x=mixed_qkv,
                 weight=self.decode_conv1d_weight,
@@ -565,7 +646,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 raw_beta=beta,
                 A_log=self.A_log,
                 dt_bias=self.dt_bias,
-                state_indices=non_spec_state_indices_tensor[:num_actual_tokens],
+                state_indices=_decode_state_indices,
                 state=recurrent_state,
                 out=core_attn_out[:, :num_actual_tokens],
                 lower_bound=self.gate_lower_bound,
@@ -660,6 +741,20 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     self.local_projection_size, dim=-1
                 )
 
+                # In all mode read the conv boundary state from the
+                # last-computed block and write the final conv state to the
+                # last-scheduled block; copy across when they differ (and there
+                # is a cached prefix) so the boundary conv is preserved.
+                if kda_is_all:
+                    _cc_cross = (kda_read_idx != kda_write_idx) & has_initial_state
+                    if bool(_cc_cross.any()):
+                        conv_state[kda_write_idx[_cc_cross]] = conv_state[
+                            kda_read_idx[_cc_cross]
+                        ]
+                    _conv_cache_idx = kda_write_idx
+                else:
+                    _conv_cache_idx = non_spec_state_indices_tensor
+
                 # Separate convolution calls accept row-strided packed inputs
                 # and produce dense Q/K/V without an additional V copy.
                 def _prefill_conv(
@@ -674,7 +769,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         activation="silu",
                         conv_states=state,
                         has_initial_state=has_initial_state,
-                        cache_indices=non_spec_state_indices_tensor,
+                        cache_indices=_conv_cache_idx,
                         query_start_loc=non_spec_query_start_loc,
                         metadata=m,
                     ).transpose(0, 1)
@@ -691,10 +786,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 assert has_initial_state is not None
                 initial_state = gather_initial_states(
                     recurrent_state,
-                    non_spec_state_indices_tensor,
+                    kda_read_idx if kda_is_all else non_spec_state_indices_tensor,
                     has_initial_state,
                 )
-                if self.kda_prefill_backend == "flashkda":
+                # flashkda cannot emit per-chunk intermediate states, so all mode
+                # must use the chunk backend to snapshot block boundaries.
+                if self.kda_prefill_backend == "flashkda" and not kda_is_all:
                     assert self.gate_lower_bound is not None
                     (
                         core_attn_out_non_spec,
@@ -712,10 +809,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         cu_seqlens=non_spec_query_start_loc,
                     )
                 else:
-                    (
-                        core_attn_out_non_spec,
-                        last_recurrent_state,
-                    ) = chunk_kda_with_fused_gate(
+                    _chunk_ret = chunk_kda_with_fused_gate(
                         q=q_ns,
                         k=k_ns,
                         v=v_ns,
@@ -728,14 +822,44 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                         output_final_state=True,
                         use_qk_l2norm_in_kernel=True,
                         cu_seqlens=non_spec_query_start_loc,
+                        output_intermediate_states=kda_is_all,
                     )
-                recurrent_state[non_spec_state_indices_tensor] = last_recurrent_state
+                    if kda_is_all:
+                        core_attn_out_non_spec, last_recurrent_state, h_states = (
+                            _chunk_ret
+                        )
+                    else:
+                        core_attn_out_non_spec, last_recurrent_state = _chunk_ret
+
+                if kda_is_all:
+                    self._kda_write_all_mode_states(
+                        m,
+                        recurrent_state,
+                        h_states,
+                        last_recurrent_state,
+                        kda_write_idx,
+                        non_spec_query_start_loc,
+                    )
+                else:
+                    recurrent_state[non_spec_state_indices_tensor] = (
+                        last_recurrent_state
+                    )
             else:
                 # Pure non-speculative decode.
                 assert non_spec_state_indices_tensor is not None
-                decode_conv_indices = non_spec_state_indices_tensor[
-                    : mixed_qkv_ns.size(0)
-                ]
+                if kda_is_all:
+                    _n = mixed_qkv_ns.size(0)
+                    _ri = kda_read_idx[:_n]
+                    _wi = kda_write_idx[:_n]
+                    _cross = _ri != _wi
+                    if bool(_cross.any()):
+                        recurrent_state[_wi[_cross]] = recurrent_state[_ri[_cross]]
+                        conv_state[_wi[_cross]] = conv_state[_ri[_cross]]
+                    decode_conv_indices = _wi
+                else:
+                    decode_conv_indices = non_spec_state_indices_tensor[
+                        : mixed_qkv_ns.size(0)
+                    ]
                 packed_conv_out = torch.empty_like(mixed_qkv_ns)
                 mixed_qkv_ns = causal_conv1d_update(
                     mixed_qkv_ns,

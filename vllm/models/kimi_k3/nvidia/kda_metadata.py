@@ -230,7 +230,21 @@ def stage_spec_decode_metadata(
 
 @dataclass
 class KimiK3KDAMetadata(GDNAttentionMetadata):
-    pass
+    # ---- all-mode (mamba_cache_mode="all") prefix-caching state indexing ----
+    # These are populated only in all mode; they are None for align/none, where
+    # the single-slot ``non_spec_state_indices_tensor`` (= block_table[:, 0]) is
+    # already the correct boundary/current slot.
+    #
+    # ``kda_state_indices_2d`` is the FULL per-request block table
+    # [num_reqs, max_blocks]; the ``block_idx_*`` tensors select, per request,
+    # the block holding the last-computed-token state (READ) and the last/first
+    # scheduled-token blocks (WRITE), mirroring mamba2's multi-slot contract.
+    kda_state_indices_2d: torch.Tensor | None = None
+    kda_block_idx_last_computed: torch.Tensor | None = None
+    kda_block_idx_first_scheduled: torch.Tensor | None = None
+    kda_block_idx_last_scheduled: torch.Tensor | None = None
+    kda_num_computed_tokens_p: torch.Tensor | None = None
+    kda_mamba_block_size: int | None = None
 
 
 class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
@@ -463,6 +477,42 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
                 :batch_size
             ]
 
+        # ---- all-mode multi-slot block indexing (mirrors mamba_attn.py) ----
+        # In all mode the per-request block table is kept in full and the layer
+        # reads/writes the recurrent+conv state at the prefix-boundary block
+        # rather than block[:, 0]. Populated only for all mode; None otherwise
+        # (align/none keep the single-slot non_spec_state_indices_tensor above).
+        kda_state_indices_2d = None
+        kda_block_idx_last_computed = None
+        kda_block_idx_first_scheduled = None
+        kda_block_idx_last_scheduled = None
+        kda_num_computed_tokens_p = None
+        kda_mamba_block_size = None
+        if self.vllm_config.cache_config.mamba_cache_mode == "all":
+            bs = self.kv_cache_spec.block_size
+            num_computed = m.compute_num_computed_tokens()
+            # Block index of the last computed token (state to READ on a hit).
+            blk_last_computed = (
+                torch.div(num_computed + bs - 1, bs, rounding_mode="floor") - 1
+            )
+            # Block index of the first scheduled token.
+            blk_first_scheduled = (
+                torch.div(num_computed + bs, bs, rounding_mode="floor") - 1
+            )
+            # Block index of the last scheduled token (state to WRITE).
+            blk_last_scheduled = (
+                torch.div(m.seq_lens + bs - 1, bs, rounding_mode="floor") - 1
+            )
+            blk_last_computed.clamp_(min=0)
+            blk_last_scheduled.clamp_(min=0)
+            # ``block_table_tensor`` is the full per-request table in all mode.
+            kda_state_indices_2d = block_table_tensor
+            kda_block_idx_last_computed = blk_last_computed
+            kda_block_idx_first_scheduled = blk_first_scheduled
+            kda_block_idx_last_scheduled = blk_last_scheduled
+            kda_num_computed_tokens_p = num_computed
+            kda_mamba_block_size = bs
+
         return KimiK3KDAMetadata(
             num_prefills=num_prefills,
             num_prefill_tokens=num_prefill_tokens,
@@ -483,6 +533,12 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             nums_dict=nums_dict,
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
+            kda_state_indices_2d=kda_state_indices_2d,
+            kda_block_idx_last_computed=kda_block_idx_last_computed,
+            kda_block_idx_first_scheduled=kda_block_idx_first_scheduled,
+            kda_block_idx_last_scheduled=kda_block_idx_last_scheduled,
+            kda_num_computed_tokens_p=kda_num_computed_tokens_p,
+            kda_mamba_block_size=kda_mamba_block_size,
         )
 
 

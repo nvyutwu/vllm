@@ -1471,6 +1471,7 @@ class KimiK3ForConditionalGeneration(
     """Kimi-K3 model with Kimi-K2.5 vision and KimiLinear text."""
 
     supports_encoder_tp_data = True
+    supports_mamba_prefix_caching = True
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
