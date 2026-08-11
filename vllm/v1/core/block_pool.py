@@ -512,7 +512,7 @@ class BlockPool:
         )
         if self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
-                request, num_tokens
+                request, num_tokens, block_size
             )
             parent_block_hash = (
                 maybe_convert_block_hash(parent_hash)
@@ -560,12 +560,30 @@ class BlockPool:
         self,
         request: Request,
         num_tokens: int,
+        block_size: int,
     ) -> tuple[BlockHash | None, int]:
-        num_hash_blocks = num_tokens // self.hash_block_size
-        parent_hash = (
-            request.block_hashes[num_hash_blocks - 2] if num_hash_blocks > 1 else None
-        )
-        block_start = (num_hash_blocks - 1) * self.hash_block_size
+        # The partial-tail entry represents the prefix ending at ``num_tokens``
+        # -- an align reload boundary inside physical block ``num_full_blocks``.
+        # Parent it on the last FULL physical block's prefix hash, which the
+        # coarse full-block event actually published (a physical block emits the
+        # fine hash at its END boundary, i.e. ``block_hashes[k * scale - 1]``,
+        # per BlockHashListWithBlockSize). Pointing the parent at the previous
+        # ``hash_block_size`` boundary instead (``num_hash_blocks - 2``)
+        # references a fine hash that was never published when
+        # ``block_size > hash_block_size``, so an external KV-router rejects the
+        # entry ("failed to find parent block"). Parenting on the published
+        # full-block boundary keeps the emitted stream self-consistent without
+        # advertising intermediate (non-checkpointed, non-reusable) fine
+        # boundaries. ``cache_partial_block`` only runs when
+        # ``block_size > hash_block_size``.
+        num_full_blocks = num_tokens // block_size
+        if num_full_blocks > 0:
+            scale = block_size // self.hash_block_size
+            parent_hash = request.block_hashes[num_full_blocks * scale - 1]
+            block_start = num_full_blocks * block_size
+        else:
+            parent_hash = None
+            block_start = 0
         return parent_hash, block_start
 
     def _remove_cached_block_hashes(
