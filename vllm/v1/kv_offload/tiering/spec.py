@@ -243,12 +243,17 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
     @override
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         world_size = self.config.parallel.world_size
+        local_world_size = self.config.parallel.local_world_size or world_size
         if self.replicated_layout:
             rank = 0
         else:
-            # Fold the global physical device index into the replica-local
-            # [0, world_size) slot range.
-            rank = torch.accelerator.current_device_index() % world_size
+            # Fold the global physical device index into the NODE-LOCAL
+            # [0, local_world_size) slot range. The per-node /dev/shm region is
+            # sized to local_world_size slots (see CPUOffloadingSpec.__init__),
+            # so folding by world_size here would index past the narrowed row on
+            # a multi-node deploy whose device ordinals reach [local_world_size,
+            # world_size).
+            rank = torch.accelerator.current_device_index() % local_world_size
         worker_mmap = SharedOffloadRegion(
             engine_id=self._engine_id,
             num_blocks=self.num_blocks,
