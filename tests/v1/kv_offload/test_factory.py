@@ -44,6 +44,7 @@ def _make_offloading_config(
     blocks_per_chunk: int = 1,
     rank: int = 0,
     world_size: int = 1,
+    local_world_size: int = 0,
     tp_size: int | None = None,
     pp_size: int = 1,
     pcp_size: int = 1,
@@ -82,6 +83,7 @@ def _make_offloading_config(
             dcp_size=dcp_size,
             data_parallel_index=data_parallel_index,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            local_world_size=local_world_size,
         ),
         replicated_layout=replicated_layout,
     )
@@ -162,6 +164,67 @@ def test_cpu_spec_zero_worker_bytes_produces_empty_cache():
     assert spec.cpu_page_size_per_worker == 0
     assert spec.kv_bytes_per_chunk == 0
     assert spec.num_blocks == 0
+
+
+def test_cpu_spec_local_world_size_sizes_per_node_region():
+    # Multi-node TP worker: only the node-local ranks write into each node's
+    # /dev/shm region, so num_copies must be local_world_size, not world_size.
+    # On a 2-node TP8 worker (world_size=8, local_world_size=4) each node's row
+    # is 4 slots wide instead of 8, so num_blocks doubles at equal cpu_bytes.
+    alignment = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    common = dict(
+        cpu_bytes_to_use=alignment * 8,
+        worker_kv_bytes_per_block=alignment,
+        world_size=8,
+    )
+
+    # Old (buggy) sizing: full world_size row.
+    full = _create_spec(local_world_size=8, **common)
+    # New sizing: node-local row (half as wide).
+    node_local = _create_spec(local_world_size=4, **common)
+    # Fallback: unset (0) must reproduce the world_size behavior exactly.
+    fallback = _create_spec(local_world_size=0, **common)
+
+    assert full.num_blocks == 1
+    assert node_local.num_blocks == 2
+    assert node_local.num_blocks == 2 * full.num_blocks
+    # cpu_page_size_per_worker is per-slot and unchanged by the row width.
+    assert node_local.cpu_page_size_per_worker == alignment
+    assert full.cpu_page_size_per_worker == alignment
+    # Unset local_world_size falls back to world_size -> identical to old path.
+    assert fallback.num_blocks == full.num_blocks
+
+
+def test_cpu_spec_create_worker_slot_uses_local_world_size(monkeypatch):
+    # On a multi-node worker the /dev/shm slot index folds the physical device
+    # index by local_world_size, so device 5 lands on node-local slot 5 % 4 == 1
+    # (not 5 % 8 == 5, which would index past the per-node region).
+    import vllm.v1.kv_offload.cpu.spec as cpu_spec_module
+
+    monkeypatch.setattr(cpu_spec_module.current_platform, "is_cuda_alike", lambda: True)
+    worker_kv_bytes_per_block = SharedOffloadRegion.BLOCK_SIZE_ALIGNMENT
+    spec = _create_spec(
+        cpu_bytes_to_use=worker_kv_bytes_per_block * 8,
+        worker_kv_bytes_per_block=worker_kv_bytes_per_block,
+        world_size=8,
+        local_world_size=4,
+    )
+
+    region_calls: list[dict[str, Any]] = []
+
+    def fake_region_ctor(**kwargs):
+        region_calls.append(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(cpu_spec_module, "SharedOffloadRegion", fake_region_ctor)
+    monkeypatch.setattr(cpu_spec_module, "CPUOffloadingWorker", MagicMock())
+    monkeypatch.setattr(
+        cpu_spec_module.torch.accelerator, "current_device_index", lambda: 5
+    )
+
+    spec.create_worker(MagicMock())
+
+    assert region_calls[0]["rank"] == 1
 
 
 def test_tiering_spec_aligns_row_size():
