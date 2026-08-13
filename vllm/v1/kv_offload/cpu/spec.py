@@ -5,6 +5,7 @@ from typing import Any
 import torch
 from typing_extensions import override
 
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import round_up
 from vllm.v1.kv_offload.base import (
@@ -22,6 +23,8 @@ from vllm.v1.kv_offload.cpu.common import CPUOffloadingMetrics
 from vllm.v1.kv_offload.cpu.gpu_worker import CPUOffloadingWorker
 from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+
+logger = init_logger(__name__)
 
 
 class CPUOffloadingSpec(OffloadingSpec):
@@ -105,6 +108,26 @@ class CPUOffloadingSpec(OffloadingSpec):
                 kv_bytes_per_chunk, self.BLOCK_SIZE_ALIGNMENT
             )
             self.num_blocks = int(cpu_bytes_to_use) // aligned_kv_bytes_per_chunk
+
+            # Self-verify the multi-node region sizing at boot so a silent no-op
+            # (--nnodes not passed -> local_world_size == world_size on a real
+            # multi-node worker -> per-node region sized for ALL ranks, ~50% wasted)
+            # is always visible in the log instead of being undetectable.
+            if not self.replicated_layout and world_size > 1:
+                node_local = local_world_size < world_size
+                logger.info(
+                    "CPU-offload host region: world_size=%d local_world_size=%d "
+                    "num_copies=%d num_blocks=%d -- %s",
+                    world_size,
+                    local_world_size,
+                    num_copies,
+                    self.num_blocks,
+                    "node-local sizing ACTIVE (per-node = local_world_size slots)"
+                    if node_local
+                    else "local_world_size==world_size: if MULTI-NODE this is a "
+                    "NO-OP (~50%% host RAM wasted; pass --nnodes); if single-node, "
+                    "correct",
+                )
 
             # Expose aligned_kv_bytes_per_chunk as
             # kv_bytes_per_chunk. Note that this might contain
