@@ -54,6 +54,12 @@ class OffloadingParallelConfig:
     # under any topology; for the canonical layout, the canonical page itself
     # is topology-free.
     is_parallelism_agnostic: bool
+    # Node-local worker count (GPUs per node within a DP replica) =
+    # world_size // nnodes_within_dp. Sizes the per-node /dev/shm offload
+    # region: on a multi-node TP worker only the node-local ranks write into
+    # each node's region, so the row must be local_world_size slots wide, not
+    # world_size. 0 = fall back to world_size (single-node / unset callers).
+    local_world_size: int = 0
 
 
 @dataclass(frozen=True)
