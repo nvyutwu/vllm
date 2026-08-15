@@ -256,7 +256,11 @@ class MoonVision3dPatchEmbed(nn.Module):
                 stride=self.patch_size,
                 layout="nchw",
             )
-        return self.proj(x)
+        # cuDNN conv2d segfaults on GB200/aarch64 + CUDA 13 (nightly cuDNN 9.20). The ViT patch-embed is
+        # one small conv, so run it without cuDNN (native ATen) -- avoids the crash at negligible cost,
+        # mirroring the ROCm/MIOpen workaround above. Applies to profiling + runtime + cudagraph capture.
+        with torch.backends.cudnn.flags(enabled=False):
+            return self.proj(x)
 
 
 class Rope2DPosEmbRepeated(nn.Module):
