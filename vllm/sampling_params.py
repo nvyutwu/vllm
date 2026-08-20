@@ -196,6 +196,25 @@ def _get_llg_tokenizer(tokenizer: TokenizerLike) -> Any:
     return tokenizer.llg_tokenizer if is_mistral_tokenizer(tokenizer) else None
 
 
+def _k3_default_repetition_detection() -> "RepetitionDetectionParams | None":
+    """v21: server-side default for repetition detection (env-overridable).
+
+    Effective under Dynamo: the worker constructs SamplingParams() directly, so this default
+    is what actually reaches the engine. Set K3_REPETITION_DETECTION=0 to restore upstream
+    behaviour (disabled) — REQUIRED on any arm being measured for degeneration rate, since
+    early termination destroys the signal the scan keys on.
+    """
+    import os as _os
+
+    if _os.getenv("K3_REPETITION_DETECTION", "1") != "1":
+        return None
+    return RepetitionDetectionParams(
+        min_pattern_size=int(_os.getenv("K3_REPDET_MIN_PATTERN", "1")),
+        max_pattern_size=int(_os.getenv("K3_REPDET_MAX_PATTERN", "8")),
+        min_count=int(_os.getenv("K3_REPDET_MIN_COUNT", "32")),
+    )
+
+
 class SamplingParams(
     PydanticMsgspecMixin,
     msgspec.Struct,
@@ -349,7 +368,9 @@ class SamplingParams(
     thinking_token_budget: int | None = None
     """Maximum number of tokens allowed for thinking operations."""
 
-    repetition_detection: RepetitionDetectionParams | None = None
+    repetition_detection: RepetitionDetectionParams | None = msgspec.field(
+        default_factory=_k3_default_repetition_detection
+    )
     """Parameters for detecting repetitive N-gram patterns in output tokens.
     If such repetition is detected, generation will be ended early. LLMs can
     sometimes generate repetitive, unhelpful token patterns, stopping only

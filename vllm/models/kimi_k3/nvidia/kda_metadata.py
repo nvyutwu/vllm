@@ -273,9 +273,34 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
 
         if num_spec_decodes == 0:
             # The runner orders ordinary decodes before prefills.
-            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-                split_decodes_and_prefills(m, decode_threshold=1)
-            )
+            # v21 KDA fix: a FIRST-token prefill has no prior KDA state and must stay a
+            # prefill, or has_initial_state is never built (kda_metadata `if num_prefills > 0`)
+            # and the decode kernel consumes an unscrubbed recycled slot. Mirrors
+            # mamba_attn.py's two-part guard; falls back to the original call when
+            # is_prefilling is unavailable so behaviour cannot regress.
+            _cam = m
+            _is_prefilling = getattr(m, "is_prefilling", None)
+            _seq_lens_cpu = getattr(m, "seq_lens_cpu_upper_bound", None)
+            if _is_prefilling is not None and _seq_lens_cpu is not None:
+                _qlens_cpu = torch.diff(m.query_start_loc_cpu)
+                # Single-token rows that are still prefilling BUT already hold state are
+                # safe as decodes; first-token rows (seq_len <= 1) are not.
+                _demote = _is_prefilling & (_qlens_cpu == 1) & (_seq_lens_cpu > 1)
+                if bool(torch.any(_demote)):
+                    _ip = _is_prefilling.clone()
+                    _ip[_demote] = False
+                    _cam = m.replace(is_prefilling=_ip)
+                num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                    split_decodes_and_prefills(
+                        _cam,
+                        decode_threshold=1,
+                        treat_short_extends_as_decodes=False,
+                    )
+                )
+            else:
+                num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                    split_decodes_and_prefills(m, decode_threshold=1)
+                )
             num_spec_decode_tokens = 0
             spec_token_indx = None
             non_spec_token_indx = None
