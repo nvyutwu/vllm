@@ -28,9 +28,11 @@ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 
 LOAD_BYTES = _TransferMetricName.LOAD_BYTES
 LOAD_TIME = _TransferMetricName.LOAD_TIME
+LOAD_TIME_SECONDS = _TransferMetricName.LOAD_TIME_SECONDS
 LOAD_SIZE = _TransferMetricName.LOAD_SIZE
 STORE_BYTES = _TransferMetricName.STORE_BYTES
 STORE_TIME = _TransferMetricName.STORE_TIME
+STORE_TIME_SECONDS = _TransferMetricName.STORE_TIME_SECONDS
 STORE_SIZE = _TransferMetricName.STORE_SIZE
 STORES_SKIPPED = "vllm:kv_offload_stores_skipped"
 PENDING_STORES = "vllm:kv_offload_pending_stores"
@@ -73,6 +75,42 @@ def test_connector_metric_histogram_buckets():
         5,
         10,
     )
+
+    load_time = metadata[_TransferMetricName.LOAD_TIME_SECONDS]
+    assert isinstance(load_time, OffloadingHistogramMetadata)
+    assert load_time.buckets == (
+        0.00001,
+        0.00005,
+        0.0001,
+        0.0005,
+        0.001,
+        0.005,
+        0.01,
+        0.05,
+        0.1,
+        0.5,
+        1,
+        5,
+        10,
+    )
+
+    load_wait = metadata[_ConnectorMetricName.LOAD_WAIT_SECONDS]
+    assert isinstance(load_wait, OffloadingHistogramMetadata)
+    assert load_wait.buckets[-3:] == (30, 60, 120)
+
+    load_chunks = metadata[_ConnectorMetricName.LOAD_CHUNKS]
+    assert isinstance(load_chunks, OffloadingHistogramMetadata)
+    assert load_chunks.buckets[:4] == (1, 2, 4, 8)
+
+    load_chunks_by_kind = metadata[_ConnectorMetricName.LOAD_CHUNKS_BY_KV_CACHE_KIND]
+    assert isinstance(load_chunks_by_kind, OffloadingCounterMetadata)
+    assert load_chunks_by_kind.labelnames == ("kv_cache_spec_kind",)
+
+    store_evictions_by_kind = metadata[
+        _ConnectorMetricName.STORE_EVICTED_CHUNKS_BY_KV_CACHE_KIND
+    ]
+    assert isinstance(store_evictions_by_kind, OffloadingCounterMetadata)
+    assert store_evictions_by_kind.labelnames == ("kv_cache_spec_kind",)
 
 
 class _FakeMetric:
@@ -129,6 +167,9 @@ def _metric_metadata():
         LOAD_TIME: OffloadingCounterMetadata(
             documentation="load time",
         ),
+        LOAD_TIME_SECONDS: OffloadingHistogramMetadata(
+            documentation="load time seconds",
+        ),
         LOAD_SIZE: OffloadingHistogramMetadata(
             documentation="load size",
         ),
@@ -137,6 +178,9 @@ def _metric_metadata():
         ),
         STORE_TIME: OffloadingCounterMetadata(
             documentation="store time",
+        ),
+        STORE_TIME_SECONDS: OffloadingHistogramMetadata(
+            documentation="store time seconds",
         ),
         STORE_SIZE: OffloadingHistogramMetadata(
             documentation="store size",
@@ -515,17 +559,21 @@ def test_prom_metrics_observes_flat_transfer_metrics_and_legacy_metrics():
             _StatsKey.TYPES: {
                 LOAD_BYTES: _MetricType.COUNTER,
                 LOAD_TIME: _MetricType.COUNTER,
+                LOAD_TIME_SECONDS: _MetricType.HISTOGRAM,
                 LOAD_SIZE: _MetricType.HISTOGRAM,
                 STORE_BYTES: _MetricType.COUNTER,
                 STORE_TIME: _MetricType.COUNTER,
+                STORE_TIME_SECONDS: _MetricType.HISTOGRAM,
                 STORE_SIZE: _MetricType.HISTOGRAM,
             },
             _StatsKey.DATA: {
                 LOAD_BYTES: {(): 24},
                 LOAD_TIME: {(): 1.5},
+                LOAD_TIME_SECONDS: {(): [1.0, 0.5]},
                 LOAD_SIZE: {(): [16, 8]},
                 STORE_BYTES: {(): 3},
                 STORE_TIME: {(): 0.3},
+                STORE_TIME_SECONDS: {(): [0.3]},
                 STORE_SIZE: {(): [1, 2]},
             },
         }
@@ -533,9 +581,16 @@ def test_prom_metrics_observes_flat_transfer_metrics_and_legacy_metrics():
 
     assert prom_metrics.offloading_metrics[(0, LOAD_BYTES, ())].increments == [24]
     assert prom_metrics.offloading_metrics[(0, LOAD_TIME, ())].increments == [1.5]
+    assert prom_metrics.offloading_metrics[(0, LOAD_TIME_SECONDS, ())].observed == [
+        1.0,
+        0.5,
+    ]
     assert prom_metrics.offloading_metrics[(0, LOAD_SIZE, ())].observed == [16, 8]
     assert prom_metrics.offloading_metrics[(0, STORE_BYTES, ())].increments == [3]
     assert prom_metrics.offloading_metrics[(0, STORE_TIME, ())].increments == [0.3]
+    assert prom_metrics.offloading_metrics[(0, STORE_TIME_SECONDS, ())].observed == [
+        0.3
+    ]
     assert prom_metrics.offloading_metrics[(0, STORE_SIZE, ())].observed == [1, 2]
 
     assert prom_metrics.counter_kv_bytes[(0, "CPU_to_GPU")].increments == [24]
