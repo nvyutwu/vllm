@@ -37,12 +37,14 @@ def test_aggregate_multiple_workers():
 def test_aggregate_transfer_stats():
     meta1 = OffloadingWorkerMetadata(
         transfer_stats=TransferStats(
-            load=DirectionalTransferStats(bytes=10, time=0.5, sizes=[10])
+            load=DirectionalTransferStats(bytes=10, time=0.5, sizes=[10], times=[0.5])
         )
     )
     meta2 = OffloadingWorkerMetadata(
         transfer_stats=TransferStats(
-            load=DirectionalTransferStats(bytes=20, time=1.0, sizes=[20, 30])
+            load=DirectionalTransferStats(
+                bytes=20, time=1.0, sizes=[20, 30], times=[0.25, 0.75]
+            )
         )
     )
 
@@ -51,3 +53,4 @@ def test_aggregate_transfer_stats():
     assert result.transfer_stats.load.bytes == 30
     assert result.transfer_stats.load.time == 1.5
     assert result.transfer_stats.load.sizes == [10, 20, 30]
+    assert result.transfer_stats.load.times == [0.5, 0.25, 0.75]

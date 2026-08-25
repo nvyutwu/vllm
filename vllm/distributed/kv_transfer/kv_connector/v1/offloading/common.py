@@ -16,6 +16,7 @@ class DirectionalTransferStats:
     bytes: int = 0
     time: float = 0.0
     sizes: list[int | float] = field(default_factory=list)
+    times: list[int | float] = field(default_factory=list)
 
     def aggregate(
         self, other: "DirectionalTransferStats"
@@ -24,15 +25,19 @@ class DirectionalTransferStats:
             bytes=self.bytes + other.bytes,
             time=self.time + other.time,
             sizes=[*self.sizes, *other.sizes],
+            times=[*self.times, *other.times],
         )
 
     def record(self, num_bytes: int, time: float) -> None:
         self.bytes += num_bytes
         self.time += time
         self.sizes.append(num_bytes)
+        self.times.append(time)
 
     def is_empty(self) -> bool:
-        return self.bytes == 0 and self.time == 0.0 and not self.sizes
+        return (
+            self.bytes == 0 and self.time == 0.0 and not self.sizes and not self.times
+        )
 
 
 @dataclass(slots=True)
