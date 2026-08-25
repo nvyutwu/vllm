@@ -678,6 +678,14 @@ def test_kv_pressure_preempt_mid_handoff(kv_role: str):
         max_num_batched_tokens=512,
     )
     assert scheduler.requires_kv_delivery is is_producer
+    # kv_consumer additionally enables defer_block_free, whose zero-reclaim
+    # guard stops this preemption before it happens (the victim was scheduled
+    # into the still-unprocessed step). That is correct, but it makes the
+    # drop_stale_output path under test unreachable, so exercise that path with
+    # the guard off; the guard itself is covered by
+    # test_zero_reclaim_cascade.py and by
+    # test_zero_reclaim_guard_blocks_mid_handoff_preempt below.
+    scheduler.defer_block_free = False
 
     # 32-token prompts fill 2 blocks each, exhausting the usable pool, so the
     # next decode allocation preempts the tail of the running queue (the handoff
@@ -712,3 +720,44 @@ def test_kv_pressure_preempt_mid_handoff(kv_role: str):
     else:
         assert handoff.is_finished()
         assert handoff.num_output_tokens == 1
+
+
+def test_zero_reclaim_guard_blocks_mid_handoff_preempt():
+    """Companion to the above: with a consumer-role connector the production
+    gate turns defer_block_free on, and the zero-reclaim guard must refuse the
+    preemption entirely rather than evict a victim whose blocks stay fenced.
+
+    This is the gate as configured in production (nothing forced by the test),
+    so it also pins that defer_block_free is reachable from create_scheduler.
+    """
+    scheduler = create_scheduler(
+        async_scheduling=True,
+        use_kv_connector=True,
+        kv_role="kv_consumer",
+        num_blocks=5,
+        block_size=16,
+        max_num_batched_tokens=512,
+    )
+    assert scheduler.defer_block_free, "production gate must be on for this test"
+
+    decoder = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=8, req_ids=["decoder"]
+    )[0]
+    handoff = create_requests(
+        num_requests=1, num_tokens=32, max_tokens=1, req_ids=["handoff"]
+    )[0]
+    scheduler.add_request(decoder)
+    scheduler.add_request(handoff)
+    scheduler.schedule()
+    running_before = list(scheduler.running)
+
+    out = scheduler.schedule()
+
+    # The victim's free is deferred, so no preemption happens at all and the
+    # running queue is intact (pre-fix: the loop chained down to `decoder`).
+    assert not out.preempted_req_ids
+    assert list(scheduler.running) == running_before
+    assert handoff.status == RequestStatus.RUNNING
+    assert decoder.status == RequestStatus.RUNNING
+    # And nothing was withheld from the pool by a pointless preemption.
+    assert not scheduler.deferred_frees
