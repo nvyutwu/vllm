@@ -107,8 +107,8 @@ def test_partial_tail_store_uses_attention_and_recurrent_cow_sources():
     req_status = scheduler._req_status["req"]
     req_status.group_states[0].block_ids[:] = [11, 12]
     req_status.group_states[1].block_ids[:] = [0, 21]
-    scheduler.manager.prepare_store.side_effect = (
-        lambda keys, req_context: generate_store_output(keys)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
     )
 
     output = SimpleNamespace(partial_tail_offloads={"req": [(1, 99, 28)]})
@@ -377,6 +377,61 @@ def test_scheduler_reports_lookup_async_delay_on_resolve(request_runner):
     reduced = _reduce_kv_connector_stats(runner)
     assert reduced[f"{_ConnectorMetricName.LOOKUP_ASYNC_DELAY}_count"] == 1
     assert reduced[f"{_ConnectorMetricName.LOOKUP_ASYNC_DELAY}_sum"] > 0
+
+
+def test_scheduler_reports_transfer_job_wait_and_size(request_runner):
+    block_size = 4
+    blocks_per_chunk = 3
+    tokens_per_chunk = block_size * blocks_per_chunk
+    runner = request_runner(
+        block_size=block_size,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        blocks_per_chunk=blocks_per_chunk,
+    )
+
+    runner.new_request(token_ids=[0] * tokens_per_chunk)
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0, 1, 2))
+
+    reduced = _reduce_kv_connector_stats(runner)
+    assert reduced[f"{_ConnectorMetricName.STORE_WAIT_SECONDS}_count"] == 1
+    assert reduced[f"{_ConnectorMetricName.STORE_WAIT_SECONDS}_sum"] >= 0
+    assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}_count"] == 1
+    assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}_sum"] == 1
+    assert (
+        reduced[
+            f"{_ConnectorMetricName.STORE_CHUNKS_BY_KV_CACHE_KIND}:"
+            "{('full_attention',)}"
+        ]
+        == 1
+    )
+
+    runner.kv_connector_stats.clear()
+    runner.scheduler.reset_prefix_cache()
+    runner.new_request(token_ids=[0] * tokens_per_chunk)
+    runner.connector_scheduler._maximal_prefix_lookup = lambda keys, ctx, *_: 1
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_loaded=(0, 1, 2))
+
+    reduced = _reduce_kv_connector_stats(runner)
+    assert reduced[f"{_ConnectorMetricName.LOAD_WAIT_SECONDS}_count"] == 1
+    assert reduced[f"{_ConnectorMetricName.LOAD_WAIT_SECONDS}_sum"] >= 0
+    assert reduced[f"{_ConnectorMetricName.LOAD_CHUNKS}_count"] == 1
+    assert reduced[f"{_ConnectorMetricName.LOAD_CHUNKS}_sum"] == 1
+    assert reduced[f"{_ConnectorMetricName.LOAD_TOKENS}_count"] == 1
+    assert reduced[f"{_ConnectorMetricName.LOAD_TOKENS}_sum"] == tokens_per_chunk
+    assert (
+        reduced[
+            f"{_ConnectorMetricName.LOAD_CHUNKS_BY_KV_CACHE_KIND}:"
+            "{('full_attention',)}"
+        ]
+        == 1
+    )
 
 
 def test_max_offload_tokens_zero_does_not_record_pending_lookups(request_runner):
