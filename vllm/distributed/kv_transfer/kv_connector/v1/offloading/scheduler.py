@@ -52,6 +52,7 @@ from vllm.v1.kv_offload.base import (
     ScheduleEndContext,
     TierFilter,
     TierMatcher,
+    get_offload_group_idx,
     make_offload_key,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -75,6 +76,16 @@ class TransferJobStatus:
     # Offload keys this job covers; passed to manager.complete_*().
     keys: set[OffloadKey]
     is_store: bool
+    # Scheduler-side wall-clock timestamp for request/job wait attribution.
+    created_time: float = field(default_factory=time.monotonic)
+    # Number of offload keys/chunks covered by this job. For hybrid models this
+    # is physical group chunks, not only logical sequence chunks.
+    num_chunks: int = 0
+    # Logical external-prefix tokens requested by load jobs.
+    num_tokens: int = 0
+    # Completed chunks grouped by low-cardinality KV cache spec kind
+    # (for example mla_attention or mamba).
+    chunks_by_kv_cache_spec_kind: dict[str, int] = field(default_factory=dict)
     # Store source blocks fenced after the request finishes.
     deferred_fence_block_ids: list[int] | None = None
     # Store source blocks fenced when the transfer is created.
@@ -585,6 +596,38 @@ class OffloadingConnectorScheduler:
             if not pending:
                 del self._block_id_to_pending_jobs[bid]
 
+    def _chunk_counts_by_kv_cache_spec_kind(
+        self, keys: Iterable[OffloadKey]
+    ) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for key in keys:
+            group_idx = get_offload_group_idx(key)
+            kind = "unknown"
+            if 0 <= group_idx < len(self.config.kv_group_configs):
+                kind = (
+                    self.config.kv_group_configs[
+                        group_idx
+                    ].kv_event_group_spec.kv_cache_spec_kind
+                    or "unknown"
+                )
+            counts[kind] = counts.get(kind, 0) + 1
+        return counts
+
+    def _record_store_evictions(self, evicted_keys: Sequence[OffloadKey]) -> None:
+        if not evicted_keys:
+            return
+        self._connector_stats.increase_counter(
+            _ConnectorMetricName.STORE_EVICTED_CHUNKS, len(evicted_keys)
+        )
+        for kind, count in self._chunk_counts_by_kv_cache_spec_kind(
+            evicted_keys
+        ).items():
+            self._connector_stats.increase_counter(
+                _ConnectorMetricName.STORE_EVICTED_CHUNKS_BY_KV_CACHE_KIND,
+                count,
+                (kind,),
+            )
+
     def _calc_num_offloadable_tokens(
         self, req_status: RequestOffloadState, num_computed_tokens: int
     ) -> int:
@@ -1094,6 +1137,11 @@ class OffloadingConnectorScheduler:
             pending_count=self.config.num_workers,
             keys=set(keys_to_load),
             is_store=False,
+            num_chunks=len(keys_to_load),
+            num_tokens=num_external_tokens,
+            chunks_by_kv_cache_spec_kind=self._chunk_counts_by_kv_cache_spec_kind(
+                keys_to_load
+            ),
         )
 
         if self._chunks_being_loaded is not None:
@@ -1204,6 +1252,7 @@ class OffloadingConnectorScheduler:
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
                 continue
+            self._record_store_evictions(store_output.evicted_keys)
             if not store_output.keys_to_store:
                 continue
 
@@ -1231,6 +1280,10 @@ class OffloadingConnectorScheduler:
                 pending_count=self.config.num_workers,
                 keys=set(store_output.keys_to_store),
                 is_store=True,
+                num_chunks=len(store_output.keys_to_store),
+                chunks_by_kv_cache_spec_kind=(
+                    self._chunk_counts_by_kv_cache_spec_kind(store_output.keys_to_store)
+                ),
                 fenced_block_ids=source_blocks,
             )
             store_jobs[job_id] = TransferJob(
@@ -1332,6 +1385,7 @@ class OffloadingConnectorScheduler:
                 )
                 logger.warning("Request %s: cannot store chunks", req_id)
                 continue
+            self._record_store_evictions(store_output.evicted_keys)
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
@@ -1415,6 +1469,10 @@ class OffloadingConnectorScheduler:
                 pending_count=self.config.num_workers,
                 keys=set(keys_to_store),
                 is_store=True,
+                num_chunks=len(keys_to_store),
+                chunks_by_kv_cache_spec_kind=(
+                    self._chunk_counts_by_kv_cache_spec_kind(keys_to_store)
+                ),
                 deferred_fence_block_ids=deferred_fence_block_ids,
                 fenced_block_ids=fenced_block_ids or None,
             )
@@ -1527,6 +1585,10 @@ class OffloadingConnectorScheduler:
                     _TransferMetricName.LOAD_TIME,
                     meta.transfer_stats.load.time,
                 )
+                for duration in meta.transfer_stats.load.times:
+                    transfer_stats.observe_histogram(
+                        _TransferMetricName.LOAD_TIME_SECONDS, duration
+                    )
                 for size in meta.transfer_stats.load.sizes:
                     transfer_stats.observe_histogram(
                         _TransferMetricName.LOAD_SIZE, size
@@ -1540,6 +1602,10 @@ class OffloadingConnectorScheduler:
                     _TransferMetricName.STORE_TIME,
                     meta.transfer_stats.store.time,
                 )
+                for duration in meta.transfer_stats.store.times:
+                    transfer_stats.observe_histogram(
+                        _TransferMetricName.STORE_TIME_SECONDS, duration
+                    )
                 for size in meta.transfer_stats.store.sizes:
                     transfer_stats.observe_histogram(
                         _TransferMetricName.STORE_SIZE, size
@@ -1560,6 +1626,43 @@ class OffloadingConnectorScheduler:
             if job_status.pending_count > 0:
                 continue
             assert job_status.pending_count == 0
+
+            wait_time = time.monotonic() - job_status.created_time
+            if job_status.is_store:
+                self._connector_stats.observe_histogram(
+                    _ConnectorMetricName.STORE_WAIT_SECONDS, wait_time
+                )
+                if job_status.num_chunks:
+                    self._connector_stats.observe_histogram(
+                        _ConnectorMetricName.STORE_CHUNKS,
+                        job_status.num_chunks,
+                    )
+                for kind, count in job_status.chunks_by_kv_cache_spec_kind.items():
+                    self._connector_stats.increase_counter(
+                        _ConnectorMetricName.STORE_CHUNKS_BY_KV_CACHE_KIND,
+                        count,
+                        (kind,),
+                    )
+            else:
+                self._connector_stats.observe_histogram(
+                    _ConnectorMetricName.LOAD_WAIT_SECONDS, wait_time
+                )
+                if job_status.num_chunks:
+                    self._connector_stats.observe_histogram(
+                        _ConnectorMetricName.LOAD_CHUNKS,
+                        job_status.num_chunks,
+                    )
+                if job_status.num_tokens:
+                    self._connector_stats.observe_histogram(
+                        _ConnectorMetricName.LOAD_TOKENS,
+                        job_status.num_tokens,
+                    )
+                for kind, count in job_status.chunks_by_kv_cache_spec_kind.items():
+                    self._connector_stats.increase_counter(
+                        _ConnectorMetricName.LOAD_CHUNKS_BY_KV_CACHE_KIND,
+                        count,
+                        (kind,),
+                    )
 
             req_status = self._req_status[job_status.req_id]
             if job_status.is_store:

@@ -24,9 +24,11 @@ class _TransferMetricName:
 
     LOAD_BYTES = "vllm:kv_offload_load_bytes"
     LOAD_TIME = "vllm:kv_offload_load_time"
+    LOAD_TIME_SECONDS = "vllm:kv_offload_load_time_seconds"
     LOAD_SIZE = "vllm:kv_offload_load_size"
     STORE_BYTES = "vllm:kv_offload_store_bytes"
     STORE_TIME = "vllm:kv_offload_store_time"
+    STORE_TIME_SECONDS = "vllm:kv_offload_store_time_seconds"
     STORE_SIZE = "vllm:kv_offload_store_size"
 
 
@@ -36,6 +38,20 @@ class _ConnectorMetricName:
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+    LOAD_WAIT_SECONDS = "vllm:kv_offload_load_wait_seconds"
+    STORE_WAIT_SECONDS = "vllm:kv_offload_store_wait_seconds"
+    LOAD_CHUNKS = "vllm:kv_offload_load_chunks"
+    STORE_CHUNKS = "vllm:kv_offload_store_chunks"
+    LOAD_TOKENS = "vllm:kv_offload_load_tokens"
+    LOAD_CHUNKS_BY_KV_CACHE_KIND = "vllm:kv_offload_load_chunks_by_kv_cache_kind"
+    STORE_CHUNKS_BY_KV_CACHE_KIND = "vllm:kv_offload_store_chunks_by_kv_cache_kind"
+    STORE_EVICTED_CHUNKS = "vllm:kv_offload_store_evicted_chunks"
+    STORE_EVICTED_CHUNKS_BY_KV_CACHE_KIND = (
+        "vllm:kv_offload_store_evicted_chunks_by_kv_cache_kind"
+    )
+
+
+_KV_CACHE_SPEC_KIND_LABEL = "kv_cache_spec_kind"
 
 
 class _TransferType:
@@ -59,6 +75,71 @@ TRANSFER_SIZE_BUCKETS = (
     200e6,
 )
 
+TRANSFER_TIME_BUCKETS = (
+    0.00001,
+    0.00005,
+    0.0001,
+    0.0005,
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1,
+    0.5,
+    1,
+    5,
+    10,
+)
+
+TRANSFER_WAIT_BUCKETS = (
+    0.0001,
+    0.0005,
+    0.001,
+    0.005,
+    0.01,
+    0.05,
+    0.1,
+    0.5,
+    1,
+    5,
+    10,
+    30,
+    60,
+    120,
+)
+
+TRANSFER_CHUNK_BUCKETS = (
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+)
+
+TRANSFER_TOKEN_BUCKETS = (
+    1,
+    4,
+    16,
+    64,
+    256,
+    1024,
+    4096,
+    16384,
+    65536,
+    262144,
+    1048576,
+)
+
 
 def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
     return {
@@ -67,6 +148,13 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         ),
         _TransferMetricName.LOAD_TIME: OffloadingCounterMetadata(
             documentation="Total load time from offload storage to GPU, in seconds.",
+        ),
+        _TransferMetricName.LOAD_TIME_SECONDS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of individual KV offload load operation duration, "
+                "in seconds."
+            ),
+            buckets=TRANSFER_TIME_BUCKETS,
         ),
         _TransferMetricName.LOAD_SIZE: OffloadingHistogramMetadata(
             documentation="Histogram of KV offload load operation size, in bytes.",
@@ -77,6 +165,13 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         ),
         _TransferMetricName.STORE_TIME: OffloadingCounterMetadata(
             documentation="Total store time from GPU to offload storage, in seconds.",
+        ),
+        _TransferMetricName.STORE_TIME_SECONDS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of individual KV offload store operation duration, "
+                "in seconds."
+            ),
+            buckets=TRANSFER_TIME_BUCKETS,
         ),
         _TransferMetricName.STORE_SIZE: OffloadingHistogramMetadata(
             documentation="Histogram of KV offload store operation size, in bytes.",
@@ -125,6 +220,75 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             documentation=(
                 "Number of KV offload store allocation attempts that failed."
             ),
+        ),
+        _ConnectorMetricName.LOAD_WAIT_SECONDS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of scheduler-observed wall time between creating "
+                "a KV offload load job and all workers reporting completion, "
+                "in seconds."
+            ),
+            buckets=TRANSFER_WAIT_BUCKETS,
+        ),
+        _ConnectorMetricName.STORE_WAIT_SECONDS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of scheduler-observed wall time between creating "
+                "a KV offload store job and all workers reporting completion, "
+                "in seconds."
+            ),
+            buckets=TRANSFER_WAIT_BUCKETS,
+        ),
+        _ConnectorMetricName.LOAD_CHUNKS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of the number of offload chunks covered by each "
+                "completed KV offload load job."
+            ),
+            buckets=TRANSFER_CHUNK_BUCKETS,
+        ),
+        _ConnectorMetricName.STORE_CHUNKS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of the number of offload chunks covered by each "
+                "completed KV offload store job."
+            ),
+            buckets=TRANSFER_CHUNK_BUCKETS,
+        ),
+        _ConnectorMetricName.LOAD_TOKENS: OffloadingHistogramMetadata(
+            documentation=(
+                "Histogram of the number of logical external-prefix tokens "
+                "requested by each completed KV offload load job."
+            ),
+            buckets=TRANSFER_TOKEN_BUCKETS,
+        ),
+        _ConnectorMetricName.LOAD_CHUNKS_BY_KV_CACHE_KIND: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of KV offload load chunks completed, grouped by "
+                    "KV cache spec kind."
+                ),
+                labelnames=(_KV_CACHE_SPEC_KIND_LABEL,),
+            )
+        ),
+        _ConnectorMetricName.STORE_CHUNKS_BY_KV_CACHE_KIND: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of KV offload store chunks completed, grouped by "
+                    "KV cache spec kind."
+                ),
+                labelnames=(_KV_CACHE_SPEC_KIND_LABEL,),
+            )
+        ),
+        _ConnectorMetricName.STORE_EVICTED_CHUNKS: OffloadingCounterMetadata(
+            documentation=(
+                "Number of KV offload chunks evicted while preparing store allocations."
+            ),
+        ),
+        _ConnectorMetricName.STORE_EVICTED_CHUNKS_BY_KV_CACHE_KIND: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of KV offload chunks evicted while preparing "
+                    "store allocations, grouped by KV cache spec kind."
+                ),
+                labelnames=(_KV_CACHE_SPEC_KIND_LABEL,),
+            )
         ),
     }
 
