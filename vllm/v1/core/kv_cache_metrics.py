@@ -85,6 +85,10 @@ class KVCacheMetricsCollector:
             )
         )
 
+    def discard_block(self, block: "KVCacheBlock") -> None:
+        """Stop tracking a recycled block that was not a cache eviction."""
+        self.block_metrics.pop(block.block_id, None)
+
     def reset(self) -> None:
         """Clear all state on cache reset."""
         self.block_metrics.clear()
