@@ -5,11 +5,18 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import (
     BlockMetricsState,
     KVCacheMetricsCollector,
 )
-from vllm.v1.core.kv_cache_utils import KVCacheBlock
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    make_block_hash_with_group_id,
+)
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 class TestBlockMetricsState:
@@ -222,3 +229,44 @@ def test_kv_cache_metrics_collector_smoke() -> None:
     assert abs(event.idle_seconds - 1.0) < 1e-6
     # One reuse gap between the two accesses.
     assert event.reuse_gaps_seconds == (1.0,)
+
+
+def test_uncached_block_recycling_is_not_reported_as_eviction() -> None:
+    collector = KVCacheMetricsCollector(sample_rate=1.0)
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=16,
+        metrics_collector=collector,
+    )
+
+    block = pool.get_new_blocks(1)[0]
+    pool.free_blocks([block])
+    pool.get_new_blocks(1)
+
+    assert collector.drain_events() == []
+
+
+def test_cached_block_recycling_reports_eviction() -> None:
+    collector = KVCacheMetricsCollector(sample_rate=1.0)
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=16,
+        metrics_collector=collector,
+    )
+
+    with patch("time.monotonic_ns", return_value=1_000_000_000):
+        block = pool.get_new_blocks(1)[0]
+    block_hash = make_block_hash_with_group_id(BlockHash(b"cached"), 0)
+    block.set_block_hash(block_hash)
+    pool.cached_block_hash_to_block.insert(block_hash, block)
+    pool.free_blocks([block])
+
+    with patch("time.monotonic_ns", return_value=6_000_000_000):
+        pool.get_new_blocks(1)
+
+    events = collector.drain_events()
+    assert len(events) == 1
+    assert events[0].lifetime_seconds == 5.0
+    assert events[0].idle_seconds == 5.0
