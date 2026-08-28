@@ -43,6 +43,27 @@ class CPUOffloadingSpec(OffloadingSpec):
                     "dropped due to insufficient capacity."
                 ),
             ),
+            CPUOffloadingMetrics.CPU_CACHE_OCCUPANCY_PERC: OffloadingGaugeMetadata(
+                documentation=(
+                    "Fraction of CPU KV-cache slots that contain cached data or "
+                    "are reserved by an in-flight store (0.0 = empty, 1.0 = "
+                    "full). Unlike cpu_cache_usage_perc, completed evictable "
+                    "cache entries remain included."
+                ),
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_OCCUPIED_BYTES: OffloadingGaugeMetadata(
+                documentation=(
+                    "Logical bytes occupied by CPU KV-cache entries, including "
+                    "slots reserved by in-flight stores. This is cache occupancy, "
+                    "not process RSS or the pre-faulted mmap resident size."
+                ),
+            ),
+            CPUOffloadingMetrics.CPU_CACHE_CAPACITY_BYTES: OffloadingGaugeMetadata(
+                documentation=(
+                    "Usable logical capacity of the CPU KV-cache block pool in "
+                    "bytes after block-size alignment."
+                ),
+            ),
             CPUOffloadingMetrics.CPU_CACHE_WRITE_USAGE_PERC: OffloadingGaugeMetadata(
                 documentation=(
                     "Fraction of CPU KV-cache space currently pinned by "
@@ -160,6 +181,7 @@ class CPUOffloadingSpec(OffloadingSpec):
 
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
+                bytes_per_block=self.kv_bytes_per_chunk,
                 cache_policy=self.eviction_policy,
                 cache_policy_module_path=self.cache_policy_module_path,
                 enable_events=self.kv_events_config.enable_kv_cache_events,

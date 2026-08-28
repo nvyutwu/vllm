@@ -47,9 +47,11 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        bytes_per_block: int = 0,
     ):
         self.medium: Medium = Medium.CPU
         self._num_blocks: int = num_blocks
+        self._bytes_per_block: int = bytes_per_block
         self._num_allocated_blocks: int = 0
         self._free_list: list[int] = []
         self.events: list[OffloadingEvent] | None = [] if enable_events else None
@@ -292,6 +294,21 @@ class CPUOffloadingManager(OffloadingManager):
 
     def get_stats(self) -> OffloadingConnectorStats | None:
         stats = OffloadingConnectorStats()
+
+        # Logical cache occupancy includes completed, evictable cache entries.
+        # This intentionally differs from CPU_CACHE_USAGE_PERC below, which
+        # reports only blocks pinned by active reads or pending writes.
+        num_occupied = self._num_allocated_blocks - len(self._free_list)
+        occupancy = num_occupied / self._num_blocks if self._num_blocks > 0 else 0.0
+        stats.set_gauge(CPUOffloadingMetrics.CPU_CACHE_OCCUPANCY_PERC, occupancy)
+        stats.set_gauge(
+            CPUOffloadingMetrics.CPU_CACHE_OCCUPIED_BYTES,
+            num_occupied * self._bytes_per_block,
+        )
+        stats.set_gauge(
+            CPUOffloadingMetrics.CPU_CACHE_CAPACITY_BYTES,
+            self._num_blocks * self._bytes_per_block,
+        )
 
         # Compute cache usage.
         num_used = (
