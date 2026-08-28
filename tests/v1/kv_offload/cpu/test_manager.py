@@ -273,6 +273,40 @@ def test_cpu_manager_reports_cache_usage_gauge():
     check_usage_stats(manager, 0.0)
 
 
+def test_cpu_manager_reports_logical_cache_occupancy():
+    bytes_per_block = 1024
+    manager = CPUOffloadingManager(
+        num_blocks=4,
+        bytes_per_block=bytes_per_block,
+    )
+
+    def check(occupancy: float, occupied_bytes: int):
+        stats = manager.get_stats()
+        assert stats is not None
+        reduced = stats.reduce()
+        assert reduced[CPUOffloadingMetrics.CPU_CACHE_OCCUPANCY_PERC] == pytest.approx(
+            occupancy
+        )
+        assert reduced[CPUOffloadingMetrics.CPU_CACHE_OCCUPIED_BYTES] == occupied_bytes
+        assert reduced[CPUOffloadingMetrics.CPU_CACHE_CAPACITY_BYTES] == 4096
+
+    check(0.0, 0)
+
+    manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    check(0.5, 2048)
+
+    # Completed entries remain logically occupied even after becoming evictable.
+    manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    check(0.5, 2048)
+
+    manager.prepare_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([3, 4]), _EMPTY_REQ_CTX)
+    check(1.0, 4096)
+
+    manager.reset_cache()
+    check(0.0, 0)
+
+
 def test_cpu_manager_reports_allocation_size_histogram():
     manager = make_cpu_manager(num_blocks=4, cache_policy="lru")
 
