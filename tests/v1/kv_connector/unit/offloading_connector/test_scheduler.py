@@ -404,7 +404,7 @@ def test_scheduler_reports_transfer_job_wait_and_size(request_runner):
     assert (
         reduced[
             f"{_ConnectorMetricName.STORE_CHUNKS_BY_KV_CACHE_KIND}:"
-            "{('full_attention',)}"
+            "('full_attention',)"
         ]
         == 1
     )
@@ -428,7 +428,7 @@ def test_scheduler_reports_transfer_job_wait_and_size(request_runner):
     assert (
         reduced[
             f"{_ConnectorMetricName.LOAD_CHUNKS_BY_KV_CACHE_KIND}:"
-            "{('full_attention',)}"
+            "('full_attention',)"
         ]
         == 1
     )
