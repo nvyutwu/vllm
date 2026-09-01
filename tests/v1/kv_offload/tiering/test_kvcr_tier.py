@@ -419,6 +419,7 @@ def test_kvcr_hint_reconciliation_conserves_h_equals_a_plus_n(monkeypatch):
         "vllm:kvcr_hint_blocks_received": 2,
         "vllm:kvcr_blocks_already_local": 1,
         "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_source_validation_started": 1,
         "vllm:kvcr_source_blocks_missing:('source_missing',)": 1,
     }
     sources = ctx.get_state(ExternalKVSourceState)
@@ -499,6 +500,7 @@ def test_kvcr_remote_promotion_and_use_are_logical_and_conserving(monkeypatch):
     assert stats.reduce() == {
         "vllm:kvcr_hint_blocks_received": 1,
         "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_source_validation_started": 1,
         "vllm:kvcr_blocks_promoted": 1,
         "vllm:kvcr_blocks_used": 1,
     }
@@ -559,10 +561,11 @@ def test_kvcr_partial_physical_groups_do_not_promote_logical_block(monkeypatch):
     assert stats.reduce() == {
         "vllm:kvcr_hint_blocks_received": 1,
         "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_source_validation_started": 1,
     }
 
 
-def test_kvcr_failed_then_successful_retry_has_one_transport_terminal(monkeypatch):
+def test_kvcr_failed_then_successful_retry_promotes_realized_outcome(monkeypatch):
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
     ctx = ReqContext(
@@ -614,6 +617,9 @@ def test_kvcr_failed_then_successful_retry_has_one_transport_terminal(monkeypatc
     assert stats.reduce() == {
         "vllm:kvcr_hint_blocks_received": 1,
         "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_source_validation_started": 1,
+        "vllm:kvcr_blocks_promoted": 1,
+        "vllm:kvcr_blocks_cancelled:('after_promotion',)": 1,
     }
 
 
@@ -655,6 +661,7 @@ def test_kvcr_remote_promotion_not_used_is_cancelled_after_promotion(monkeypatch
     assert stats.reduce() == {
         "vllm:kvcr_hint_blocks_received": 1,
         "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_source_validation_started": 1,
         "vllm:kvcr_blocks_promoted": 1,
         "vllm:kvcr_blocks_cancelled:('after_promotion',)": 1,
     }
@@ -690,12 +697,11 @@ def test_kvcr_destination_capacity_decline_is_counted_once(monkeypatch):
     assert stats.reduce() == {
         "vllm:kvcr_hint_blocks_received": 1,
         "vllm:kvcr_blocks_remote_needed": 1,
-        "vllm:kvcr_source_blocks_available": 1,
         "vllm:kvcr_blocks_policy_declined:('destination_capacity',)": 1,
     }
 
 
-def test_kvcr_unattempted_hint_closes_source_resolution(monkeypatch):
+def test_kvcr_unattempted_hint_is_pre_validation_cancellation(monkeypatch):
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
     ctx = ReqContext(
@@ -719,8 +725,7 @@ def test_kvcr_unattempted_hint_closes_source_resolution(monkeypatch):
     assert stats.reduce() == {
         "vllm:kvcr_hint_blocks_received": 1,
         "vllm:kvcr_blocks_remote_needed": 1,
-        "vllm:kvcr_source_blocks_available": 1,
-        "vllm:kvcr_blocks_cancelled:('before_submit',)": 1,
+        "vllm:kvcr_blocks_cancelled:('before_source_validation',)": 1,
     }
 
 
@@ -800,9 +805,10 @@ def test_kvcr_telemetry_is_opt_in_and_namespaced_at_vllm_boundary(monkeypatch):
     assert "vllm:kvcr_hint_blocks_received" in definitions
     assert "vllm:kvcr_blocks_already_local" in definitions
     assert "vllm:kvcr_blocks_remote_needed" in definitions
+    assert "vllm:kvcr_source_validation_started" in definitions
     assert "vllm:kvcr_blocks_policy_declined" in definitions
     assert "vllm:kvcr_blocks_promoted" in definitions
-    assert "vllm:kvcr_blocks_promotion_failed" in definitions
+    assert "vllm:kvcr_blocks_promotion_failed" not in definitions
     assert "vllm:kvcr_blocks_used" in definitions
 
     kvcr = RecordingKVCR()

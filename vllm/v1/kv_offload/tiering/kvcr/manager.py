@@ -95,9 +95,9 @@ _REQUIRED_ROUTER_CAPABILITIES = {"router_hint"}
 _HINT_BLOCKS_RECEIVED_METRIC = "kvcr_hint_blocks_received"
 _BLOCKS_ALREADY_LOCAL_METRIC = "kvcr_blocks_already_local"
 _BLOCKS_REMOTE_NEEDED_METRIC = "kvcr_blocks_remote_needed"
+_SOURCE_VALIDATION_STARTED_METRIC = "kvcr_source_validation_started"
 _BLOCKS_POLICY_DECLINED_METRIC = "kvcr_blocks_policy_declined"
 _BLOCKS_PROMOTED_METRIC = "kvcr_blocks_promoted"
-_BLOCKS_PROMOTION_FAILED_METRIC = "kvcr_blocks_promotion_failed"
 _BLOCKS_USED_METRIC = "kvcr_blocks_used"
 
 logger = init_logger(__name__)
@@ -154,7 +154,7 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             labelnames=("operation",),
         ),
         _vllm_metric_name(TRANSFER_BLOCKS_METRIC): OffloadingCounterMetadata(
-            documentation="KV blocks transferred by successful KVCR operations.",
+            documentation="Logical blocks transferred by successful KVCR attempts.",
             labelnames=("operation",),
         ),
         _vllm_metric_name(TRANSFER_BLOCKS_SUBMITTED_METRIC): (
@@ -163,16 +163,20 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             )
         ),
         _vllm_metric_name(TRANSFER_BLOCKS_FAILED_METRIC): OffloadingCounterMetadata(
-            documentation="KVCR blocks that failed remote delivery.",
+            documentation="Logical blocks in KVCR attempts that failed delivery.",
             labelnames=("reason",),
         ),
         _vllm_metric_name(SOURCE_BLOCKS_AVAILABLE_METRIC): (
             OffloadingCounterMetadata(
-                documentation="Router-hinted blocks available at the KVCR source."
+                documentation=(
+                    "Logical blocks available in KVCR source-validation attempts."
+                )
             )
         ),
         _vllm_metric_name(SOURCE_BLOCKS_MISSING_METRIC): OffloadingCounterMetadata(
-            documentation="Router-hinted blocks missing at the KVCR source.",
+            documentation=(
+                "Logical blocks unavailable in KVCR source-validation attempts."
+            ),
             labelnames=("reason",),
         ),
         _vllm_metric_name(BLOCKS_CANCELLED_METRIC): OffloadingCounterMetadata(
@@ -188,21 +192,27 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _vllm_metric_name(_BLOCKS_REMOTE_NEEDED_METRIC): OffloadingCounterMetadata(
             documentation="Hinted blocks still requiring a remote KVCR source."
         ),
+        _vllm_metric_name(_SOURCE_VALIDATION_STARTED_METRIC): (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Unique remote-needed blocks that entered source validation."
+                )
+            )
+        ),
         _vllm_metric_name(_BLOCKS_POLICY_DECLINED_METRIC): OffloadingCounterMetadata(
-            documentation="Remote-needed blocks declined before transport submission.",
+            documentation="Remote-needed logical blocks declined before validation.",
             labelnames=("reason",),
         ),
         _vllm_metric_name(_BLOCKS_PROMOTED_METRIC): OffloadingCounterMetadata(
-            documentation="Remote KVCR blocks promoted into destination CPU cache."
-        ),
-        _vllm_metric_name(_BLOCKS_PROMOTION_FAILED_METRIC): (
-            OffloadingCounterMetadata(
-                documentation="Remote KVCR blocks whose promotion job failed.",
-                labelnames=("reason",),
+            documentation=(
+                "Unique remote KVCR logical blocks realized in allocated "
+                "primary-cache memory after any retry."
             )
         ),
         _vllm_metric_name(_BLOCKS_USED_METRIC): OffloadingCounterMetadata(
-            documentation="Promoted KVCR blocks consumed by the request GPU load path."
+            documentation=(
+                "Realized KVCR logical blocks consumed after GPU load completion."
+            )
         ),
         _vllm_metric_name(STATE_METRIC): OffloadingGaugeMetadata(
             documentation="Current KVCR metadata and operation counts.",
@@ -332,7 +342,6 @@ class _HintMetricState:
     used: set[ExternalBlockHash] = field(default_factory=set)
     declined: set[ExternalBlockHash] = field(default_factory=set)
     attempted: set[ExternalBlockHash] = field(default_factory=set)
-    transport_terminal: set[ExternalBlockHash] = field(default_factory=set)
     source_resolved: set[ExternalBlockHash] = field(default_factory=set)
     active_jobs: int = 0
     request_finished: bool = False
@@ -662,10 +671,6 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         ):
             return
         state.declined.add(block_hash)
-        state.source_resolved.add(block_hash)
-        self._adapter_stats.increase_counter(
-            _vllm_metric_name(SOURCE_BLOCKS_AVAILABLE_METRIC)
-        )
         self._adapter_stats.increase_counter(
             _vllm_metric_name(_BLOCKS_POLICY_DECLINED_METRIC),
             labelvalues=("destination_capacity",),
@@ -745,7 +750,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         hint_state = self._hint_metric_states.get(job_metadata.req_context.req_id)
         if hint_state is not None and frozen_remote_keys:
             hint_state.active_jobs += 1
-            hint_state.attempted.update(frozen_remote_keys)
+            self._record_source_validation_started(hint_state, set(frozen_remote_keys))
         self._jobs_by_op[op_handle] = (
             job_metadata.job_id,
             len(blocks),
@@ -847,11 +852,9 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                         for block_hash, physical_keys in remote_keys_by_hash.items()
                         if physical_keys.issubset(successful_key_set)
                     }
-                    new_terminal = (
-                        set(remote_keys_by_hash) - hint_state.transport_terminal
-                    )
-                    hint_state.transport_terminal.update(new_terminal)
-                    newly_promoted = successful_hashes & new_terminal
+                    # Promotion reflects the realized request outcome: a later
+                    # successful retry supersedes an earlier failed attempt.
+                    newly_promoted = successful_hashes - hint_state.promoted
                     if newly_promoted:
                         self._adapter_stats.increase_counter(
                             _vllm_metric_name(_BLOCKS_PROMOTED_METRIC),
@@ -920,13 +923,9 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             not_requested.difference_update(state.source_resolved)
             if not_requested:
                 self._adapter_stats.increase_counter(
-                    _vllm_metric_name(SOURCE_BLOCKS_AVAILABLE_METRIC),
-                    len(not_requested),
-                )
-                self._adapter_stats.increase_counter(
                     _vllm_metric_name(BLOCKS_CANCELLED_METRIC),
                     len(not_requested),
-                    ("before_submit",),
+                    ("before_source_validation",),
                 )
             state.request_finished = True
             self._maybe_finalize_hint_state(req_context.req_id)
@@ -939,12 +938,27 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         block_hash = self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
         if block_hash not in state.remote_needed or block_hash in state.source_resolved:
             return
+        self._record_source_validation_started(state, {block_hash})
         state.source_resolved.add(block_hash)
         self._adapter_stats.increase_counter(
             _vllm_metric_name(SOURCE_BLOCKS_MISSING_METRIC),
             labelvalues=("source_missing",),
         )
         _record_dynamo_inventory_mismatch("source_missing", 1)
+
+    def _record_source_validation_started(
+        self,
+        state: _HintMetricState,
+        block_hashes: set[ExternalBlockHash],
+    ) -> None:
+        newly_started = block_hashes - state.attempted
+        if not newly_started:
+            return
+        state.attempted.update(newly_started)
+        self._adapter_stats.increase_counter(
+            _vllm_metric_name(_SOURCE_VALIDATION_STARTED_METRIC),
+            len(newly_started),
+        )
 
     def _maybe_finalize_hint_state(self, request_id: str) -> None:
         state = self._hint_metric_states.get(request_id)
