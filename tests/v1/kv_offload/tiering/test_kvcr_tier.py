@@ -540,6 +540,12 @@ def test_kvcr_logical_metrics_exclude_opportunistic_non_hint_blocks(monkeypatch)
             req_context=ctx,
         )
     )
+    _, delivered, request_id = kvcr.deliver_calls[-1]
+    assert request_id == "req"
+    assert set(delivered) == {
+        BlockKey(bytes(hinted)),
+        BlockKey(bytes(opportunistic)),
+    }
     assert list(tier.get_finished_jobs()) == [JobResult(17, True)]
     tier.record_blocks_used([hinted, opportunistic], ctx)
     tier.on_request_finished(ctx)
@@ -554,6 +560,49 @@ def test_kvcr_logical_metrics_exclude_opportunistic_non_hint_blocks(monkeypatch)
         "vllm:kvcr_source_validation_started": 1,
         "vllm:kvcr_blocks_promoted": 1,
         "vllm:kvcr_blocks_used": 1,
+    }
+
+
+def test_kvcr_pure_opportunistic_job_does_not_hold_hint_lifecycle(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
+    ctx = ReqContext(
+        req_id="req",
+        kv_transfer_params={
+            "router_hint": {
+                "source_control_endpoint": "tcp://source:1234",
+                "source_inventory_epoch": 7,
+                "block_hashes": [123],
+                "start_block": 0,
+                "hinted_blocks": 1,
+            }
+        },
+    )
+    sources = ExternalKVSourceState()
+    ctx.set_state(sources)
+    opportunistic = make_offload_key((999).to_bytes(8, "big"), 0)
+    sources.lookup_sources[opportunistic] = "kvcr_p2p"
+
+    tier.on_new_request(ctx)
+    tier.submit_load(
+        TransferJob(
+            job_id=18,
+            keys=[opportunistic],
+            block_ids=np.array([0], dtype=np.int64),
+            is_promotion=True,
+            req_context=ctx,
+        )
+    )
+    tier.on_request_finished(ctx)
+    assert "req" not in tier._hint_metric_states
+    assert list(tier.get_finished_jobs()) == [JobResult(18, True)]
+
+    stats = tier.get_stats()
+    assert stats is not None
+    assert stats.reduce() == {
+        "vllm:kvcr_hint_blocks_received": 1,
+        "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_blocks_cancelled:('before_source_validation',)": 1,
     }
 
 
