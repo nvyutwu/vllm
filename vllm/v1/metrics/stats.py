@@ -273,6 +273,8 @@ class PrefillStats:
     num_cached_tokens: int = 0
     num_local_cached_tokens: int = 0
     num_external_cached_tokens: int = 0
+    num_local_cpu_cached_tokens: int = 0
+    num_kvcr_p2p_cached_tokens: int = 0
     num_cache_creation_tokens: int = 0
 
     def set(
@@ -280,15 +282,24 @@ class PrefillStats:
         num_prompt_tokens: int,
         num_local_cached_tokens: int,
         num_external_cached_tokens: int,
+        num_local_cpu_cached_tokens: int = 0,
+        num_kvcr_p2p_cached_tokens: int = 0,
     ):
         num_cached_tokens = num_local_cached_tokens + num_external_cached_tokens
         assert num_cached_tokens <= num_prompt_tokens
+        assert (
+            0
+            <= num_local_cpu_cached_tokens + num_kvcr_p2p_cached_tokens
+            <= num_external_cached_tokens
+        )
 
         self.num_prompt_tokens = num_prompt_tokens
         self.num_computed_tokens = num_prompt_tokens - num_cached_tokens
         self.num_cached_tokens = num_cached_tokens
         self.num_local_cached_tokens = num_local_cached_tokens
         self.num_external_cached_tokens = num_external_cached_tokens
+        self.num_local_cpu_cached_tokens = num_local_cpu_cached_tokens
+        self.num_kvcr_p2p_cached_tokens = num_kvcr_p2p_cached_tokens
 
     def finalize(self, num_cached_tokens: int) -> None:
         assert num_cached_tokens >= 0
@@ -303,7 +314,10 @@ class PromptTokenStats:
 
     Fields:
         computed: Tokens prefilled locally (actual compute work).
-        local_cache_hit: Tokens from local prefix cache.
+        local_gpu: Tokens from the local GPU prefix cache.
+        local_cpu: Tokens restored from local CPU offload.
+        kvcr_p2p: Tokens restored from KVCR P2P.
+        local_cache_hit: Legacy alias for local_gpu.
         external_kv_transfer: Tokens from external KV transfer.
         cached_tokens: Tokens skipped during prefill (from scheduler).
         total: Total prompt tokens.
@@ -315,11 +329,17 @@ class PromptTokenStats:
 
     ALL_SOURCES: tuple[str, ...] = (
         "local_compute",
+        "local_gpu",
+        "local_cpu",
+        "kvcr_p2p",
         "local_cache_hit",
         "external_kv_transfer",
     )
 
     computed: int = 0
+    local_gpu: int = 0
+    local_cpu: int = 0
+    kvcr_p2p: int = 0
     local_cache_hit: int = 0
     external_kv_transfer: int = 0
     cached_tokens: int = 0
@@ -332,12 +352,18 @@ class PromptTokenStats:
         self.total += prefill_stats.num_prompt_tokens
 
         self.local_cache_hit += prefill_stats.num_local_cached_tokens
+        self.local_gpu += prefill_stats.num_local_cached_tokens
+        self.local_cpu += prefill_stats.num_local_cpu_cached_tokens
+        self.kvcr_p2p += prefill_stats.num_kvcr_p2p_cached_tokens
         self.external_kv_transfer += prefill_stats.num_external_cached_tokens
 
     def get_by_source(self, source: str) -> int:
         """Get token count by source label."""
         source_map = {
             "local_compute": self.computed,
+            "local_gpu": self.local_gpu,
+            "local_cpu": self.local_cpu,
+            "kvcr_p2p": self.kvcr_p2p,
             "local_cache_hit": self.local_cache_hit,
             "external_kv_transfer": self.external_kv_transfer,
         }

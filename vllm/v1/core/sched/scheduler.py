@@ -780,6 +780,7 @@ class Scheduler(SchedulerInterface):
                     continue
 
                 num_external_computed_tokens = 0
+                external_token_sources: dict[str, int] = {}
                 load_kv_async = False
                 connector_prefix_cache_queries, connector_prefix_cache_hits = 0, 0
                 did_prefix_cache_lookup = False
@@ -839,6 +840,12 @@ class Scheduler(SchedulerInterface):
                         else:
                             num_external_computed_tokens = ext_tokens
 
+                        external_token_sources = (
+                            self.connector.get_matched_token_sources(
+                                request, num_external_computed_tokens
+                            )
+                        )
+
                         if hit_diverged and num_external_computed_tokens == 0:
                             # No external tokens back the deeper local hit, so its
                             # resume boundary would have no valid Mamba state.
@@ -879,6 +886,12 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
+                            num_local_cpu_cached_tokens=external_token_sources.get(
+                                "local_cpu", 0
+                            ),
+                            num_kvcr_p2p_cached_tokens=external_token_sources.get(
+                                "kvcr_p2p", 0
+                            ),
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
@@ -39,6 +39,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowSpec,
 )
 from vllm.v1.kv_offload.base import (
+    ExternalKVSourceState,
     GPULoadStoreSpec,
     Locality,
     LookupResult,
@@ -63,6 +64,45 @@ logger = init_logger(__name__)
 KV_LOAD_TIERS_KEY = "kv_load_tiers"
 MATCHER_MEDIUM_KEY = "medium"
 MATCHER_LOCALITY_KEY = "locality"
+
+
+def _summarize_external_token_sources(
+    *,
+    start_token: int,
+    end_token: int,
+    group_chunks: Sequence[tuple[int, Sequence[OffloadKey]]],
+    key_sources: Mapping[OffloadKey, str],
+) -> dict[str, int]:
+    """Conservatively attribute external tokens across required KV groups.
+
+    A segment is KVCR P2P when any required group was promoted from KVCR. It
+    is local CPU only when every required group resolved from local CPU.
+    Unknown or non-KVCR secondary origins retain the legacy aggregate label.
+    """
+    if not 0 <= start_token <= end_token:
+        raise ValueError("token interval must be non-negative and ordered")
+    totals: dict[str, int] = {}
+    position = start_token
+    while position < end_token:
+        next_boundary = end_token
+        sources: list[str | None] = []
+        for tokens_per_chunk, keys in group_chunks:
+            if tokens_per_chunk <= 0:
+                raise ValueError("tokens_per_chunk must be positive")
+            chunk_idx = position // tokens_per_chunk
+            next_boundary = min(next_boundary, (chunk_idx + 1) * tokens_per_chunk)
+            key = keys[chunk_idx] if chunk_idx < len(keys) else None
+            sources.append(key_sources.get(key) if key is not None else None)
+
+        if "kvcr_p2p" in sources:
+            source = "kvcr_p2p"
+        elif sources and all(item == "local_cpu" for item in sources):
+            source = "local_cpu"
+        else:
+            source = "external_kv_transfer"
+        totals[source] = totals.get(source, 0) + next_boundary - position
+        position = next_boundary
+    return totals
 
 
 @dataclass(slots=True)
@@ -343,6 +383,7 @@ class RequestOffloadState:
     partial_tail_boundary: int | None = None
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    matched_token_sources: dict[str, int] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -1029,9 +1070,35 @@ class OffloadingConnectorScheduler:
                 self._maybe_observe_lookup_async_delay(req_status)
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
+        if num_hit_tokens:
+            source_state = req_status.req_context.get_state(ExternalKVSourceState)
+            req_status.matched_token_sources = _summarize_external_token_sources(
+                start_token=num_computed_tokens,
+                end_token=num_computed_tokens + num_hit_tokens,
+                group_chunks=tuple(
+                    (config.tokens_per_chunk, state.offload_keys)
+                    for config, state in zip(
+                        self.config.kv_group_configs, req_status.group_states
+                    )
+                ),
+                key_sources=(source_state.resolved if source_state else {}),
+            )
+        else:
+            req_status.matched_token_sources = {}
+
         self._touch(req_status)
 
         return num_hit_tokens, bool(num_hit_tokens)
+
+    def get_matched_token_sources(
+        self, request: Request, num_external_tokens: int
+    ) -> dict[str, int]:
+        if num_external_tokens <= 0:
+            return {}
+        sources = dict(self._req_status[request.request_id].matched_token_sources)
+        if sum(sources.values()) != num_external_tokens:
+            return {"external_kv_transfer": num_external_tokens}
+        return sources
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int

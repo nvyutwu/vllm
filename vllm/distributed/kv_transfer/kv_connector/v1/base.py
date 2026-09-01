@@ -506,6 +506,18 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def get_matched_token_sources(
+        self, request: "Request", num_external_tokens: int
+    ) -> dict[str, int]:
+        """Return the bounded source split for the most recent prefix match.
+
+        Connectors without provider-specific attribution retain the legacy
+        aggregate. Provider-aware connectors override this method.
+        """
+        if num_external_tokens <= 0:
+            return {}
+        return {"external_kv_transfer": num_external_tokens}
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

@@ -236,12 +236,20 @@ def test_prompt_token_stats_mixed_sources():
         num_prompt_tokens=1000,
         num_local_cached_tokens=400,
         num_external_cached_tokens=200,
+        num_local_cpu_cached_tokens=64,
+        num_kvcr_p2p_cached_tokens=128,
     )
     stats.update_from_output(prefill_stats)
 
     assert stats.computed == 400
     assert stats.local_cache_hit == 400
     assert stats.external_kv_transfer == 200
+    assert stats.local_gpu == 400
+    assert stats.local_cpu == 64
+    assert stats.kvcr_p2p == 128
+    assert stats.get_by_source("local_gpu") == 400
+    assert stats.get_by_source("local_cpu") == 64
+    assert stats.get_by_source("kvcr_p2p") == 128
     assert stats.cached_tokens == 600
     assert stats.total == 1000
 

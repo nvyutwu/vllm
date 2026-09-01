@@ -18,6 +18,9 @@ from tests.v1.kv_connector.unit.offloading_connector.utils import (
 from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
 from vllm.config import KVEventsConfig
 from vllm.distributed.kv_events import MEDIUM_CPU, BlockRemoved, BlockStored
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+    scheduler as scheduler_module,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMetadata,
@@ -49,6 +52,7 @@ from vllm.v1.kv_offload.base import (
     Medium,
     OffloadingEvent,
     OffloadingManager,
+    OffloadKey,
     OffloadPolicy,
     ReqContext,
     RequestOffloadingContext,
@@ -403,8 +407,7 @@ def test_scheduler_reports_transfer_job_wait_and_size(request_runner):
     assert reduced[f"{_ConnectorMetricName.STORE_CHUNKS}_sum"] == 1
     assert (
         reduced[
-            f"{_ConnectorMetricName.STORE_CHUNKS_BY_KV_CACHE_KIND}:"
-            "('full_attention',)"
+            f"{_ConnectorMetricName.STORE_CHUNKS_BY_KV_CACHE_KIND}:('full_attention',)"
         ]
         == 1
     )
@@ -427,8 +430,7 @@ def test_scheduler_reports_transfer_job_wait_and_size(request_runner):
     assert reduced[f"{_ConnectorMetricName.LOAD_TOKENS}_sum"] == tokens_per_chunk
     assert (
         reduced[
-            f"{_ConnectorMetricName.LOAD_CHUNKS_BY_KV_CACHE_KIND}:"
-            "('full_attention',)"
+            f"{_ConnectorMetricName.LOAD_CHUNKS_BY_KV_CACHE_KIND}:('full_attention',)"
         ]
         == 1
     )
@@ -3418,3 +3420,20 @@ def test_chunked_local_attention_reports_its_chunk_window():
     assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=1024) == 8
     # Partial chunks round up, so the reachable tail is never understated.
     assert get_sliding_window_size_in_chunks(spec, tokens_per_chunk=3000) == 3
+
+
+def test_external_token_sources_use_p2p_when_any_required_group_is_remote():
+    """A token is P2P-attributed when any required KV group came from KVCR."""
+    group_0 = (OffloadKey(b"g0-c0"), OffloadKey(b"g0-c1"))
+    group_1 = (OffloadKey(b"g1-c0"), OffloadKey(b"g1-c1"))
+    assert scheduler_module._summarize_external_token_sources(
+        start_token=0,
+        end_token=96,
+        group_chunks=((64, group_0), (64, group_1)),
+        key_sources={
+            group_0[0]: "local_cpu",
+            group_1[0]: "local_cpu",
+            group_0[1]: "local_cpu",
+            group_1[1]: "kvcr_p2p",
+        },
+    ) == {"local_cpu": 64, "kvcr_p2p": 32}

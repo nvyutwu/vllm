@@ -104,6 +104,14 @@ class ReqContext:
         return self._state.get(cls)
 
 
+@dataclass
+class ExternalKVSourceState:
+    """Per-request origins for offload keys resolved by tiered lookup."""
+
+    promoted: dict[OffloadKey, str] = field(default_factory=dict)
+    resolved: dict[OffloadKey, str] = field(default_factory=dict)
+
+
 class LookupResult(Enum):
     """Result of OffloadingManager.lookup()."""
 

@@ -152,6 +152,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             request, num_computed_tokens
         )
 
+    def get_matched_token_sources(
+        self, request: "Request", num_external_tokens: int
+    ) -> dict[str, int]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_matched_token_sources(
+            request, num_external_tokens
+        )
+
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):

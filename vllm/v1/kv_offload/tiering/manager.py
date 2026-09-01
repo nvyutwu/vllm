@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
 )
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.base import (
+    ExternalKVSourceState,
     LoadStoreSpec,
     LookupResult,
     OffloadingEvent,
@@ -378,6 +379,9 @@ class TieringOffloadingManager(OffloadingManager):
             lookup_duration,
         )
         if primary_hit is LookupResult.HIT:
+            source_state = req_context.get_state(ExternalKVSourceState)
+            if source_state is not None:
+                source_state.resolved[key] = source_state.promoted.get(key, "local_cpu")
             return LookupResult.HIT
         if primary_hit is LookupResult.HIT_PENDING:
             return LookupResult.HIT_PENDING
@@ -401,6 +405,14 @@ class TieringOffloadingManager(OffloadingManager):
                     lookup_duration,
                 )
                 promoted = self._initiate_promotion(i, key, req_context)
+                if promoted:
+                    source_state = req_context.get_state(ExternalKVSourceState)
+                    if source_state is not None:
+                        source_state.promoted[key] = (
+                            "kvcr_p2p"
+                            if tier.tier_type.lower() == "kvcr"
+                            else "external_kv_transfer"
+                        )
                 return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
@@ -713,6 +725,7 @@ class TieringOffloadingManager(OffloadingManager):
         Only stores REQUEST_LEVEL tier decisions for use in prepare_store.
         """
         state = RequestState(req_context=req_context)
+        req_context.set_state(ExternalKVSourceState())
         self._metrics.on_new_request(req_context)
         for tier_idx, tier in enumerate(self.secondary_tiers):
             if tier_idx == exclude_tier_idx:

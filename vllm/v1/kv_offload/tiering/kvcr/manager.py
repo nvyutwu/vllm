@@ -13,10 +13,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from kvcr import (
+    BLOCKS_CANCELLED_METRIC,
     DURATION_METRIC,
     KVCR,
+    SOURCE_BLOCKS_AVAILABLE_METRIC,
+    SOURCE_BLOCKS_MISSING_METRIC,
     STATE_METRIC,
+    TRANSFER_BLOCKS_FAILED_METRIC,
     TRANSFER_BLOCKS_METRIC,
+    TRANSFER_BLOCKS_SUBMITTED_METRIC,
     TRANSFER_BYTES_METRIC,
     KVCRBindings,
 )
@@ -86,6 +91,10 @@ if TYPE_CHECKING:
 
 _REQUIRED_ROUTER_CAPABILITIES = {"router_hint"}
 
+_HINT_BLOCKS_RECEIVED_METRIC = "kvcr_hint_blocks_received"
+_BLOCKS_ALREADY_LOCAL_METRIC = "kvcr_blocks_already_local"
+_BLOCKS_REMOTE_NEEDED_METRIC = "kvcr_blocks_remote_needed"
+
 logger = init_logger(__name__)
 
 _BUILTIN_POLICIES: dict[str, type[KVCachePolicy]] = {
@@ -132,6 +141,37 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _vllm_metric_name(TRANSFER_BLOCKS_METRIC): OffloadingCounterMetadata(
             documentation="KV blocks transferred by successful KVCR operations.",
             labelnames=("operation",),
+        ),
+        _vllm_metric_name(TRANSFER_BLOCKS_SUBMITTED_METRIC): (
+            OffloadingCounterMetadata(
+                documentation="KVCR blocks accepted by the remote transport."
+            )
+        ),
+        _vllm_metric_name(TRANSFER_BLOCKS_FAILED_METRIC): OffloadingCounterMetadata(
+            documentation="KVCR blocks that failed remote delivery.",
+            labelnames=("reason",),
+        ),
+        _vllm_metric_name(SOURCE_BLOCKS_AVAILABLE_METRIC): (
+            OffloadingCounterMetadata(
+                documentation="Router-hinted blocks available at the KVCR source."
+            )
+        ),
+        _vllm_metric_name(SOURCE_BLOCKS_MISSING_METRIC): OffloadingCounterMetadata(
+            documentation="Router-hinted blocks missing at the KVCR source.",
+            labelnames=("reason",),
+        ),
+        _vllm_metric_name(BLOCKS_CANCELLED_METRIC): OffloadingCounterMetadata(
+            documentation="KVCR blocks cancelled before reaching a terminal stage.",
+            labelnames=("stage",),
+        ),
+        _vllm_metric_name(_HINT_BLOCKS_RECEIVED_METRIC): OffloadingCounterMetadata(
+            documentation="Unique router-hinted blocks received by KVCR."
+        ),
+        _vllm_metric_name(_BLOCKS_ALREADY_LOCAL_METRIC): OffloadingCounterMetadata(
+            documentation="Hinted blocks already local when KVCR rechecked them."
+        ),
+        _vllm_metric_name(_BLOCKS_REMOTE_NEEDED_METRIC): OffloadingCounterMetadata(
+            documentation="Hinted blocks still requiring a remote KVCR source."
         ),
         _vllm_metric_name(STATE_METRIC): OffloadingGaugeMetadata(
             documentation="Current KVCR metadata and operation counts.",
@@ -248,6 +288,12 @@ class _FrameworkPinAdapter:
 class _RouterHint:
     source: str
     block_hashes: frozenset[ExternalBlockHash]
+
+
+@dataclass
+class _HintMetricState:
+    block_hashes: frozenset[ExternalBlockHash]
+    classified: set[ExternalBlockHash]
 
 
 def _parse_router_hint(
@@ -474,11 +520,31 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         self._local_dram_mmap = local_mapping
         self._finished_jobs: list[JobResult] = []
         self._jobs_by_op: dict[OpHandle, _JobState] = {}
+        self._telemetry_enabled = enable_telemetry
+        self._adapter_stats = OffloadingConnectorStats()
+        self._hint_metric_states: dict[str, _HintMetricState] = {}
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         block_key = self._key_hint_adapter.encode(key)
-        status, _ = self._kvcr.query((block_key,), req_context.req_id)[0]
+        status, tier = self._kvcr.query((block_key,), req_context.req_id)[0]
+        state = self._hint_metric_states.get(req_context.req_id)
+        block_hash = maybe_convert_block_hash(BlockHash(get_offload_block_hash(key)))
+        if (
+            state is not None
+            and block_hash in state.block_hashes
+            and block_hash not in state.classified
+        ):
+            if status is QueryStatus.HIT and tier is CacheTier.LOCAL_G2:
+                self._adapter_stats.increase_counter(
+                    _vllm_metric_name(_BLOCKS_ALREADY_LOCAL_METRIC)
+                )
+                state.classified.add(block_hash)
+            elif status is QueryStatus.FETCHABLE and tier is CacheTier.REMOTE_G2:
+                self._adapter_stats.increase_counter(
+                    _vllm_metric_name(_BLOCKS_REMOTE_NEEDED_METRIC)
+                )
+                state.classified.add(block_hash)
         if status is QueryStatus.FETCHING:
             return LookupResult.RETRY
         if status in (QueryStatus.HIT, QueryStatus.FETCHABLE):
@@ -545,6 +611,12 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             for metrics in stats.data.values():
                 for name in tuple(metrics):
                     metrics[_vllm_metric_name(name)] = metrics.pop(name)
+        if not self._adapter_stats.is_empty():
+            if stats is None:
+                stats = self._adapter_stats
+            else:
+                stats.aggregate(self._adapter_stats)
+            self._adapter_stats = OffloadingConnectorStats()
         return stats
 
     @override
@@ -600,6 +672,15 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         hint = _parse_router_hint(req_context.kv_transfer_params)
         if hint is not None:
+            if self._telemetry_enabled:
+                self._adapter_stats.increase_counter(
+                    _vllm_metric_name(_HINT_BLOCKS_RECEIVED_METRIC),
+                    len(hint.block_hashes),
+                )
+                self._hint_metric_states[req_context.req_id] = _HintMetricState(
+                    block_hashes=hint.block_hashes,
+                    classified=set(),
+                )
             self._kvcr.submit_hint(
                 (),
                 src=hint.source,
@@ -611,6 +692,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        self._hint_metric_states.pop(req_context.req_id, None)
         self._kvcr.discard_hint(req_context.req_id)
 
     @override
