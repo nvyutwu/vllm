@@ -666,6 +666,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             state is None
             or block_hash not in state.remote_needed
             or block_hash in state.declined
+            or block_hash in state.attempted
             or source_state is None
             or source_state.lookup_sources.get(key) != "kvcr_p2p"
         ):
@@ -752,7 +753,10 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             {
                 block_hash: keys
                 for block_hash, keys in frozen_remote_keys.items()
-                if block_hash in hint_state.remote_needed
+                if (
+                    block_hash in hint_state.remote_needed
+                    and block_hash not in hint_state.declined
+                )
             }
             if hint_state is not None
             else {}
@@ -945,7 +949,11 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         if state is None:
             return
         block_hash = self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
-        if block_hash not in state.remote_needed or block_hash in state.source_resolved:
+        if (
+            block_hash not in state.remote_needed
+            or block_hash in state.declined
+            or block_hash in state.source_resolved
+        ):
             return
         self._record_source_validation_started(state, {block_hash})
         state.source_resolved.add(block_hash)
