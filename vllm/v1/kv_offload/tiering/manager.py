@@ -525,8 +525,6 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
-        for tier in self.secondary_tiers:
-            tier.record_blocks_used(keys, req_context)
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override
@@ -555,6 +553,8 @@ class TieringOffloadingManager(OffloadingManager):
             req_context: Per-request context.
         """
         self.primary_tier.complete_load(keys, req_context)
+        for tier in self.secondary_tiers:
+            tier.record_blocks_used(keys, req_context)
 
     @override
     def prepare_store(

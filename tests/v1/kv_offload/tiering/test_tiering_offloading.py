@@ -318,6 +318,24 @@ class TestTieringOffloadingManager:
             self.manager._process_finished_jobs()
         completed.assert_called_once_with(to_keys([1, 2]), _CTX, False)
 
+    def test_blocks_are_used_only_after_gpu_load_completes(self, manager_setup):
+        from unittest.mock import patch
+
+        keys = to_keys([1])
+        with (
+            patch.object(self.primary_tier, "prepare_load"),
+            patch.object(self.primary_tier, "complete_load"),
+            patch.object(self.secondary_tier1, "record_blocks_used") as first_used,
+            patch.object(self.secondary_tier2, "record_blocks_used") as second_used,
+        ):
+            self.manager.prepare_load(keys, _CTX)
+            first_used.assert_not_called()
+            second_used.assert_not_called()
+
+            self.manager.complete_load(keys, _CTX)
+            first_used.assert_called_once_with(keys, _CTX)
+            second_used.assert_called_once_with(keys, _CTX)
+
     def test_successful_promotion_finalizes_primary_with_success(self, manager_setup):
         from unittest.mock import patch
 

@@ -331,6 +331,9 @@ class _HintMetricState:
     promoted: set[ExternalBlockHash] = field(default_factory=set)
     used: set[ExternalBlockHash] = field(default_factory=set)
     declined: set[ExternalBlockHash] = field(default_factory=set)
+    attempted: set[ExternalBlockHash] = field(default_factory=set)
+    transport_terminal: set[ExternalBlockHash] = field(default_factory=set)
+    source_resolved: set[ExternalBlockHash] = field(default_factory=set)
     active_jobs: int = 0
     request_finished: bool = False
 
@@ -393,14 +396,15 @@ class _VllmKeyHintAdapter:
         return maybe_convert_block_hash(block_hash)
 
 
-# Job ID, remaining blocks, aggregate success, and successful load keys.
+# Job ID, remaining blocks, aggregate success, successful load keys, request ID,
+# and all physical KV-group keys required by each remote logical block.
 _JobState = tuple[
     int,
     int,
     bool,
     set[OffloadKey] | None,
     str | None,
-    frozenset[ExternalBlockHash],
+    dict[ExternalBlockHash, frozenset[OffloadKey]],
 ]
 
 
@@ -627,6 +631,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 and status in (QueryStatus.HIT, QueryStatus.FETCHING)
             ),
         )
+        if status is QueryStatus.MISS:
+            self._record_source_miss(key, req_context)
         if status is QueryStatus.FETCHING:
             return LookupResult.RETRY
         if status in (QueryStatus.HIT, QueryStatus.FETCHABLE):
@@ -656,6 +662,10 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         ):
             return
         state.declined.add(block_hash)
+        state.source_resolved.add(block_hash)
+        self._adapter_stats.increase_counter(
+            _vllm_metric_name(SOURCE_BLOCKS_AVAILABLE_METRIC)
+        )
         self._adapter_stats.increase_counter(
             _vllm_metric_name(_BLOCKS_POLICY_DECLINED_METRIC),
             labelvalues=("destination_capacity",),
@@ -719,22 +729,30 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             blocks, request_id=job_metadata.req_context.req_id
         )
         source_state = job_metadata.req_context.get_state(ExternalKVSourceState)
-        remote_hashes = frozenset(
-            self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
-            for key in job_metadata.keys
-            if source_state is not None
-            and source_state.lookup_sources.get(key) == "kvcr_p2p"
-        )
+        remote_keys_by_hash: dict[ExternalBlockHash, set[OffloadKey]] = {}
+        for key in job_metadata.keys:
+            if (
+                source_state is None
+                or source_state.lookup_sources.get(key) != "kvcr_p2p"
+            ):
+                continue
+            block_hash = self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
+            remote_keys_by_hash.setdefault(block_hash, set()).add(key)
+        frozen_remote_keys = {
+            block_hash: frozenset(keys)
+            for block_hash, keys in remote_keys_by_hash.items()
+        }
         hint_state = self._hint_metric_states.get(job_metadata.req_context.req_id)
-        if hint_state is not None and remote_hashes:
+        if hint_state is not None and frozen_remote_keys:
             hint_state.active_jobs += 1
+            hint_state.attempted.update(frozen_remote_keys)
         self._jobs_by_op[op_handle] = (
             job_metadata.job_id,
             len(blocks),
             True,
             set(),
             job_metadata.req_context.req_id,
-            remote_hashes,
+            frozen_remote_keys,
         )
 
     @override
@@ -757,7 +775,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             True,
             None,
             None,
-            frozenset(),
+            {},
         )
 
     @override
@@ -799,7 +817,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 success,
                 successful_keys,
                 request_id,
-                remote_hashes,
+                remote_keys_by_hash,
             ) = job_state
             remaining -= len(entries)
             success = success and all(entry.success for entry in entries.values())
@@ -816,21 +834,24 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     success,
                     successful_keys,
                     request_id,
-                    remote_hashes,
+                    remote_keys_by_hash,
                 )
                 continue
             self._jobs_by_op.pop(op_handle, None)
-            if request_id is not None and remote_hashes:
+            if request_id is not None and remote_keys_by_hash:
                 hint_state = self._hint_metric_states.get(request_id)
                 if hint_state is not None:
-                    successful_hashes = (
-                        frozenset(
-                            self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
-                            for key in successful_keys or ()
-                        )
-                        & remote_hashes
+                    successful_key_set = successful_keys or set()
+                    successful_hashes = {
+                        block_hash
+                        for block_hash, physical_keys in remote_keys_by_hash.items()
+                        if physical_keys.issubset(successful_key_set)
+                    }
+                    new_terminal = (
+                        set(remote_keys_by_hash) - hint_state.transport_terminal
                     )
-                    newly_promoted = successful_hashes - hint_state.promoted
+                    hint_state.transport_terminal.update(new_terminal)
+                    newly_promoted = successful_hashes & new_terminal
                     if newly_promoted:
                         self._adapter_stats.increase_counter(
                             _vllm_metric_name(_BLOCKS_PROMOTED_METRIC),
@@ -895,9 +916,35 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 )
                 state.classified.update(unclassified)
                 state.remote_needed.update(unclassified)
+            not_requested = state.remote_needed - state.attempted - state.declined
+            not_requested.difference_update(state.source_resolved)
+            if not_requested:
+                self._adapter_stats.increase_counter(
+                    _vllm_metric_name(SOURCE_BLOCKS_AVAILABLE_METRIC),
+                    len(not_requested),
+                )
+                self._adapter_stats.increase_counter(
+                    _vllm_metric_name(BLOCKS_CANCELLED_METRIC),
+                    len(not_requested),
+                    ("before_submit",),
+                )
             state.request_finished = True
             self._maybe_finalize_hint_state(req_context.req_id)
         self._kvcr.discard_hint(req_context.req_id)
+
+    def _record_source_miss(self, key: OffloadKey, req_context: ReqContext) -> None:
+        state = self._hint_metric_states.get(req_context.req_id)
+        if state is None:
+            return
+        block_hash = self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
+        if block_hash not in state.remote_needed or block_hash in state.source_resolved:
+            return
+        state.source_resolved.add(block_hash)
+        self._adapter_stats.increase_counter(
+            _vllm_metric_name(SOURCE_BLOCKS_MISSING_METRIC),
+            labelvalues=("source_missing",),
+        )
+        _record_dynamo_inventory_mismatch("source_missing", 1)
 
     def _maybe_finalize_hint_state(self, request_id: str) -> None:
         state = self._hint_metric_states.get(request_id)
