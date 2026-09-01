@@ -99,6 +99,11 @@ _SOURCE_VALIDATION_STARTED_METRIC = "kvcr_source_validation_started"
 _BLOCKS_POLICY_DECLINED_METRIC = "kvcr_blocks_policy_declined"
 _BLOCKS_PROMOTED_METRIC = "kvcr_blocks_promoted"
 _BLOCKS_USED_METRIC = "kvcr_blocks_used"
+# Target-observed inventory faults. These have NO source-side counterpart:
+# the source ledger only records reasons it can attribute to a source
+# attempt, so `layout_mismatch` and `worker_unreachable` would otherwise
+# be visible nowhere.
+_TARGET_INVENTORY_MISMATCH_METRIC = "kvcr_target_inventory_mismatch"
 
 logger = init_logger(__name__)
 
@@ -110,14 +115,10 @@ _BUILTIN_POLICIES: dict[str, type[KVCachePolicy]] = {
 }
 
 
-def _record_dynamo_inventory_mismatch(reason: str, blocks: int) -> None:
-    """Forward bounded source-inventory mismatches when running under Dynamo."""
-    try:
-        from dynamo.llm import record_kv_inventory_mismatch
-
-        record_kv_inventory_mismatch(reason, blocks)
-    except (ImportError, AttributeError):
-        logger.debug("Dynamo inventory mismatch sink is unavailable")
+_TARGET_INVENTORY_MISMATCH_REASONS = frozenset(
+    {"layout_mismatch", "worker_unreachable", "source_missing",
+     "source_validation_timeout", "epoch_mismatch"}
+)
 
 
 def _resolve_policy(name: str | None) -> KVCachePolicy | None:
@@ -164,6 +165,15 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         ),
         _vllm_metric_name(TRANSFER_BLOCKS_FAILED_METRIC): OffloadingCounterMetadata(
             documentation="Logical blocks in KVCR attempts that failed delivery.",
+            labelnames=("reason",),
+        ),
+        _vllm_metric_name(
+            _TARGET_INVENTORY_MISMATCH_METRIC
+        ): OffloadingCounterMetadata(
+            documentation=(
+                "Blocks rejected by target-side inventory reconciliation, by "
+                "bounded reason. Target-only: no source attempt is implied."
+            ),
             labelnames=("reason",),
         ),
         _vllm_metric_name(SOURCE_BLOCKS_AVAILABLE_METRIC): (
@@ -583,7 +593,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     framework_control=control,
                     key_hint_adapter=self._key_hint_adapter,
                     inventory_sink=(self._record_inventory if events_enabled else None),
-                    inventory_mismatch_sink=_record_dynamo_inventory_mismatch,
+                    inventory_mismatch_sink=self._record_target_inventory_mismatch,
                     stats_factory=(
                         OffloadingConnectorStats if enable_telemetry else None
                     ),
@@ -961,7 +971,27 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             _vllm_metric_name(SOURCE_BLOCKS_MISSING_METRIC),
             labelvalues=("source_missing",),
         )
-        _record_dynamo_inventory_mismatch("source_missing", 1)
+
+    def _record_target_inventory_mismatch(self, reason: str, blocks: int) -> None:
+        """Count blocks rejected by *target-side* inventory reconciliation.
+
+        KVCR calls this only from `_report_inventory_mismatch`, the path that
+        deliberately raises no source attempt. Reasons it carries -- notably
+        `layout_mismatch` and a target terminal-wait timeout reported as
+        `worker_unreachable` -- have no entry in
+        `vllm:kvcr_source_blocks_missing_total`, so the two families partition
+        rather than overlap.
+        """
+        if not self._telemetry_enabled or blocks <= 0:
+            return
+        if reason not in _TARGET_INVENTORY_MISMATCH_REASONS:
+            logger.warning("Unbounded KVCR inventory mismatch reason %r", reason)
+            return
+        self._adapter_stats.increase_counter(
+            _vllm_metric_name(_TARGET_INVENTORY_MISMATCH_METRIC),
+            blocks,
+            (reason,),
+        )
 
     def _record_source_validation_started(
         self,
