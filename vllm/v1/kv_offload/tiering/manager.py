@@ -379,6 +379,8 @@ class TieringOffloadingManager(OffloadingManager):
             lookup_duration,
         )
         if primary_hit is LookupResult.HIT:
+            for tier in self.secondary_tiers:
+                tier.record_primary_hit(key, req_context)
             source_state = req_context.get_state(ExternalKVSourceState)
             if source_state is not None:
                 source_state.resolved[key] = source_state.promoted.get(key, "local_cpu")
@@ -408,11 +410,11 @@ class TieringOffloadingManager(OffloadingManager):
                 if promoted:
                     source_state = req_context.get_state(ExternalKVSourceState)
                     if source_state is not None:
-                        source_state.promoted[key] = (
-                            "kvcr_p2p"
-                            if tier.tier_type.lower() == "kvcr"
-                            else "external_kv_transfer"
+                        source_state.promoted[key] = source_state.lookup_sources.get(
+                            key, "external_kv_transfer"
                         )
+                else:
+                    tier.record_promotion_allocation_failure(key, req_context)
                 return LookupResult.MISS if not promoted else LookupResult.HIT_PENDING
             if result is LookupResult.RETRY:
                 any_retry = True
@@ -523,6 +525,8 @@ class TieringOffloadingManager(OffloadingManager):
         Returns:
             LoadStoreSpec for reading from primary tier.
         """
+        for tier in self.secondary_tiers:
+            tier.record_blocks_used(keys, req_context)
         return self.primary_tier.prepare_load(keys, req_context)
 
     @override

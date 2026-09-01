@@ -27,6 +27,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
 from vllm.v1.kv_offload.base import (
+    ExternalKVSourceState,
     LookupResult,
     Medium,
     OffloadKey,
@@ -79,6 +80,7 @@ class RecordingKVCR:
                 str,
                 object | None,
                 str | None,
+                int | None,
             ]
         ] = []
         self.discard_hint_calls: list[str] = []
@@ -88,6 +90,7 @@ class RecordingKVCR:
         self.deposit_calls: list[tuple[OpHandle, dict[BlockKey, MemDescriptor]]] = []
         self.completed: list[tuple[OpHandle, dict[BlockKey, OpEntryResult]]] = []
         self._next_op_handle = 1
+        self.closed = False
 
     def submit_hint(
         self,
@@ -96,9 +99,17 @@ class RecordingKVCR:
         mode: str = "copy",
         hints: object | None = None,
         request_id: str | None = None,
+        source_inventory_epoch: int | None = None,
     ) -> None:
         self.submit_hint_calls.append(
-            (list(block_key_list), src, mode, hints, request_id)
+            (
+                list(block_key_list),
+                src,
+                mode,
+                hints,
+                request_id,
+                source_inventory_epoch,
+            )
         )
 
     def discard_hint(self, request_id: str) -> None:
@@ -158,7 +169,7 @@ class RecordingKVCR:
         return stats
 
     def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class _ExternalPolicy(FIFOPolicy):
@@ -194,6 +205,9 @@ def _make_tier(
     g3: dict[str, object] | None = None,
     control_ports: list[int] | None = None,
     data_parallel_rank_local: int | None = None,
+    inventory_epoch: int | None = None,
+    operation_timeout_ms: int = 1000,
+    drain_timeout_ms: int | None = None,
 ) -> KVCRSecondaryTierManager:
     def make_control(_bind_host, bind_port, advertise_host):
         return _StubControlChannel(f"tcp://{advertise_host}:{int(bind_port)}")
@@ -234,6 +248,9 @@ def _make_tier(
         compatibility_digest=compatibility_digest,
         policy=policy,
         g3=g3,
+        inventory_epoch=inventory_epoch,
+        operation_timeout_ms=operation_timeout_ms,
+        drain_timeout_ms=drain_timeout_ms,
     )
 
 
@@ -248,6 +265,7 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
         secondary_g2_slots=1,
         control_ports=[7001, 7002],
         data_parallel_rank_local=1,
+        inventory_epoch=8080,
     )
 
     assert kvcr.framework_control is not None
@@ -259,6 +277,8 @@ def test_kvcr_tier_configures_service_for_local_dp_rank(monkeypatch):
         compatibility_digest="Opaque-Digest",
     )
     assert kvcr.backend_configs.local_dram is None
+    assert kvcr.config is not None
+    assert kvcr.config.inventory_epoch == 8080
 
 
 def test_kvcr_tier_converts_g3_paths(monkeypatch, tmp_path):
@@ -284,8 +304,10 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
     tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
     router_hint = {
         "source_control_endpoint": "tcp://source:1234",
-        "block_hashes": [123],
-        "target_cached_prefix_blocks": 0,
+        "source_inventory_epoch": 77,
+        "block_hashes": [121, 122, 123, 124],
+        "start_block": 2,
+        "hinted_blocks": 1,
     }
     ctx = ReqContext(req_id="req", kv_transfer_params={"router_hint": router_hint})
     key = make_offload_key((123).to_bytes(8, "big"), 0)
@@ -294,8 +316,13 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
 
     tier.on_new_request(ctx)
     assert len(kvcr.submit_hint_calls) == 1
-    _, source, mode, hint, request_id = kvcr.submit_hint_calls[0]
-    assert (source, mode, request_id) == ("tcp://source:1234", "copy", "req")
+    _, source, mode, hint, request_id, source_epoch = kvcr.submit_hint_calls[0]
+    assert (source, mode, request_id, source_epoch) == (
+        "tcp://source:1234",
+        "copy",
+        "req",
+        77,
+    )
     bindings = kvcr.constructor_bindings
     assert bindings is not None
     assert bindings.key_hint_adapter is not None
@@ -304,6 +331,8 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
         BlockKey(bytes(same_hash_other_group)), hint
     )
     assert not bindings.key_hint_adapter.matches(BlockKey(bytes(other_key)), hint)
+    outside_slice = make_offload_key((124).to_bytes(8, "big"), 0)
+    assert not bindings.key_hint_adapter.matches(BlockKey(bytes(outside_slice)), hint)
 
     kvcr.query_status = QueryStatus.HIT
     assert tier.lookup(key, ctx) is LookupResult.HIT
@@ -356,6 +385,199 @@ def test_kvcr_tier_maps_query_status(monkeypatch, status, expected):
     tier = _make_tier(monkeypatch, kvcr)
 
     assert tier.lookup(OffloadKey(b"k0"), ReqContext(req_id="req")) is expected
+
+
+def test_kvcr_hint_reconciliation_conserves_h_equals_a_plus_n(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
+    ctx = ReqContext(
+        req_id="req",
+        kv_transfer_params={
+            "router_hint": {
+                "source_control_endpoint": "tcp://source:1234",
+                "source_inventory_epoch": 7,
+                "block_hashes": [123, 124],
+                "start_block": 0,
+                "hinted_blocks": 2,
+            }
+        },
+    )
+    ctx.set_state(ExternalKVSourceState())
+    local_key = make_offload_key((123).to_bytes(8, "big"), 0)
+    remote_key = make_offload_key((124).to_bytes(8, "big"), 0)
+
+    tier.on_new_request(ctx)
+    kvcr.query_status = QueryStatus.HIT
+    assert tier.lookup(local_key, ctx) is LookupResult.HIT
+    kvcr.query_status = QueryStatus.MISS
+    assert tier.lookup(remote_key, ctx) is LookupResult.MISS
+    tier.on_request_finished(ctx)
+
+    stats = tier.get_stats()
+    assert stats is not None
+    assert stats.reduce() == {
+        "vllm:kvcr_hint_blocks_received": 2,
+        "vllm:kvcr_blocks_already_local": 1,
+        "vllm:kvcr_blocks_remote_needed": 1,
+    }
+    sources = ctx.get_state(ExternalKVSourceState)
+    assert sources is not None
+    assert sources.lookup_sources[local_key] == "local_cpu"
+
+
+def test_kvcr_counts_framework_cpu_hit_as_already_local(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
+    ctx = ReqContext(
+        req_id="req",
+        kv_transfer_params={
+            "router_hint": {
+                "source_control_endpoint": "tcp://source:1234",
+                "source_inventory_epoch": 7,
+                "block_hashes": [123],
+                "start_block": 0,
+                "hinted_blocks": 1,
+            }
+        },
+    )
+    key = make_offload_key((123).to_bytes(8, "big"), 0)
+
+    tier.on_new_request(ctx)
+    tier.record_primary_hit(key, ctx)
+    tier.on_request_finished(ctx)
+
+    stats = tier.get_stats()
+    assert stats is not None
+    assert stats.reduce() == {
+        "vllm:kvcr_hint_blocks_received": 1,
+        "vllm:kvcr_blocks_already_local": 1,
+    }
+
+
+def test_kvcr_remote_promotion_and_use_are_logical_and_conserving(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
+    ctx = ReqContext(
+        req_id="req",
+        kv_transfer_params={
+            "router_hint": {
+                "source_control_endpoint": "tcp://source:1234",
+                "source_inventory_epoch": 7,
+                "block_hashes": [123],
+                "start_block": 0,
+                "hinted_blocks": 1,
+            }
+        },
+    )
+    ctx.set_state(ExternalKVSourceState())
+    key = make_offload_key((123).to_bytes(8, "big"), 0)
+    same_hash_other_group = make_offload_key((123).to_bytes(8, "big"), 1)
+
+    tier.on_new_request(ctx)
+    kvcr.query_status = QueryStatus.FETCHABLE
+    assert tier.lookup(key, ctx) is LookupResult.HIT
+    assert tier.lookup(same_hash_other_group, ctx) is LookupResult.HIT
+    sources = ctx.get_state(ExternalKVSourceState)
+    assert sources is not None
+    assert sources.lookup_sources[key] == "kvcr_p2p"
+    tier.submit_load(
+        TransferJob(
+            job_id=17,
+            keys=[key, same_hash_other_group],
+            block_ids=np.array([0, 1], dtype=np.int64),
+            is_promotion=True,
+            req_context=ctx,
+        )
+    )
+    assert list(tier.get_finished_jobs()) == [JobResult(17, True)]
+    tier.record_blocks_used([key, same_hash_other_group], ctx)
+    tier.on_request_finished(ctx)
+
+    stats = tier.get_stats()
+    assert stats is not None
+    assert stats.reduce() == {
+        "vllm:kvcr_hint_blocks_received": 1,
+        "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_blocks_promoted": 1,
+        "vllm:kvcr_blocks_used": 1,
+    }
+
+
+def test_kvcr_remote_promotion_not_used_is_cancelled_after_promotion(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
+    ctx = ReqContext(
+        req_id="req",
+        kv_transfer_params={
+            "router_hint": {
+                "source_control_endpoint": "tcp://source:1234",
+                "source_inventory_epoch": 7,
+                "block_hashes": [123],
+                "start_block": 0,
+                "hinted_blocks": 1,
+            }
+        },
+    )
+    ctx.set_state(ExternalKVSourceState())
+    key = make_offload_key((123).to_bytes(8, "big"), 0)
+
+    tier.on_new_request(ctx)
+    kvcr.query_status = QueryStatus.FETCHABLE
+    assert tier.lookup(key, ctx) is LookupResult.HIT
+    tier.submit_load(
+        TransferJob(
+            job_id=17,
+            keys=[key],
+            block_ids=np.array([0], dtype=np.int64),
+            is_promotion=True,
+            req_context=ctx,
+        )
+    )
+    assert list(tier.get_finished_jobs()) == [JobResult(17, True)]
+    tier.on_request_finished(ctx)
+
+    stats = tier.get_stats()
+    assert stats is not None
+    assert stats.reduce() == {
+        "vllm:kvcr_hint_blocks_received": 1,
+        "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_blocks_promoted": 1,
+        "vllm:kvcr_blocks_cancelled:('after_promotion',)": 1,
+    }
+
+
+def test_kvcr_destination_capacity_decline_is_counted_once(monkeypatch):
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
+    ctx = ReqContext(
+        req_id="req",
+        kv_transfer_params={
+            "router_hint": {
+                "source_control_endpoint": "tcp://source:1234",
+                "source_inventory_epoch": 7,
+                "block_hashes": [123],
+                "start_block": 0,
+                "hinted_blocks": 1,
+            }
+        },
+    )
+    ctx.set_state(ExternalKVSourceState())
+    key = make_offload_key((123).to_bytes(8, "big"), 0)
+
+    tier.on_new_request(ctx)
+    kvcr.query_status = QueryStatus.FETCHABLE
+    assert tier.lookup(key, ctx) is LookupResult.HIT
+    tier.record_promotion_allocation_failure(key, ctx)
+    tier.record_promotion_allocation_failure(key, ctx)
+    tier.on_request_finished(ctx)
+
+    stats = tier.get_stats()
+    assert stats is not None
+    assert stats.reduce() == {
+        "vllm:kvcr_hint_blocks_received": 1,
+        "vllm:kvcr_blocks_remote_needed": 1,
+        "vllm:kvcr_blocks_policy_declined:('destination_capacity',)": 1,
+    }
 
 
 def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
@@ -434,6 +656,10 @@ def test_kvcr_telemetry_is_opt_in_and_namespaced_at_vllm_boundary(monkeypatch):
     assert "vllm:kvcr_hint_blocks_received" in definitions
     assert "vllm:kvcr_blocks_already_local" in definitions
     assert "vllm:kvcr_blocks_remote_needed" in definitions
+    assert "vllm:kvcr_blocks_policy_declined" in definitions
+    assert "vllm:kvcr_blocks_promoted" in definitions
+    assert "vllm:kvcr_blocks_promotion_failed" in definitions
+    assert "vllm:kvcr_blocks_used" in definitions
 
     kvcr = RecordingKVCR()
     tier = _make_tier(monkeypatch, kvcr, enable_telemetry=True)
@@ -585,3 +811,27 @@ def test_kvcr_tier_waits_for_all_completions_and_drains(monkeypatch):
     assert result.job_id == 13
     assert not result.success
     assert result.successful_keys == {keys[0]}
+
+
+def test_kvcr_tier_drain_is_bounded_under_peer_loss(monkeypatch):
+    class StuckKVCR(RecordingKVCR):
+        def deliver(self, blocks, request_id=None):
+            op_handle = self._next_op_handle
+            self._next_op_handle += 1
+            self.deliver_calls.append((op_handle, dict(blocks), request_id))
+            return op_handle
+
+    kvcr = StuckKVCR()
+    tier = _make_tier(
+        monkeypatch,
+        kvcr,
+        operation_timeout_ms=5,
+        drain_timeout_ms=10,
+    )
+    tier.submit_load(_job(23, ReqContext(req_id="req")))
+
+    with pytest.raises(TimeoutError, match="KVCR drain timed out"):
+        tier.drain_jobs()
+
+    tier.shutdown()
+    assert kvcr.closed

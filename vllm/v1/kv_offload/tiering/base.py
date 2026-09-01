@@ -257,6 +257,22 @@ class SecondaryTierManager(ABC):
         """
         return
 
+    def record_primary_hit(self, key: OffloadKey, req_context: ReqContext) -> None:
+        """Observe a primary CPU hit before secondary-tier lookup short-circuits."""
+        return
+
+    def record_promotion_allocation_failure(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> None:
+        """Observe a block declined before secondary-tier transfer submission."""
+        return
+
+    def record_blocks_used(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        """Observe promoted blocks selected for the GPU load path."""
+        return
+
     @abstractmethod
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         """

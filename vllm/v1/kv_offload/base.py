@@ -110,6 +110,7 @@ class ExternalKVSourceState:
 
     promoted: dict[OffloadKey, str] = field(default_factory=dict)
     resolved: dict[OffloadKey, str] = field(default_factory=dict)
+    lookup_sources: dict[OffloadKey, str] = field(default_factory=dict)
 
 
 class LookupResult(Enum):

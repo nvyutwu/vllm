@@ -8,7 +8,7 @@ import socket
 import time
 import uuid
 from collections.abc import Collection, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -66,6 +66,7 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.kv_offload.base import (
+    ExternalKVSourceState,
     LookupResult,
     Medium,
     OffloadingCounterMetadata,
@@ -94,6 +95,10 @@ _REQUIRED_ROUTER_CAPABILITIES = {"router_hint"}
 _HINT_BLOCKS_RECEIVED_METRIC = "kvcr_hint_blocks_received"
 _BLOCKS_ALREADY_LOCAL_METRIC = "kvcr_blocks_already_local"
 _BLOCKS_REMOTE_NEEDED_METRIC = "kvcr_blocks_remote_needed"
+_BLOCKS_POLICY_DECLINED_METRIC = "kvcr_blocks_policy_declined"
+_BLOCKS_PROMOTED_METRIC = "kvcr_blocks_promoted"
+_BLOCKS_PROMOTION_FAILED_METRIC = "kvcr_blocks_promotion_failed"
+_BLOCKS_USED_METRIC = "kvcr_blocks_used"
 
 logger = init_logger(__name__)
 
@@ -103,6 +108,16 @@ _BUILTIN_POLICIES: dict[str, type[KVCachePolicy]] = {
     "g3_fifo": G3FIFOPolicy,
     "g3_lru": G3LRUPolicy,
 }
+
+
+def _record_dynamo_inventory_mismatch(reason: str, blocks: int) -> None:
+    """Forward bounded source-inventory mismatches when running under Dynamo."""
+    try:
+        from dynamo.llm import record_kv_inventory_mismatch
+
+        record_kv_inventory_mismatch(reason, blocks)
+    except (ImportError, AttributeError):
+        logger.debug("Dynamo inventory mismatch sink is unavailable")
 
 
 def _resolve_policy(name: str | None) -> KVCachePolicy | None:
@@ -172,6 +187,22 @@ def _kvcr_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         ),
         _vllm_metric_name(_BLOCKS_REMOTE_NEEDED_METRIC): OffloadingCounterMetadata(
             documentation="Hinted blocks still requiring a remote KVCR source."
+        ),
+        _vllm_metric_name(_BLOCKS_POLICY_DECLINED_METRIC): OffloadingCounterMetadata(
+            documentation="Remote-needed blocks declined before transport submission.",
+            labelnames=("reason",),
+        ),
+        _vllm_metric_name(_BLOCKS_PROMOTED_METRIC): OffloadingCounterMetadata(
+            documentation="Remote KVCR blocks promoted into destination CPU cache."
+        ),
+        _vllm_metric_name(_BLOCKS_PROMOTION_FAILED_METRIC): (
+            OffloadingCounterMetadata(
+                documentation="Remote KVCR blocks whose promotion job failed.",
+                labelnames=("reason",),
+            )
+        ),
+        _vllm_metric_name(_BLOCKS_USED_METRIC): OffloadingCounterMetadata(
+            documentation="Promoted KVCR blocks consumed by the request GPU load path."
         ),
         _vllm_metric_name(STATE_METRIC): OffloadingGaugeMetadata(
             documentation="Current KVCR metadata and operation counts.",
@@ -287,6 +318,8 @@ class _FrameworkPinAdapter:
 @dataclass(frozen=True)
 class _RouterHint:
     source: str
+    source_inventory_epoch: int
+    start_block: int
     block_hashes: frozenset[ExternalBlockHash]
 
 
@@ -294,6 +327,12 @@ class _RouterHint:
 class _HintMetricState:
     block_hashes: frozenset[ExternalBlockHash]
     classified: set[ExternalBlockHash]
+    remote_needed: set[ExternalBlockHash] = field(default_factory=set)
+    promoted: set[ExternalBlockHash] = field(default_factory=set)
+    used: set[ExternalBlockHash] = field(default_factory=set)
+    declined: set[ExternalBlockHash] = field(default_factory=set)
+    active_jobs: int = 0
+    request_finished: bool = False
 
 
 def _parse_router_hint(
@@ -311,12 +350,28 @@ def _parse_router_hint(
     if not isinstance(block_hashes, list) or not block_hashes:
         return None
 
+    source_inventory_epoch = router_hint.get("source_inventory_epoch")
+    start_block = router_hint.get("start_block")
+    hinted_blocks = router_hint.get("hinted_blocks")
+    for value in (source_inventory_epoch, start_block, hinted_blocks):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return None
+    if hinted_blocks == 0 or start_block + hinted_blocks > len(block_hashes):
+        return None
+
     planned_hashes: set[ExternalBlockHash] = set()
-    for block_hash in block_hashes:
+    for block_hash in block_hashes[start_block : start_block + hinted_blocks]:
         if isinstance(block_hash, bool) or not isinstance(block_hash, (bytes, int)):
             return None
         planned_hashes.add(block_hash)
-    return _RouterHint(location, frozenset(planned_hashes))
+    if len(planned_hashes) != hinted_blocks:
+        return None
+    return _RouterHint(
+        location,
+        source_inventory_epoch,
+        start_block,
+        frozenset(planned_hashes),
+    )
 
 
 class _VllmKeyHintAdapter:
@@ -333,9 +388,20 @@ class _VllmKeyHintAdapter:
         block_hash = BlockHash(get_offload_block_hash(OffloadKey(key)))
         return maybe_convert_block_hash(block_hash) in hint.block_hashes
 
+    def logical_key(self, key: BlockKey) -> ExternalBlockHash:
+        block_hash = BlockHash(get_offload_block_hash(OffloadKey(key)))
+        return maybe_convert_block_hash(block_hash)
+
 
 # Job ID, remaining blocks, aggregate success, and successful load keys.
-_JobState = tuple[int, int, bool, set[OffloadKey] | None]
+_JobState = tuple[
+    int,
+    int,
+    bool,
+    set[OffloadKey] | None,
+    str | None,
+    frozenset[ExternalBlockHash],
+]
 
 
 class KVCRSecondaryTierManager(SecondaryTierManager):
@@ -369,6 +435,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         compatibility_digest: str | None = None,
         policy: str | None = None,
         g3: dict[str, Any] | None = None,
+        inventory_epoch: int | None = None,
+        drain_timeout_ms: int | None = None,
     ) -> None:
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         selected_policy = _resolve_policy(policy)
@@ -382,6 +450,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             raise ValueError(
                 f"KVCR secondary tier requires router capabilities: {sorted(missing)}"
             )
+        if inventory_epoch is not None and (
+            isinstance(inventory_epoch, bool)
+            or not isinstance(inventory_epoch, int)
+            or not 0 <= inventory_epoch < 2**64
+        ):
+            raise ValueError("inventory_epoch must be an unsigned 64-bit integer")
+        if drain_timeout_ms is not None and drain_timeout_ms <= 0:
+            raise ValueError("drain_timeout_ms must be positive")
         events_enabled = offloading_spec.kv_events_config.enable_kv_cache_events
         self_describing_events = (
             offloading_spec.kv_events_config.self_describing_kv_events
@@ -484,6 +560,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     operation_timeout_ms=operation_timeout_ms,
                     nixl_agent_name=nixl_agent_name,
                     nixl_listen_port=_nixl_listen_port,
+                    inventory_epoch=inventory_epoch,
                 ),
                 KVCRBindings(
                     request_pin=self._framework_pin_adapter.request_pin,
@@ -493,6 +570,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     framework_control=control,
                     key_hint_adapter=self._key_hint_adapter,
                     inventory_sink=(self._record_inventory if events_enabled else None),
+                    inventory_mismatch_sink=_record_dynamo_inventory_mismatch,
                     stats_factory=(
                         OffloadingConnectorStats if enable_telemetry else None
                     ),
@@ -523,33 +601,105 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         self._telemetry_enabled = enable_telemetry
         self._adapter_stats = OffloadingConnectorStats()
         self._hint_metric_states: dict[str, _HintMetricState] = {}
+        self._drain_timeout_s = (
+            drain_timeout_ms
+            if drain_timeout_ms is not None
+            else max(2 * operation_timeout_ms, 1000)
+        ) / 1000
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         block_key = self._key_hint_adapter.encode(key)
         status, tier = self._kvcr.query((block_key,), req_context.req_id)[0]
-        state = self._hint_metric_states.get(req_context.req_id)
-        block_hash = maybe_convert_block_hash(BlockHash(get_offload_block_hash(key)))
-        if (
-            state is not None
-            and block_hash in state.block_hashes
-            and block_hash not in state.classified
-        ):
-            if status is QueryStatus.HIT and tier is CacheTier.LOCAL_G2:
-                self._adapter_stats.increase_counter(
-                    _vllm_metric_name(_BLOCKS_ALREADY_LOCAL_METRIC)
-                )
-                state.classified.add(block_hash)
-            elif status is QueryStatus.FETCHABLE and tier is CacheTier.REMOTE_G2:
-                self._adapter_stats.increase_counter(
-                    _vllm_metric_name(_BLOCKS_REMOTE_NEEDED_METRIC)
-                )
-                state.classified.add(block_hash)
+        source_state = req_context.get_state(ExternalKVSourceState)
+        if source_state is not None:
+            if tier is CacheTier.LOCAL_G2:
+                source_state.lookup_sources[key] = "local_cpu"
+            elif tier is CacheTier.REMOTE_G2:
+                source_state.lookup_sources[key] = "kvcr_p2p"
+            else:
+                source_state.lookup_sources[key] = "external_kv_transfer"
+        self._classify_hint_block(
+            key,
+            req_context,
+            already_local=(
+                tier is CacheTier.LOCAL_G2
+                and status in (QueryStatus.HIT, QueryStatus.FETCHING)
+            ),
+        )
         if status is QueryStatus.FETCHING:
             return LookupResult.RETRY
         if status in (QueryStatus.HIT, QueryStatus.FETCHABLE):
             return LookupResult.HIT
         return LookupResult.MISS
+
+    @override
+    def record_primary_hit(self, key: OffloadKey, req_context: ReqContext) -> None:
+        self._classify_hint_block(key, req_context, already_local=True)
+        source_state = req_context.get_state(ExternalKVSourceState)
+        if source_state is not None:
+            source_state.lookup_sources[key] = "local_cpu"
+
+    @override
+    def record_promotion_allocation_failure(
+        self, key: OffloadKey, req_context: ReqContext
+    ) -> None:
+        state = self._hint_metric_states.get(req_context.req_id)
+        source_state = req_context.get_state(ExternalKVSourceState)
+        block_hash = self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
+        if (
+            state is None
+            or block_hash not in state.remote_needed
+            or block_hash in state.declined
+            or source_state is None
+            or source_state.lookup_sources.get(key) != "kvcr_p2p"
+        ):
+            return
+        state.declined.add(block_hash)
+        self._adapter_stats.increase_counter(
+            _vllm_metric_name(_BLOCKS_POLICY_DECLINED_METRIC),
+            labelvalues=("destination_capacity",),
+        )
+
+    @override
+    def record_blocks_used(
+        self, keys: Collection[OffloadKey], req_context: ReqContext
+    ) -> None:
+        state = self._hint_metric_states.get(req_context.req_id)
+        if state is None:
+            return
+        used = {
+            self._key_hint_adapter.logical_key(BlockKey(bytes(key))) for key in keys
+        } & state.promoted
+        newly_used = used - state.used
+        if newly_used:
+            state.used.update(newly_used)
+            self._adapter_stats.increase_counter(
+                _vllm_metric_name(_BLOCKS_USED_METRIC), len(newly_used)
+            )
+
+    def _classify_hint_block(
+        self,
+        key: OffloadKey,
+        req_context: ReqContext,
+        *,
+        already_local: bool,
+    ) -> None:
+        state = self._hint_metric_states.get(req_context.req_id)
+        if state is None:
+            return
+        block_hash = self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
+        if block_hash not in state.block_hashes or block_hash in state.classified:
+            return
+        metric = (
+            _BLOCKS_ALREADY_LOCAL_METRIC
+            if already_local
+            else _BLOCKS_REMOTE_NEEDED_METRIC
+        )
+        self._adapter_stats.increase_counter(_vllm_metric_name(metric))
+        state.classified.add(block_hash)
+        if not already_local:
+            state.remote_needed.add(block_hash)
 
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
@@ -568,11 +718,23 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         op_handle = self._kvcr.deliver(
             blocks, request_id=job_metadata.req_context.req_id
         )
+        source_state = job_metadata.req_context.get_state(ExternalKVSourceState)
+        remote_hashes = frozenset(
+            self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
+            for key in job_metadata.keys
+            if source_state is not None
+            and source_state.lookup_sources.get(key) == "kvcr_p2p"
+        )
+        hint_state = self._hint_metric_states.get(job_metadata.req_context.req_id)
+        if hint_state is not None and remote_hashes:
+            hint_state.active_jobs += 1
         self._jobs_by_op[op_handle] = (
             job_metadata.job_id,
             len(blocks),
             True,
             set(),
+            job_metadata.req_context.req_id,
+            remote_hashes,
         )
 
     @override
@@ -594,6 +756,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             len(blocks),
             True,
             None,
+            None,
+            frozenset(),
         )
 
     @override
@@ -629,7 +793,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             job_state = self._jobs_by_op.get(op_handle)
             if job_state is None:
                 continue
-            job_id, remaining, success, successful_keys = job_state
+            (
+                job_id,
+                remaining,
+                success,
+                successful_keys,
+                request_id,
+                remote_hashes,
+            ) = job_state
             remaining -= len(entries)
             success = success and all(entry.success for entry in entries.values())
             if successful_keys is not None:
@@ -644,9 +815,30 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     remaining,
                     success,
                     successful_keys,
+                    request_id,
+                    remote_hashes,
                 )
                 continue
             self._jobs_by_op.pop(op_handle, None)
+            if request_id is not None and remote_hashes:
+                hint_state = self._hint_metric_states.get(request_id)
+                if hint_state is not None:
+                    successful_hashes = (
+                        frozenset(
+                            self._key_hint_adapter.logical_key(BlockKey(bytes(key)))
+                            for key in successful_keys or ()
+                        )
+                        & remote_hashes
+                    )
+                    newly_promoted = successful_hashes - hint_state.promoted
+                    if newly_promoted:
+                        self._adapter_stats.increase_counter(
+                            _vllm_metric_name(_BLOCKS_PROMOTED_METRIC),
+                            len(newly_promoted),
+                        )
+                        hint_state.promoted.update(newly_promoted)
+                    hint_state.active_jobs -= 1
+                    self._maybe_finalize_hint_state(request_id)
             results.append(
                 JobResult(
                     job_id=job_id,
@@ -687,26 +879,60 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 mode="copy",
                 request_id=req_context.req_id,
                 hints=hint,
+                source_inventory_epoch=hint.source_inventory_epoch,
             )
         return RequestOffloadingContext()
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
-        self._hint_metric_states.pop(req_context.req_id, None)
+        state = self._hint_metric_states.get(req_context.req_id)
+        if state is not None:
+            unclassified = state.block_hashes - state.classified
+            if unclassified:
+                self._adapter_stats.increase_counter(
+                    _vllm_metric_name(_BLOCKS_REMOTE_NEEDED_METRIC),
+                    len(unclassified),
+                )
+                state.classified.update(unclassified)
+                state.remote_needed.update(unclassified)
+            state.request_finished = True
+            self._maybe_finalize_hint_state(req_context.req_id)
         self._kvcr.discard_hint(req_context.req_id)
+
+    def _maybe_finalize_hint_state(self, request_id: str) -> None:
+        state = self._hint_metric_states.get(request_id)
+        if state is not None and state.request_finished and state.active_jobs == 0:
+            cancelled_after_promotion = state.promoted - state.used
+            if cancelled_after_promotion:
+                self._adapter_stats.increase_counter(
+                    _vllm_metric_name(BLOCKS_CANCELLED_METRIC),
+                    len(cancelled_after_promotion),
+                    ("after_promotion",),
+                )
+            self._hint_metric_states.pop(request_id, None)
 
     @override
     def drain_jobs(self) -> None:
+        deadline = time.monotonic() + self._drain_timeout_s
         while self._jobs_by_op or self._framework_pin_adapter.has_active_pins():
             drained = self._poll_finished_jobs()
             if drained:
                 self._finished_jobs.extend(drained)
             else:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "KVCR drain timed out with "
+                        f"{len(self._jobs_by_op)} jobs and "
+                        f"active_pins={self._framework_pin_adapter.has_active_pins()}"
+                    )
                 time.sleep(0.001)
 
     @override
     def shutdown(self) -> None:
-        self.drain_jobs()
+        try:
+            self.drain_jobs()
+        except TimeoutError:
+            logger.warning("KVCR drain timed out during shutdown", exc_info=True)
         # TODO: Keep registered buffers alive if KVCR.close() fails.
         self._kvcr.close()
         if self._local_dram_mmap is not None:
