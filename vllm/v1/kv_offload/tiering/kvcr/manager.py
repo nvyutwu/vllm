@@ -748,16 +748,25 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             for block_hash, keys in remote_keys_by_hash.items()
         }
         hint_state = self._hint_metric_states.get(job_metadata.req_context.req_id)
-        if hint_state is not None and frozen_remote_keys:
+        metric_remote_keys = (
+            {
+                block_hash: keys
+                for block_hash, keys in frozen_remote_keys.items()
+                if block_hash in hint_state.remote_needed
+            }
+            if hint_state is not None
+            else {}
+        )
+        if hint_state is not None and metric_remote_keys:
             hint_state.active_jobs += 1
-            self._record_source_validation_started(hint_state, set(frozen_remote_keys))
+            self._record_source_validation_started(hint_state, set(metric_remote_keys))
         self._jobs_by_op[op_handle] = (
             job_metadata.job_id,
             len(blocks),
             True,
             set(),
             job_metadata.req_context.req_id,
-            frozen_remote_keys,
+            metric_remote_keys,
         )
 
     @override
