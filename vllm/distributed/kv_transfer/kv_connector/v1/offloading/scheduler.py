@@ -318,6 +318,24 @@ class SchedulerOffloadConfig(NamedTuple):
                 )
             )
         kv_group_configs = tuple(kv_group_configs_list)
+        # Nothing else reports these, and a KV-event consumer that assumes a
+        # single block size will silently discard whatever does not match it.
+        # `emitted_block_size` is the value stamped on every BlockStored this
+        # tier publishes (see events.py `block_size=tokens_per_hash`), so a
+        # router expecting the device block will reject all of them.
+        for config in kv_group_configs:
+            logger.info(
+                "KV offload group %d (%s): tokens_per_block=%d "
+                "tokens_per_chunk=%d hashes_per_chunk=%d emitted_block_size=%d",
+                config.group_idx,
+                type(
+                    kv_cache_config.kv_cache_groups[config.group_idx].kv_cache_spec
+                ).__name__,
+                config.tokens_per_block,
+                config.tokens_per_chunk,
+                config.hashes_per_chunk,
+                config.tokens_per_chunk // config.hashes_per_chunk,
+            )
         group_block_sizes = {config.tokens_per_block for config in kv_group_configs}
         has_partial_recurrent_group = any(
             config.requires_cow_source

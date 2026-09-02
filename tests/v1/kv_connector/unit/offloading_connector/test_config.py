@@ -727,3 +727,159 @@ def test_blocks_per_chunk_must_be_positive():
 
     with pytest.raises(ValueError, match="greater than 0"):
         build_offloading_config(config, _make_kv_cache_config())
+
+
+# ---------------------------------------------------------------------------
+# Kimi-K3 shape characterization.
+#
+# Purpose: determine, without a GPU or model weights, what block sizes a
+# Kimi-K3-shaped hybrid config actually puts on the wire, and whether they
+# match what the Dynamo KV router demands.
+#
+# Background: the router derives ONE expected block size, the main-attention
+# group's block times decode_context_parallel_size, in
+# dynamo/components/src/dynamo/vllm/cache_info.py:86-88. It then validates
+# EVERY KV event against that single value in
+# dynamo/lib/kv-router/src/zmq_wire/convert.rs:274-284, and `break`s on the
+# first mismatch, discarding the rest of the event.
+#
+# On the live shadow five distinct sizes were observed being rejected: 128,
+# 1536, 6784, 1664 and 8192, against a required 12288. These tests exist to
+# reproduce that multi-granularity stream deterministically.
+#
+# Run with -s to read the emitted table.
+# ---------------------------------------------------------------------------
+
+# Kimi-K3 production shape, from moonshotai/kimi-k3/nvcf-conf.yaml and the
+# engine's own startup log:
+#   "KV-event block size 12288 = main-attention block 1536 x dcp 8"
+_K3_MAIN_ATTENTION_BLOCK = 1536
+_K3_DCP = 8
+# ParallelConfig requires tp_size divisible by dcp_size; Kimi-K3 runs tp8 dcp8.
+_K3_TP = 8
+_K3_PREFIX_MATCH_UNIT = 128
+_K3_ROUTER_EXPECTED_BLOCK = _K3_MAIN_ATTENTION_BLOCK * _K3_DCP  # 12288
+
+
+def _make_k3_shaped_kv_cache_config(mamba_block_size: int) -> KVCacheConfig:
+    """MLA attention plus one KDA/Mamba group, as Kimi-K3 resolves."""
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["mla_layer"], _mla_spec(block_size=_K3_MAIN_ATTENTION_BLOCK)
+            ),
+            KVCacheGroupSpec(
+                ["kda_layer"],
+                MambaSpec(
+                    block_size=mamba_block_size,
+                    shapes=((1, 1),),
+                    dtypes=(torch.float32,),
+                    mamba_cache_mode="align",
+                ),
+            ),
+        ],
+    )
+
+
+# Divisors of 12288 so resolve_kv_cache_block_sizes' divisibility check passes.
+# The real KDA block size is not known; sweeping brackets it.
+@pytest.mark.parametrize("mamba_block_size", [128, 1536, 6144, 12288])
+def test_k3_shape_event_block_sizes_vs_router_expectation(mamba_block_size: int):
+    """Characterize what each group puts on the wire for a Kimi-K3 shape.
+
+    Asserts only structural invariants. The printed table is the deliverable:
+    it says which granularities the router would reject and why.
+    """
+    config = _make_vllm_config(
+        tensor_parallel_size=_K3_TP, decode_context_parallel_size=_K3_DCP
+    )
+    # MagicMock makes speculative_config truthy, which trips the EAGLE/MTP
+    # draft-group detection at scheduler.py:285 and would confound
+    # supports_partial_tail. Kimi-K3 has no speculative config.
+    config.speculative_config = None
+    config.cache_config.block_size = _K3_MAIN_ATTENTION_BLOCK
+    config.cache_config.prefix_match_unit = _K3_PREFIX_MATCH_UNIT
+
+    kv_cache_config = _make_k3_shaped_kv_cache_config(mamba_block_size)
+    offloading_config = build_offloading_config(config, kv_cache_config)
+    scheduler_config = SchedulerOffloadConfig.from_spec(
+        MockOffloadingSpec(offloading_config),
+        config,
+        kv_cache_config,
+    )
+
+    tokens_per_hash = offloading_config.cache.tokens_per_hash
+
+    print(f"\n=== Kimi-K3 shape, mamba block {mamba_block_size} ===")
+    print(f"router expects (device tier)      : {_K3_ROUTER_EXPECTED_BLOCK}")
+    print(f"global tokens_per_hash            : {tokens_per_hash}")
+    print(f"blocks_per_chunk                  : {offloading_config.cache.blocks_per_chunk}")
+    print(f"supports_partial_tail             : {scheduler_config.supports_partial_tail}")
+    print(f"{'group':<6}{'kind':<18}{'tokens_per_block':>18}"
+          f"{'tokens_per_chunk':>18}{'hashes_per_chunk':>18}{'EMITTED':>10}")
+
+    emitted_sizes = []
+    for idx, (group, group_cfg) in enumerate(
+        zip(offloading_config.groups, scheduler_config.kv_group_configs)
+    ):
+        kind = type(kv_cache_config.kv_cache_groups[idx].kv_cache_spec).__name__
+        # This is exactly what offloading/events.py:192 and :308 stamp as the
+        # event's `block_size`.
+        emitted = group_cfg.tokens_per_chunk // group_cfg.hashes_per_chunk
+        emitted_sizes.append(emitted)
+        print(
+            f"{idx:<6}{kind:<18}{group.tokens_per_block:>18}"
+            f"{group_cfg.tokens_per_chunk:>18}{group_cfg.hashes_per_chunk:>18}"
+            f"{emitted:>10}"
+        )
+
+    rejected = [s for s in emitted_sizes if s != _K3_ROUTER_EXPECTED_BLOCK]
+    print(f"host-tier sizes the router would REJECT: {rejected or 'none'}")
+
+    # Structural invariants we are confident about.
+    # 1. Attention scales by DCP, Mamba does not.
+    assert offloading_config.groups[0].tokens_per_block == _K3_ROUTER_EXPECTED_BLOCK
+    assert offloading_config.groups[1].tokens_per_block == mamba_block_size
+    # 2. Every group block must be divisible by the hash size, or the engine
+    #    would have raised at startup (kv_cache_utils.py:661-666).
+    for group in offloading_config.groups:
+        assert group.tokens_per_block % tokens_per_hash == 0
+    # 3. The offload-side partial tail requires DCP 1 and uniform group blocks,
+    #    so it must be off here (offloading/scheduler.py:330-341).
+    assert scheduler_config.supports_partial_tail is False
+
+
+def test_k3_shape_host_tier_size_differs_from_device_tier():
+    """The defect, stated as a test.
+
+    The device tier publishes the main-attention block times DCP. The host tier
+    publishes the hash granularity. The router accepts only one value, so the
+    host tier's events are discarded and the host-pinned index stays empty,
+    which is why no router hint is ever built and KVCR P2P never fires.
+
+    If this test ever FAILS, the per-tier premise behind the Dynamo fix is
+    wrong and the fix should be reconsidered before shipping.
+    """
+    config = _make_vllm_config(
+        tensor_parallel_size=_K3_TP, decode_context_parallel_size=_K3_DCP
+    )
+    # MagicMock makes speculative_config truthy, which trips the EAGLE/MTP
+    # draft-group detection at scheduler.py:285 and would confound
+    # supports_partial_tail. Kimi-K3 has no speculative config.
+    config.speculative_config = None
+    config.cache_config.block_size = _K3_MAIN_ATTENTION_BLOCK
+    config.cache_config.prefix_match_unit = _K3_PREFIX_MATCH_UNIT
+
+    kv_cache_config = _make_k3_shaped_kv_cache_config(mamba_block_size=1536)
+    offloading_config = build_offloading_config(config, kv_cache_config)
+
+    device_tier_block = offloading_config.groups[0].tokens_per_block
+    host_tier_block = offloading_config.cache.tokens_per_hash
+
+    assert device_tier_block == _K3_ROUTER_EXPECTED_BLOCK
+    assert host_tier_block == _K3_PREFIX_MATCH_UNIT
+    assert host_tier_block != device_tier_block, (
+        "host and device tiers agree; the per-tier fix would be unnecessary"
+    )
