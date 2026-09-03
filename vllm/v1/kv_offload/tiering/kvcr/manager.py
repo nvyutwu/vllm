@@ -4,6 +4,7 @@
 
 import ctypes
 import mmap
+import os
 import socket
 import time
 import uuid
@@ -78,6 +79,7 @@ from vllm.v1.kv_offload.base import (
     ReqContext,
     RequestOffloadingContext,
     get_offload_block_hash,
+    get_offload_group_idx,
 )
 from vllm.v1.kv_offload.tiering.base import (
     JobResult,
@@ -106,6 +108,20 @@ _BLOCKS_USED_METRIC = "kvcr_blocks_used"
 _TARGET_INVENTORY_MISMATCH_METRIC = "kvcr_target_inventory_mismatch"
 
 logger = init_logger(__name__)
+
+
+def _format_pin_lookup(key: OffloadKey, result: LookupResult) -> str:
+    """Return a non-sensitive summary of one framework pin lookup.
+
+    The external block hash is derived from a request prefix, so diagnostic
+    logging must never emit it in full.  The suffix is only useful to correlate
+    source-side lookups within a single controlled debugging run.
+    """
+    return (
+        f"g{get_offload_group_idx(key)}:"
+        f"{get_offload_block_hash(key)[-8:].hex()}={result.name}"
+    )
+
 
 _BUILTIN_POLICIES: dict[str, type[KVCachePolicy]] = {
     "fifo": FIFOPolicy,
@@ -279,10 +295,17 @@ class _FrameworkPinAdapter:
         try:
             parent.on_new_request(req_context)
             started = True
+            lookup_results = tuple(
+                (key, parent.lookup(key, req_context)) for key in offload_keys
+            )
+            if os.environ.get("VLLM_KVCR_PIN_DIAGNOSTICS") == "1":
+                logger.info(
+                    "KVCR source pin lookup: request_id=%s keys=%s",
+                    request_id,
+                    [_format_pin_lookup(key, result) for key, result in lookup_results],
+                )
             hit_keys = tuple(
-                key
-                for key in offload_keys
-                if parent.lookup(key, req_context) is LookupResult.HIT
+                key for key, result in lookup_results if result is LookupResult.HIT
             )
             if not hit_keys:
                 return None

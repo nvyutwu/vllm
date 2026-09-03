@@ -1018,6 +1018,14 @@ def test_kvcr_tier_serves_primary_pin_request(monkeypatch):
     assert list(tier.get_finished_jobs()) == [JobResult(11, True)]
 
 
+def test_kvcr_pin_lookup_diagnostic_redacts_block_hash():
+    key = make_offload_key(b"0123456789", 3)
+
+    assert kvcr_manager._format_pin_lookup(key, LookupResult.HIT) == (
+        "g3:3233343536373839=HIT"
+    )
+
+
 def test_kvcr_telemetry_is_opt_in_and_namespaced_at_vllm_boundary(monkeypatch):
     """Keep telemetry opt-in and namespace metrics only at the vLLM boundary."""
     assert KVCRSecondaryTierManager.build_metric_definitions({}) == {}
