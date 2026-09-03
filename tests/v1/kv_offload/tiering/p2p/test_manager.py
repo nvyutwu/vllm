@@ -111,13 +111,22 @@ def _make_manager() -> P2PSecondaryTierManager:
     mgr._kv_to_session = {}
     mgr._unbound_stores = {}
     mgr._failed_serve_ctxs = []
+    mgr._rank_complete_staging_required = False
     return mgr
 
 
-def _init_offloading_spec() -> SimpleNamespace:
+def _init_offloading_spec(
+    world_size: int = 1, local_world_size: int = 0
+) -> SimpleNamespace:
     """Minimal offloading_spec for driving the real __init__."""
     return SimpleNamespace(
-        config=SimpleNamespace(parallel=SimpleNamespace(data_parallel_index=0)),
+        config=SimpleNamespace(
+            parallel=SimpleNamespace(
+                data_parallel_index=0,
+                world_size=world_size,
+                local_world_size=local_world_size,
+            )
+        ),
         blocks_per_chunk=1,
     )
 
@@ -152,6 +161,22 @@ class TestInitHashSeedAssertion:
             primary_kv_view=memoryview(bytearray(16)),
         )
         assert mgr._hash_seed == "12345"
+
+    def test_multinode_requires_rank_complete_staging(self, monkeypatch):
+        """A scheduler-owned primary view is not a complete multi-node row."""
+        monkeypatch.setenv("PYTHONHASHSEED", "12345")
+        monkeypatch.setattr(manager_module, "NixlTransport", lambda *a, **k: object())
+        monkeypatch.setattr(manager_module, "ZmqTransport", lambda *a, **k: object())
+        monkeypatch.setattr(
+            manager_module.FileMapper,
+            "from_offloading_spec",
+            lambda **k: SimpleNamespace(get_run_config=lambda: {}),
+        )
+        mgr = P2PSecondaryTierManager(
+            offloading_spec=_init_offloading_spec(world_size=8, local_world_size=4),
+            primary_kv_view=memoryview(bytearray(16)),
+        )
+        assert mgr._requires_rank_complete_staging()
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +243,12 @@ class TestLookup:
         returns MISS even when a stale ``remote_decoder`` block is present."""
         mgr = _make_manager()
         ctx = _req_context(kv_params=_remote_decoder_kv_params())
+        assert mgr.lookup(b"key", ctx) is LookupResult.MISS
+
+    def test_multinode_guard_returns_miss_for_remote_source(self):
+        mgr = _make_manager()
+        mgr._rank_complete_staging_required = True
+        ctx = _req_context(kv_params=_remote_prefiller_kv_params())
         assert mgr.lookup(b"key", ctx) is LookupResult.MISS
 
 
@@ -376,6 +407,16 @@ class TestSubmitStore:
         assert mgr._sessions == {}
         assert "req-1" in mgr._unbound_stores
 
+    def test_multinode_guard_completes_store_without_remote_transfer(self):
+        mgr = _make_manager()
+        mgr._rank_complete_staging_required = True
+        job = _job_metadata(
+            job_id=1, kv_params=_remote_decoder_kv_params(kv_request_id="req-1")
+        )
+        mgr.submit_store(job)
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=True)]
+        assert mgr._unbound_stores == {}
+
 
 # ---------------------------------------------------------------------------
 # Tests for submit_load
@@ -437,6 +478,13 @@ class TestSubmitLoad:
             "kv_request_id": "req-1",
         }
         job = _job_metadata(job_id=1, kv_params=params)
+        mgr.submit_load(job)
+        assert mgr._finished_jobs == [JobResult(job_id=1, success=False)]
+
+    def test_multinode_guard_rejects_unexpected_promotion(self):
+        mgr = _make_manager()
+        mgr._rank_complete_staging_required = True
+        job = _job_metadata(job_id=1, kv_params=_remote_prefiller_kv_params())
         mgr.submit_load(job)
         assert mgr._finished_jobs == [JobResult(job_id=1, success=False)]
 

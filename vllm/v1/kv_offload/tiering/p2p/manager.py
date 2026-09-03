@@ -247,6 +247,24 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             **kwargs: Reserved for future tier-specific options.
         """
         super().__init__(offloading_spec, primary_kv_view, tier_type)
+        parallel = offloading_spec.config.parallel
+        world_size = getattr(parallel, "world_size", 1)
+        local_world_size = getattr(parallel, "local_world_size", 0) or world_size
+        # The primary view below is owned by the scheduler's node.  On a
+        # multi-node TP group each other node has a distinct pod-local mmap,
+        # so NIXL registering this one view cannot transfer all DCP ranks.
+        # Do not let a partial transfer become a logical cache HIT.  A future
+        # rank-complete gather -> P2P -> scatter staging path will clear this
+        # guard; it must preserve every global-rank row before doing so.
+        self._rank_complete_staging_required = local_world_size < world_size
+        if self._rank_complete_staging_required:
+            logger.warning(
+                "P2P KV offload disabled: world_size=%d local_world_size=%d "
+                "uses pod-local primary mmap; rank-complete staging is required "
+                "before multi-node P2P can be enabled",
+                world_size,
+                local_world_size,
+            )
         # Block hashes chain from NONE_HASH, seeded from PYTHONHASHSEED
         # (see init_none_hash in v1/core/kv_cache_utils.py). Peers with
         # different seeds compute different hashes for identical content, so
@@ -325,8 +343,18 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     # SecondaryTierManager interface
     # ------------------------------------------------------------------
 
+    def _requires_rank_complete_staging(self) -> bool:
+        """Whether this manager must fail closed for multi-node P2P.
+
+        ``getattr`` keeps lightweight unit-test managers created with
+        ``__new__`` compatible with the normal single-node behavior.
+        """
+        return getattr(self, "_rank_complete_staging_required", False)
+
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        if self._requires_rank_complete_staging():
+            return LookupResult.MISS
         source = req_context.get_state(P2PSourceInfo)
         if source is None:
             return LookupResult.MISS
@@ -367,6 +395,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         connection arrives in _accept_new_peers — submit_store no longer
         pre-creates anything.
         """
+        if self._requires_rank_complete_staging():
+            return RequestOffloadingContext()
         _annotate_req_context(req_context)
         source = req_context.get_state(P2PSourceInfo)
         if source is not None:
@@ -389,6 +419,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         in `_unbound_stores` are left in place and cleaned up only by
         `_reap_unbound_stores` after `_UNBOUND_STORE_TIMEOUT_S`.
         """
+        if self._requires_rank_complete_staging():
+            return
         source = req_context.get_state(P2PSourceInfo)
         dest = req_context.get_state(P2PDestInfo)
         kv_request_id = source.kv_request_id if source is not None else None
@@ -413,6 +445,12 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     @override
     def submit_store(self, job_metadata: TransferJob) -> None:
         job_id = job_metadata.job_id
+        if self._requires_rank_complete_staging():
+            # The primary CPU tier has already completed its local store.  No
+            # remote P2P work was advertised, so complete the secondary job
+            # locally rather than leave a pinned primary block behind.
+            self._finished_jobs.append(JobResult(job_id=job_id, success=True))
+            return
         keys = list(job_metadata.keys)
         block_ids = job_metadata.block_ids
 
@@ -472,6 +510,12 @@ class P2PSecondaryTierManager(SecondaryTierManager):
     @override
     def submit_load(self, job_metadata: TransferJob) -> None:
         job_id = job_metadata.job_id
+        if self._requires_rank_complete_staging():
+            # Defensive only: lookup() returns MISS under this guard, so a
+            # promotion should never be scheduled.  Surface failure rather
+            # than loading a partial logical block.
+            self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+            return
         keys = list(job_metadata.keys)
         block_ids = job_metadata.block_ids
 
@@ -533,7 +577,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # Drive one polling sweep on the scheduler thread, then hand off
         # whatever has accumulated. The engine calls this once per step
         # (and keeps stepping while has_pending_work() is True).
-        self._poll_once()
+        if not self._requires_rank_complete_staging():
+            self._poll_once()
         result = self._finished_jobs
         self._finished_jobs = []
         return result
@@ -544,7 +589,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # session.poll(); without it we miss new peer connects and
         # inbound fetch messages on existing sessions. Keep the engine
         # ticking for the lifetime of this manager.
-        return True
+        return not self._requires_rank_complete_staging()
 
     @override
     def drain_jobs(self) -> None:
@@ -557,6 +602,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         accumulate in ``_finished_jobs`` and are surfaced by the next
         ``get_finished_jobs()`` call.
         """
+        if self._requires_rank_complete_staging():
+            return
         start = time.monotonic()
         warned = False
         while True:
@@ -583,6 +630,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         the failed serves left by a reaped session, then let every live
         session resolve its enqueued inbound LookupMsgs.
         """
+        if self._requires_rank_complete_staging():
+            return
         if self._failed_serve_ctxs:
             for ctx in self._failed_serve_ctxs:
                 parent.on_request_finished(ctx)
@@ -595,6 +644,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # Flush any p2p lookups aggregated during this step.
         # One LookupMsg per (peer, kv_request_id) with unsent entries;
         # send-gating happens inside the session if not yet ready.
+        if self._requires_rank_complete_staging():
+            return
         for session in self._sessions.values():
             session.flush_pending_lookups()
 
@@ -741,6 +792,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         their results into ``_finished_jobs``, and reaps any dead sessions.
         Runs on the scheduler thread.
         """
+        if self._requires_rank_complete_staging():
+            return
         new_connections = self._control.poll()
         if new_connections:
             logger.info(
