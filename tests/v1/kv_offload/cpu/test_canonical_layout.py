@@ -19,6 +19,7 @@ from vllm.v1.kv_offload.cpu.gpu_worker import (
     _build_copy_plan,
     _canonical_block_sizes,
     _canonical_page_ids,
+    _cpu_to_gpu_source_access_order_any,
     pin_mmap_region,
 )
 from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
@@ -76,6 +77,13 @@ def test_canonical_block_sizes_take_max_per_tensor():
     small = CanonicalPageMapping(2048, 512, (identity,), 1, 0, False)
     refs = [[_ref(_nhd_mapping(), 0), _ref(small, 0)], [_ref(small, 1)]]
     assert _canonical_block_sizes(refs, 2) == [4096, 2048]
+
+
+def test_kvcr_strict_cpu_to_gpu_order_disables_source_access_any(monkeypatch):
+    monkeypatch.delenv("VLLM_KVCR_STRICT_CPU_TO_GPU_ORDER", raising=False)
+    assert _cpu_to_gpu_source_access_order_any()
+    monkeypatch.setenv("VLLM_KVCR_STRICT_CPU_TO_GPU_ORDER", "1")
+    assert not _cpu_to_gpu_source_access_order_any()
 
 
 def _tp2_rank_mapping(rank: int) -> CanonicalPageMapping:

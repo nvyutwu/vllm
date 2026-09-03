@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import time
 from collections import deque
 from collections.abc import Sequence
@@ -33,6 +34,18 @@ from vllm.v1.kv_offload.cpu.swap_blocks_triton import (
 )
 
 logger = init_logger(__name__)
+
+
+def _cpu_to_gpu_source_access_order_any() -> bool:
+    """Whether a CPU-to-GPU DMA may bypass source-access ordering.
+
+    The optimized path is safe for ordinary CPU offload memory, whose source
+    pages are not concurrently updated by a device stream. KVCR promotion
+    writes those pinned pages through an external transport, however. Keep a
+    flag-gated strict path for that case until its completion ordering is
+    proven on the target platform.
+    """
+    return os.environ.get("VLLM_KVCR_STRICT_CPU_TO_GPU_ORDER", "0") != "1"
 
 
 def _select_swap_blocks_fn(
@@ -650,7 +663,9 @@ class SingleDirectionOffloadingHandler:
         # from the live GPU KV cache, which the compute stream keeps
         # writing; we must keep STREAM ordering so source reads are gated
         # by the transfer stream's wait_stream(compute) barrier.
-        is_src_access_order_any = not self.gpu_to_cpu
+        is_src_access_order_any = (
+            _cpu_to_gpu_source_access_order_any() if not self.gpu_to_cpu else False
+        )
         with current_platform.stream(stream):
             start_event.record(stream)
             if op_idx > 0:
