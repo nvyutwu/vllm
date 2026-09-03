@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import ctypes
 from collections.abc import Collection, Iterable, Mapping
 from types import SimpleNamespace
 
@@ -1137,6 +1138,45 @@ def test_kvcr_tier_stores_and_emits_inventory(monkeypatch):
         ([key], Medium.STORAGE, "kvcr", False),
     ]
     tier.shutdown()
+
+
+def test_kvcr_row_diagnostics_fingerprint_each_physical_group(monkeypatch, caplog):
+    """Keep bounded P2P diagnostics at the primary deposit/load boundaries."""
+    monkeypatch.setenv("VLLM_KVCR_ROW_DIAGNOSTICS", "1")
+    kvcr = RecordingKVCR()
+    tier = _make_tier(monkeypatch, kvcr)
+    keys = [
+        make_offload_key(b"group-zero", 0),
+        make_offload_key(b"group-three", 3),
+    ]
+    ctypes.memset(tier._primary_base_addr, 0x11, tier._primary_row_stride)
+    ctypes.memset(
+        tier._primary_base_addr + tier._primary_row_stride,
+        0x22,
+        tier._primary_row_stride,
+    )
+    job = TransferJob(
+        job_id=31,
+        keys=keys,
+        block_ids=np.array([0, 1], dtype=np.int64),
+        is_promotion=True,
+        req_context=ReqContext(req_id="req"),
+    )
+
+    tier.submit_store(job)
+    tier.submit_load(job)
+    assert list(tier.get_finished_jobs()) == [JobResult(31, True), JobResult(31, True)]
+
+    messages = [record.getMessage() for record in caplog.records]
+    source = next(
+        message for message in messages if "role=source_primary_pre_deposit" in message
+    )
+    target = next(
+        message for message in messages if "role=target_primary_post_deliver" in message
+    )
+    assert "g0:s16:sha256=" in source
+    assert "g3:s16:sha256=" in source
+    assert source.split("[", maxsplit=1)[1] == target.split("[", maxsplit=1)[1]
 
 
 def test_kvcr_tier_requires_self_describing_inventory_events(monkeypatch):

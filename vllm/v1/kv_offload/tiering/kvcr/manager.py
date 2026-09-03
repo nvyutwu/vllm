@@ -3,6 +3,7 @@
 """vLLM secondary-tier adapter for KVCR."""
 
 import ctypes
+import hashlib
 import mmap
 import os
 import socket
@@ -107,7 +108,64 @@ _BLOCKS_USED_METRIC = "kvcr_blocks_used"
 # be visible nowhere.
 _TARGET_INVENTORY_MISMATCH_METRIC = "kvcr_target_inventory_mismatch"
 
+# Diagnostic only.  A KVCR P2P transfer crosses four independently-addressed
+# physical KV-group rows for the Kimi-K3 layout.  Hashing sampled row bytes at
+# the primary-tier boundaries lets an operator identify whether divergence was
+# introduced before deposit, in the remote transfer, or while promoting into
+# the target primary tier.  It deliberately never logs keys or cache contents.
+_ROW_DIAGNOSTICS_ENV = "VLLM_KVCR_ROW_DIAGNOSTICS"
+_ROW_DIAGNOSTIC_MAX_BYTES = 4096
+_ROW_DIAGNOSTIC_SAMPLE_COUNT = 64
+
 logger = init_logger(__name__)
+
+
+def _row_diagnostics_enabled() -> bool:
+    return os.getenv(_ROW_DIAGNOSTICS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _sample_descriptor_digest(descriptor: MemDescriptor) -> str:
+    """Return a bounded, evenly-spaced fingerprint of a DRAM descriptor."""
+    size = int(descriptor.size)
+    if size <= 0:
+        return hashlib.sha256(b"").hexdigest()
+    sample_count = min(_ROW_DIAGNOSTIC_SAMPLE_COUNT, size)
+    sample_width = min(
+        _ROW_DIAGNOSTIC_MAX_BYTES // sample_count,
+        size,
+    )
+    offsets = {
+        (size - sample_width) * index // max(sample_count - 1, 1)
+        for index in range(sample_count)
+    }
+    digest = hashlib.sha256()
+    for offset in sorted(offsets):
+        digest.update(
+            ctypes.string_at(
+                int(descriptor.addr) + offset,
+                min(sample_width, size - offset),
+            )
+        )
+    return digest.hexdigest()
+
+
+def _format_primary_row_fingerprints(
+    blocks: Collection[tuple[BlockKey, MemDescriptor]],
+) -> str:
+    """Format bounded, content-free primary-row diagnostics for logging."""
+    rows = []
+    for key, descriptor in blocks:
+        group_idx = get_offload_group_idx(OffloadKey(bytes(key)))
+        rows.append(
+            f"g{group_idx}:s{int(descriptor.size)}:"
+            f"sha256={_sample_descriptor_digest(descriptor)}"
+        )
+    return ", ".join(rows)
 
 
 def _format_pin_lookup(key: OffloadKey, result: LookupResult) -> str:
@@ -644,6 +702,9 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         self._local_dram_mmap = local_mapping
         self._finished_jobs: list[JobResult] = []
         self._jobs_by_op: dict[OpHandle, _JobState] = {}
+        self._row_diagnostics_by_op: dict[
+            OpHandle, dict[BlockKey, MemDescriptor]
+        ] = {}
         self._telemetry_enabled = enable_telemetry
         self._adapter_stats = OffloadingConnectorStats()
         self._hint_metric_states: dict[str, _HintMetricState] = {}
@@ -767,6 +828,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         op_handle = self._kvcr.deliver(
             blocks, request_id=job_metadata.req_context.req_id
         )
+        if _row_diagnostics_enabled():
+            self._row_diagnostics_by_op[op_handle] = blocks
         source_state = job_metadata.req_context.get_state(ExternalKVSourceState)
         remote_keys_by_hash: dict[ExternalBlockHash, set[OffloadKey]] = {}
         for key in job_metadata.keys:
@@ -819,6 +882,13 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 JobResult(job_id=job_metadata.job_id, success=True)
             )
             return
+        if _row_diagnostics_enabled():
+            logger.info(
+                "KVCR primary row fingerprints role=source_primary_pre_deposit "
+                "rows=%d [%s]",
+                len(blocks),
+                _format_primary_row_fingerprints(blocks.items()),
+            )
         op_handle = self._kvcr.deposit(blocks)
         self._jobs_by_op[op_handle] = (
             job_metadata.job_id,
@@ -872,6 +942,21 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             ) = job_state
             remaining -= len(entries)
             success = success and all(entry.success for entry in entries.values())
+            diagnostic_blocks = self._row_diagnostics_by_op.get(op_handle)
+            if diagnostic_blocks is not None:
+                completed_rows = [
+                    (key, diagnostic_blocks[key])
+                    for key, entry in entries.items()
+                    if entry.success and key in diagnostic_blocks
+                ]
+                if completed_rows:
+                    logger.info(
+                        "KVCR primary row fingerprints "
+                        "role=target_primary_post_deliver op=%s rows=%d [%s]",
+                        op_handle,
+                        len(completed_rows),
+                        _format_primary_row_fingerprints(completed_rows),
+                    )
             if successful_keys is not None:
                 successful_keys.update(
                     OffloadKey(bytes(key))
@@ -889,6 +974,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 )
                 continue
             self._jobs_by_op.pop(op_handle, None)
+            self._row_diagnostics_by_op.pop(op_handle, None)
             if request_id is not None and remote_keys_by_hash:
                 hint_state = self._hint_metric_states.get(request_id)
                 if hint_state is not None:
