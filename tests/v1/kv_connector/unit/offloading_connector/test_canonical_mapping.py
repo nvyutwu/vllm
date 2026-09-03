@@ -346,6 +346,40 @@ def test_cp_round_trip():
     assert _store_all(mappings, pages, 2048) == reference
 
 
+def test_dcp8_rank_association_round_trip_rejects_permuted_shards():
+    """DCP=8 needs each rank's page to return to that exact rank.
+
+    MLA shards latent tokens across all eight DCP ranks. Mamba currently uses
+    an opaque, rank-exclusive fallback page. Both round-trip correctly under
+    a stable association, while even a one-rank rotation corrupts the
+    canonical bytes despite preserving every individual page.
+    """
+    mla = _mla_spec()
+    mla_mappings = [_mapping(mla, None, _ctx(rank, tp=8, dcp=8)) for rank in range(8)]
+    _verify_tiling("mla-dcp8", mla_mappings)
+    mla_reference = bytes((13 + 29 * i) % 256 for i in range(8 * 256))
+    mla_pages = [_load_one(mapping, mla_reference) for mapping in mla_mappings]
+    assert _store_all(mla_mappings, mla_pages, len(mla_reference)) == mla_reference
+    assert (
+        _store_all(mla_mappings, mla_pages[1:] + mla_pages[:1], len(mla_reference))
+        != mla_reference
+    )
+
+    mamba_mappings = [_opaque_fallback_mapping(128, 8, rank) for rank in range(8)]
+    mamba_reference = bytes((7 + 19 * i) % 256 for i in range(8 * 128))
+    mamba_pages = [_load_one(mapping, mamba_reference) for mapping in mamba_mappings]
+    assert (
+        _store_all(mamba_mappings, mamba_pages, len(mamba_reference))
+        == mamba_reference
+    )
+    assert (
+        _store_all(
+            mamba_mappings, mamba_pages[1:] + mamba_pages[:1], len(mamba_reference)
+        )
+        != mamba_reference
+    )
+
+
 def test_replica_rotation_round_trip():
     """Whichever replica a block elects reproduces the same canonical page."""
     spec = _mla_spec()

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import hashlib
 import os
 import time
 from collections import deque
@@ -84,6 +85,33 @@ class Transfer:
     batch_src: torch.Tensor
     batch_dst: torch.Tensor
     batch_sizes: torch.Tensor
+    gpu_diagnostic_blocks: tuple[tuple[int, int, int], ...] = ()
+
+
+def _kvcr_gpu_row_diagnostics_enabled() -> bool:
+    """Gate expensive, redacted GPU-page fingerprints for KVCR triage."""
+    return os.environ.get("VLLM_KVCR_GPU_ROW_DIAGNOSTICS", "0") == "1"
+
+
+def _fingerprint_gpu_page(page: torch.Tensor) -> str:
+    """Return a bounded content fingerprint without logging KV bytes.
+
+    Full Kimi-K3 Mamba pages are large. Hash three bounded windows instead of
+    copying an entire page to the host; a rank permutation or omitted shard
+    still changes the content fingerprint while the diagnostic stays cheap.
+    """
+    flat = page.reshape(-1)
+    size = flat.numel()
+    sample_size = min(size, 64 * 1024)
+    offsets = sorted({0, max(0, (size - sample_size) // 2), size - sample_size})
+    digest = hashlib.sha256()
+    for offset in offsets:
+        sample = flat.narrow(0, offset, sample_size).detach().cpu()
+        digest.update(sample.numpy().tobytes())
+    return (
+        f"s{size}:w{sample_size}:o{','.join(map(str, offsets))}:"
+        f"sha256={digest.hexdigest()}"
+    )
 
 
 def compute_sub_block_ptrs(
@@ -262,6 +290,7 @@ class SingleDirectionOffloadingHandler:
         layer_refs_per_group: list[list[CanonicalKVCacheRef]],
         gpu_to_cpu: bool,
         canonical_layout: bool = False,
+        diagnostic_rank: int | None = None,
     ):
         """
         Initialize a SingleDirectionOffloadingHandler.
@@ -310,6 +339,8 @@ class SingleDirectionOffloadingHandler:
             cpu_tensors if gpu_to_cpu else gpu_tensors
         )
         self.gpu_to_cpu: bool = gpu_to_cpu
+        self._gpu_tensors = gpu_tensors
+        self._diagnostic_rank = diagnostic_rank
         self.layer_refs_per_group = layer_refs_per_group
         self._swap_blocks_batch = _select_swap_blocks_fn(
             layer_refs_per_group, gpu_to_cpu
@@ -348,6 +379,44 @@ class SingleDirectionOffloadingHandler:
         self._event_pool: list[torch.Event] = []
         # list of pinned descriptor buffer sets available for re-use
         self._buffer_pool: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def _gpu_diagnostic_blocks(
+        self, gpu_spec: GPULoadStoreSpec
+    ) -> tuple[tuple[int, int, int], ...]:
+        """Select one physical GPU page per logical KV group for hashing."""
+        if not _kvcr_gpu_row_diagnostics_enabled():
+            return ()
+        selected: list[tuple[int, int, int]] = []
+        seen_tensors: set[int] = set()
+        offset = 0
+        for group_idx, group_size in enumerate(gpu_spec.group_sizes):
+            if group_size:
+                block_id = int(gpu_spec.block_ids[offset])
+                for ref in self.layer_refs_per_group[group_idx]:
+                    if ref.tensor_idx not in seen_tensors:
+                        selected.append((group_idx, ref.tensor_idx, block_id))
+                        seen_tensors.add(ref.tensor_idx)
+            offset += group_size
+        return tuple(selected)
+
+    def _log_gpu_diagnostic(self, transfer: Transfer) -> None:
+        if not transfer.gpu_diagnostic_blocks:
+            return
+        role = "source_gpu_post_store" if self.gpu_to_cpu else "target_gpu_post_load"
+        rows = []
+        for group_idx, tensor_idx, block_id in transfer.gpu_diagnostic_blocks:
+            page = self._gpu_tensors[tensor_idx][block_id]
+            rows.append(
+                f"g{group_idx}:t{tensor_idx}:b{block_id}:"
+                f"{_fingerprint_gpu_page(page)}"
+            )
+        logger.info(
+            "KVCR GPU rank fingerprints role=%s global_rank=%s job=%d rows=[%s]",
+            role,
+            self._diagnostic_rank,
+            transfer.job_id,
+            ",".join(rows),
+        )
 
     def _estimate_max_copy_ops(self, group_sizes: Sequence[int]) -> int:
         """Upper bound on the number of copy descriptors for a transfer.
@@ -558,6 +627,7 @@ class SingleDirectionOffloadingHandler:
         # extract group_sizes from the GPU spec
         gpu_spec = src_spec if self.gpu_to_cpu else dst_spec
         assert isinstance(gpu_spec, GPULoadStoreSpec)
+        gpu_diagnostic_blocks = self._gpu_diagnostic_blocks(gpu_spec)
         group_sizes = gpu_spec.group_sizes
         assert len(group_sizes) == len(self.layer_refs_per_group)
 
@@ -688,6 +758,7 @@ class SingleDirectionOffloadingHandler:
                 batch_src=batch_src,
                 batch_dst=batch_dst,
                 batch_sizes=batch_sizes,
+                gpu_diagnostic_blocks=gpu_diagnostic_blocks,
             )
         )
 
@@ -709,6 +780,7 @@ class SingleDirectionOffloadingHandler:
             )
 
             results.append(result)
+            self._log_gpu_diagnostic(transfer)
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
@@ -767,6 +839,7 @@ class CPUOffloadingWorker(OffloadingWorker):
         num_cpu_blocks: int,
         mmap_region: SharedOffloadRegion | None = None,
         canonical_layout: bool = False,
+        diagnostic_rank: int | None = None,
     ):
         assert not canonical_layout or mmap_region is not None
         # The caller owns mmap_region until this constructor returns. After a
@@ -826,6 +899,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             layer_refs_per_group=kv_caches.group_data_refs,
             gpu_to_cpu=True,
             canonical_layout=canonical_layout,
+            diagnostic_rank=diagnostic_rank,
         )
 
         self._load_handler = SingleDirectionOffloadingHandler(
@@ -835,6 +909,7 @@ class CPUOffloadingWorker(OffloadingWorker):
             layer_refs_per_group=kv_caches.group_data_refs,
             gpu_to_cpu=False,
             canonical_layout=canonical_layout,
+            diagnostic_rank=diagnostic_rank,
         )
 
     def submit_store(

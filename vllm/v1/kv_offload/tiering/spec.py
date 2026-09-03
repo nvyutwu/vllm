@@ -53,6 +53,7 @@ Example out-of-tree tier configuration:
 }
 """
 
+import os
 from typing import Any
 
 import torch
@@ -406,12 +407,28 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         try:
             if self.config.canonical_layout:
                 self._validate_canonical_refs(kv_caches)
+            if os.environ.get("VLLM_KVCR_GPU_ROW_DIAGNOSTICS", "0") == "1":
+                logger.info(
+                    "KVCR DCP rank association global_rank=%d world_size=%d "
+                    "tp_size=%d dcp_size=%d local_world_size=%d "
+                    "device_index=%d shared_memory_slot=%d "
+                    "canonical_layout=%s",
+                    self.config.parallel.rank,
+                    world_size,
+                    self.config.parallel.tp_size,
+                    self.config.parallel.dcp_size,
+                    local_world_size,
+                    torch.accelerator.current_device_index(),
+                    rank,
+                    self.config.canonical_layout,
+                )
             return CPUOffloadingWorker(
                 kv_caches=kv_caches,
                 blocks_per_chunk=self.blocks_per_chunk,
                 num_cpu_blocks=self.num_blocks,
                 mmap_region=worker_mmap,
                 canonical_layout=self.config.canonical_layout,
+                diagnostic_rank=self.config.parallel.rank,
             )
         except Exception:
             worker_mmap.cleanup()
