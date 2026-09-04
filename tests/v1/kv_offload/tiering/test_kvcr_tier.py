@@ -24,6 +24,9 @@ from kvcr.types import (
     QueryStatus,
 )
 
+from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+    OffloadingWorkerMetadata,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
 )
@@ -38,6 +41,10 @@ from vllm.v1.kv_offload.base import (
 from vllm.v1.kv_offload.tiering.base import JobResult, TransferJob
 from vllm.v1.kv_offload.tiering.kvcr import manager as kvcr_manager
 from vllm.v1.kv_offload.tiering.kvcr.manager import KVCRSecondaryTierManager
+from vllm.v1.kv_offload.tiering.p2p.segment import (
+    SegmentRegistration,
+    _layout_digest,
+)
 
 
 def _op_entries(
@@ -88,6 +95,7 @@ class RecordingKVCR:
         self.deliver_calls: list[
             tuple[OpHandle, dict[BlockKey, MemDescriptor], str | None]
         ] = []
+        self.deliver_operation_tags: list[str | None] = []
         self.deposit_calls: list[tuple[OpHandle, dict[BlockKey, MemDescriptor]]] = []
         self.completed: list[tuple[OpHandle, dict[BlockKey, OpEntryResult]]] = []
         self._next_op_handle = 1
@@ -133,10 +141,12 @@ class RecordingKVCR:
         self,
         blocks: Mapping[BlockKey, MemDescriptor],
         request_id: str | None = None,
+        operation_tag: str | None = None,
     ) -> OpHandle:
         op_handle = self._next_op_handle
         self._next_op_handle += 1
         self.deliver_calls.append((op_handle, dict(blocks), request_id))
+        self.deliver_operation_tags.append(operation_tag)
         self.complete(op_handle, {key: True for key in blocks})
         return op_handle
 
@@ -209,6 +219,9 @@ def _make_tier(
     inventory_epoch: int | None = None,
     operation_timeout_ms: int = 1000,
     drain_timeout_ms: int | None = None,
+    world_size: int = 1,
+    local_world_size: int | None = None,
+    multi_segment: bool = False,
 ) -> KVCRSecondaryTierManager:
     def make_control(_bind_host, bind_port, advertise_host):
         return _StubControlChannel(f"tcp://{advertise_host}:{int(bind_port)}")
@@ -230,6 +243,8 @@ def _make_tier(
             config=SimpleNamespace(
                 parallel=SimpleNamespace(
                     data_parallel_rank_local=data_parallel_rank_local,
+                    world_size=world_size,
+                    local_world_size=local_world_size,
                 )
             ),
             kv_events_config=SimpleNamespace(
@@ -252,6 +267,7 @@ def _make_tier(
         inventory_epoch=inventory_epoch,
         operation_timeout_ms=operation_timeout_ms,
         drain_timeout_ms=drain_timeout_ms,
+        multi_segment=multi_segment,
     )
 
 
@@ -358,6 +374,69 @@ def test_kvcr_tier_maps_router_hint_to_load(monkeypatch):
 
     tier.on_request_finished(ctx)
     assert kvcr.discard_hint_calls == ["req"]
+
+
+def test_rank_complete_target_promotes_only_after_both_rows_complete(monkeypatch):
+    """An extra mmap-row ACK is required in addition to the KVCR row."""
+    kvcr = RecordingKVCR()
+    tier = _make_tier(
+        monkeypatch,
+        kvcr,
+        control_ports=[31251],
+        world_size=8,
+        local_world_size=4,
+        multi_segment=True,
+    )
+    fingerprint = "kimi-k3-mla-mamba"
+    registration = SegmentRegistration(
+        segment_id=4,
+        rank_start=4,
+        rank_end=8,
+        local_slots=4,
+        base_addr=0xDEADBEEF,
+        num_blocks=4,
+        block_len=16,
+        config_fingerprint=fingerprint,
+        layout_digest=_layout_digest(
+            rank_start=4,
+            rank_end=8,
+            local_slots=4,
+            num_blocks=4,
+            block_len=16,
+            config_fingerprint=fingerprint,
+        ),
+        agent_metadata=b"target-extra-row",
+    )
+    tier.update_worker_metadata(
+        OffloadingWorkerMetadata(segment_registrations={4: registration})
+    )
+    ctx = ReqContext(
+        req_id="rank-complete",
+        kv_transfer_params={
+            "router_hint": {
+                "source_control_endpoint": "tcp://source:31251",
+                "source_inventory_epoch": 7,
+                "block_hashes": [123],
+                "start_block": 0,
+                "hinted_blocks": 1,
+            }
+        },
+    )
+    tier.on_new_request(ctx)
+    job = _job(71, ctx, block_id=2)
+
+    tier.submit_load(job)
+    assert kvcr.deliver_calls == []
+    [state] = tier._target_segment_operations.values()
+
+    state.acknowledged = True
+    assert list(tier.get_finished_jobs()) == []
+    assert len(kvcr.deliver_calls) == 1
+    assert kvcr.deliver_operation_tags == [state.manifest.operation_tag]
+
+    state.segment_success = True
+    assert list(tier.get_finished_jobs()) == [JobResult(job_id=71, success=True)]
+    tier.shutdown()
 
 
 def test_kvcr_tier_allows_request_without_router_hint(monkeypatch):

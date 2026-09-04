@@ -927,6 +927,17 @@ class CPUOffloadingWorker(OffloadingWorker):
     def get_finished(self) -> list[TransferResult]:
         return self._store_handler.get_finished() + self._load_handler.get_finished()
 
+    def get_segment_memoryview(self) -> memoryview:
+        """Return the complete pod-local mmap row for rank-complete P2P.
+
+        This is intentionally the full physical row rather than this GPU
+        rank's tensor views: a local-rank leader copies every rank-owned byte
+        (MLA and Mamba alike) to the matching remote pod row.
+        """
+        if self._mmap_region is None:
+            raise RuntimeError("rank-complete P2P requires an mmap-backed CPU tier")
+        return self._mmap_region.create_kv_memoryview()
+
     def wait(self, job_ids: set[int]) -> None:
         self._store_handler.wait(job_ids)
         self._load_handler.wait(job_ids)

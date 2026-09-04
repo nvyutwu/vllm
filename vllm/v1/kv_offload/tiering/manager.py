@@ -249,6 +249,26 @@ class TieringOffloadingManager(OffloadingManager):
     def _pop_job(self, job_id: JobId) -> JobMetadata | None:
         return self._jobs.pop(job_id, None)
 
+    def update_worker_metadata(self, metadata: object) -> None:
+        """Forward optional worker-side secondary-tier metadata.
+
+        Ordinary tiers have no worker control-plane state.  The rank-complete
+        P2P tier uses the existing connector output aggregation to return mmap
+        registrations and segment completion acknowledgements.
+        """
+        for tier in self.secondary_tiers:
+            update = getattr(tier, "update_worker_metadata", None)
+            if update is not None:
+                update(metadata)
+
+    def take_worker_segment_commands(self) -> tuple[object, ...]:
+        commands: list[object] = []
+        for tier in self.secondary_tiers:
+            take = getattr(tier, "take_worker_segment_commands", None)
+            if take is not None:
+                commands.extend(take())
+        return tuple(commands)
+
     def _maybe_process_finished_jobs(self):
         """
         Poll secondary tiers for completed jobs (at most once per step).

@@ -7,6 +7,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorWorkerMetadata,
 )
 from vllm.v1.kv_offload.base import LoadStoreSpec
+from vllm.v1.kv_offload.tiering.p2p.segment import (
+    SegmentOperationResult,
+    SegmentRegistration,
+    SegmentTransferCommand,
+)
 
 ReqId = str
 
@@ -75,6 +80,9 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     load_jobs: dict[int, TransferJob]
     store_jobs: dict[int, TransferJob]
     jobs_to_flush: set[int] | None = None
+    # Scheduler → worker-leader requests for rank-complete P2P mmap rows.
+    # Every worker receives the metadata; only the matching pod leader acts.
+    segment_commands: tuple[SegmentTransferCommand, ...] = ()
 
 
 @dataclass
@@ -89,6 +97,10 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
 
     completed_jobs: dict[int, int] = field(default_factory=dict)
     transfer_stats: TransferStats = field(default_factory=TransferStats)
+    # Persistent registrations are sent until the scheduler has both pod rows;
+    # operation results are one-shot acknowledgements.
+    segment_registrations: dict[int, SegmentRegistration] = field(default_factory=dict)
+    segment_results: tuple[SegmentOperationResult, ...] = ()
 
     def mark_completed(self, job_id: int) -> None:
         """Record a transfer job completion from this worker."""
@@ -103,7 +115,18 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
         for job_id, v in other.completed_jobs.items():
             merged[job_id] = merged.get(job_id, 0) + v
 
+        registrations = dict(self.segment_registrations)
+        for segment_id, registration in other.segment_registrations.items():
+            existing = registrations.get(segment_id)
+            if existing is not None and existing != registration:
+                raise ValueError(
+                    f"conflicting registration for KVCR segment {segment_id}"
+                )
+            registrations[segment_id] = registration
+
         return OffloadingWorkerMetadata(
             completed_jobs=merged,
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+            segment_registrations=registrations,
+            segment_results=(*self.segment_results, *other.segment_results),
         )

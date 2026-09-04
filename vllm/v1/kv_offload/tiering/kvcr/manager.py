@@ -4,6 +4,7 @@
 
 import ctypes
 import hashlib
+import itertools
 import mmap
 import os
 import socket
@@ -14,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+import zmq
 from kvcr import (
     BLOCKS_CANCELLED_METRIC,
     DURATION_METRIC,
@@ -87,6 +89,18 @@ from vllm.v1.kv_offload.tiering.base import (
     ParentManager,
     SecondaryTierManager,
     TransferJob,
+)
+from vllm.v1.kv_offload.tiering.kvcr.multisegment import (
+    KVCRSegmentManifest,
+    decode_manifest,
+    decode_terminal,
+    encode_ack,
+    encode_manifest,
+    encode_terminal,
+)
+from vllm.v1.kv_offload.tiering.p2p.segment import (
+    SegmentRegistration,
+    SegmentTransferCommand,
 )
 
 if TYPE_CHECKING:
@@ -315,6 +329,9 @@ class _FrameworkPinAdapter:
         self._pending_pins: dict[PinRequestId, tuple[BlockKey, ...]] = {}
         self._completed_pins: list[tuple[PinRequestId, PinResult]] = []
         self._pin_jobs: dict[str, int] = {}
+        self._deferred_pins: dict[str, str] = {}
+        self._release_requested: set[str] = set()
+        self._segment_outcomes: dict[str, bool] = {}
         self._pin_job_results: list[JobResult] = []
 
     def request_pin(self, keys: Collection[BlockKey]) -> PinRequestId:
@@ -402,10 +419,44 @@ class _FrameworkPinAdapter:
                 )
 
     def release_pin(self, pin_handle: str) -> bool:
-        job_id = self._pin_jobs.pop(pin_handle, None)
+        job_id = self._pin_jobs.get(pin_handle)
+        operation_tag = self._deferred_pins.get(pin_handle)
+        if operation_tag is not None:
+            self._release_requested.add(pin_handle)
+            outcome = self._segment_outcomes.get(operation_tag)
+            if outcome is not None:
+                self._complete_deferred_pin(pin_handle, outcome)
+            return True
         if job_id is not None:
+            self._pin_jobs.pop(pin_handle, None)
             self._pin_job_results.append(JobResult(job_id=job_id, success=True))
         return True
+
+    def defer_pins(self, operation_tag: str, pin_handles: Collection[str]) -> bool:
+        if not operation_tag or not pin_handles:
+            return False
+        if any(handle not in self._pin_jobs for handle in pin_handles):
+            return False
+        for handle in pin_handles:
+            self._deferred_pins[handle] = operation_tag
+        return True
+
+    def complete_deferred_operation(self, operation_tag: str, success: bool) -> None:
+        self._segment_outcomes[operation_tag] = success
+        for handle, owner in tuple(self._deferred_pins.items()):
+            if owner == operation_tag and handle in self._release_requested:
+                self._complete_deferred_pin(handle, success)
+
+    def _complete_deferred_pin(self, pin_handle: str, success: bool) -> None:
+        job_id = self._pin_jobs.pop(pin_handle, None)
+        operation_tag = self._deferred_pins.pop(pin_handle, None)
+        self._release_requested.discard(pin_handle)
+        if operation_tag is not None and not any(
+            owner == operation_tag for owner in self._deferred_pins.values()
+        ):
+            self._segment_outcomes.pop(operation_tag, None)
+        if job_id is not None:
+            self._pin_job_results.append(JobResult(job_id=job_id, success=success))
 
     def has_active_pins(self) -> bool:
         return bool(self._pin_jobs)
@@ -508,6 +559,18 @@ _JobState = tuple[
 ]
 
 
+@dataclass
+class _TargetSegmentState:
+    job_metadata: TransferJob
+    manifest: KVCRSegmentManifest
+    source_endpoint: str
+    deadline: float
+    acknowledged: bool = False
+    base_started: bool = False
+    base_result: JobResult | None = None
+    segment_success: bool | None = None
+
+
 class KVCRSecondaryTierManager(SecondaryTierManager):
     """Secondary tier wrapper around the KVCR KV P2P API."""
 
@@ -541,6 +604,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         g3: dict[str, Any] | None = None,
         inventory_epoch: int | None = None,
         drain_timeout_ms: int | None = None,
+        multi_segment: bool = False,
+        segment_control_port: int | None = None,
     ) -> None:
         super().__init__(offloading_spec, primary_kv_view, tier_type)
         selected_policy = _resolve_policy(policy)
@@ -602,6 +667,52 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             control_ports[dp_local_rank],
             advertise_host,
         )
+        parallel = offloading_spec.config.parallel
+        world_size = int(getattr(parallel, "world_size", 1))
+        local_world_size = int(
+            getattr(parallel, "local_world_size", None) or world_size
+        )
+        self._multi_segment = multi_segment and local_world_size < world_size
+        if self._multi_segment and world_size != 2 * local_world_size:
+            raise ValueError(
+                "KVCR rank-complete P2P currently requires exactly two "
+                "equal-size pod-local mmap rows"
+            )
+        self._segment_registrations: dict[int, SegmentRegistration] = {}
+        self._segment_commands: list[SegmentTransferCommand] = []
+        self._segment_manifests: dict[str, KVCRSegmentManifest] = {}
+        self._source_segment_operations: dict[int, KVCRSegmentManifest] = {}
+        self._next_segment_operation_id = itertools.count()
+        self._target_segment_operations: dict[str, _TargetSegmentState] = {}
+        self._kvcr_op_to_segment_tag: dict[OpHandle, str] = {}
+        self._segment_sources: dict[str, str] = {}
+        self._segment_senders: dict[str, Any] = {}
+        self._segment_socket: Any | None = None
+        self._segment_endpoint: str | None = None
+        self._segment_deadline_s = operation_timeout_ms / 1000
+        if self._multi_segment:
+            default_segment_port = control_ports[dp_local_rank] + 1
+            if (
+                segment_control_port is not None
+                and segment_control_port != default_segment_port
+            ):
+                raise ValueError(
+                    "segment_control_port must equal the KVCR control port plus one"
+                )
+            port = default_segment_port
+            if not 1 <= port <= 65535:
+                raise ValueError("segment_control_port must be between 1 and 65535")
+            self._segment_endpoint = f"tcp://{advertise_host}:{port}"
+            self._segment_socket = zmq.Context.instance().socket(zmq.PULL)
+            self._segment_socket.setsockopt(zmq.LINGER, 0)
+            self._segment_socket.bind(f"tcp://{control_host}:{port}")
+            logger.info(
+                "KVCR rank-complete extra segment enabled world_size=%d "
+                "local_world_size=%d endpoint=%s",
+                world_size,
+                local_world_size,
+                self._segment_endpoint,
+            )
         # Give colocated workers distinct transport listen ports.
         with socket.socket() as _s:
             _s.bind(("", 0))
@@ -671,6 +782,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     poll_pin_results=self._framework_pin_adapter.poll_pin_results,
                     release_pin=self._framework_pin_adapter.release_pin,
                     cancel_pin_request=(self._framework_pin_adapter.cancel_pin_request),
+                    prepare_extra_write=self._prepare_extra_write,
                     framework_control=control,
                     key_hint_adapter=self._key_hint_adapter,
                     inventory_sink=(self._record_inventory if events_enabled else None),
@@ -713,6 +825,151 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             if drain_timeout_ms is not None
             else max(2 * operation_timeout_ms, 1000)
         ) / 1000
+
+    def update_worker_metadata(self, metadata: object) -> None:
+        """Accept the non-zero pod-row registration and its terminal ACKs."""
+        if not self._multi_segment:
+            return
+        for registration in getattr(metadata, "segment_registrations", {}).values():
+            if registration.rank_start == 0:
+                continue
+            old = self._segment_registrations.get(registration.segment_id)
+            if old is not None and old != registration:
+                raise ValueError("KVCR segment registration changed during runtime")
+            self._segment_registrations[registration.segment_id] = registration
+        for result in getattr(metadata, "segment_results", ()):
+            manifest = self._source_segment_operations.pop(result.operation_id, None)
+            if manifest is None:
+                continue
+            self._framework_pin_adapter.complete_deferred_operation(
+                manifest.operation_tag, result.success
+            )
+            self._send_segment(
+                manifest.reply_endpoint,
+                encode_terminal(manifest.operation_tag, result.success),
+            )
+
+    def take_worker_segment_commands(self) -> tuple[SegmentTransferCommand, ...]:
+        commands = tuple(self._segment_commands)
+        self._segment_commands.clear()
+        return commands
+
+    def _send_segment(self, endpoint: str, payload: bytes) -> bool:
+        if not endpoint:
+            return False
+        try:
+            sender = self._segment_senders.get(endpoint)
+            if sender is None:
+                sender = zmq.Context.instance().socket(zmq.PUSH)
+                sender.setsockopt(zmq.LINGER, 0)
+                sender.connect(endpoint)
+                self._segment_senders[endpoint] = sender
+            sender.send(payload, flags=zmq.NOBLOCK)
+        except zmq.ZMQError:
+            logger.warning("KVCR segment control send failed to %s", endpoint)
+            return False
+        return True
+
+    def _poll_segment_control(self) -> None:
+        socket_ = self._segment_socket
+        if socket_ is None:
+            return
+        while True:
+            try:
+                payload = socket_.recv(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            except zmq.ZMQError:
+                logger.warning("KVCR segment control receive failed", exc_info=True)
+                break
+            try:
+                manifest = decode_manifest(payload)
+            except ValueError:
+                try:
+                    message_type, operation_tag, success = decode_terminal(payload)
+                except ValueError:
+                    logger.warning("KVCR ignored malformed segment control message")
+                    continue
+                target = self._target_segment_operations.get(operation_tag)
+                if target is None:
+                    continue
+                if message_type == "ack":
+                    target.acknowledged = success
+                elif message_type == "done":
+                    target.segment_success = success
+                continue
+            if manifest.target_segment.segment_id not in self._segment_registrations:
+                self._send_segment(
+                    manifest.reply_endpoint,
+                    encode_ack(manifest.operation_tag, False),
+                )
+                continue
+            old = self._segment_manifests.get(manifest.operation_tag)
+            if old is not None and old != manifest:
+                self._send_segment(
+                    manifest.reply_endpoint,
+                    encode_ack(manifest.operation_tag, False),
+                )
+                continue
+            self._segment_manifests[manifest.operation_tag] = manifest
+            self._send_segment(
+                manifest.reply_endpoint,
+                encode_ack(manifest.operation_tag, True),
+            )
+
+    @staticmethod
+    def _segment_endpoint_for(source_control_endpoint: str) -> str | None:
+        prefix, separator, raw_port = source_control_endpoint.rpartition(":")
+        if not separator:
+            return None
+        try:
+            port = int(raw_port)
+        except ValueError:
+            return None
+        return f"{prefix}:{port + 1}" if port < 65535 else None
+
+    def _prepare_extra_write(
+        self,
+        operation_tag: str,
+        keys: Collection[BlockKey],
+        descriptors: dict[BlockKey, MemDescriptor],
+        pin_handles: Collection[str],
+    ) -> bool:
+        """Source callback: bind a pinned KVCR write to its extra mmap row."""
+        manifest = self._segment_manifests.pop(operation_tag, None)
+        if manifest is None or manifest.expires_at <= time.monotonic():
+            return False
+        if tuple(bytes(key) for key in keys) != manifest.source_keys:
+            return False
+        block_ids = {
+            (int(descriptor.addr) - self._primary_base_addr) // self._primary_row_stride
+            for descriptor in descriptors.values()
+        }
+        if len(block_ids) != 1 or min(block_ids) < 0:
+            return False
+        local_segment = self._segment_registrations.get(
+            manifest.target_segment.segment_id
+        )
+        if (
+            local_segment is None
+            or not local_segment.compatible_with(manifest.target_segment)
+        ):
+            return False
+        if not self._framework_pin_adapter.defer_pins(operation_tag, pin_handles):
+            return False
+        operation_id = next(self._next_segment_operation_id)
+        self._source_segment_operations[operation_id] = manifest
+        self._segment_commands.append(
+            SegmentTransferCommand(
+                operation_id=operation_id,
+                segment_id=local_segment.segment_id,
+                peer_id=operation_tag,
+                remote=manifest.target_segment,
+                local_indices=(next(iter(block_ids)),),
+                remote_indices=(manifest.target_block_id,),
+            )
+        )
+        return True
 
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
@@ -825,9 +1082,74 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             )
             return
 
-        op_handle = self._kvcr.deliver(
-            blocks, request_id=job_metadata.req_context.req_id
-        )
+        operation_tag: str | None = None
+        if self._multi_segment:
+            existing = next(
+                (
+                    state
+                    for state in self._target_segment_operations.values()
+                    if state.job_metadata.job_id == job_metadata.job_id
+                ),
+                None,
+            )
+            if existing is None:
+                source_endpoint = self._segment_endpoint_for(
+                    self._segment_sources.get(job_metadata.req_context.req_id, "")
+                )
+                target_segment = next(iter(self._segment_registrations.values()), None)
+                block_ids = {int(block_id) for block_id in job_metadata.block_ids}
+                if (
+                    source_endpoint is None
+                    or self._segment_endpoint is None
+                    or target_segment is None
+                    or len(block_ids) != 1
+                ):
+                    self._finished_jobs.append(
+                        JobResult(job_id=job_metadata.job_id, success=False)
+                    )
+                    return
+                operation_tag = uuid.uuid4().hex
+                manifest = KVCRSegmentManifest(
+                    operation_tag=operation_tag,
+                    request_id=job_metadata.req_context.req_id,
+                    reply_endpoint=self._segment_endpoint,
+                    source_keys=tuple(bytes(key) for key in blocks),
+                    target_block_id=next(iter(block_ids)),
+                    target_segment=target_segment,
+                    expires_at=time.monotonic() + self._segment_deadline_s,
+                )
+                self._target_segment_operations[operation_tag] = _TargetSegmentState(
+                    job_metadata=job_metadata,
+                    manifest=manifest,
+                    source_endpoint=source_endpoint,
+                    deadline=manifest.expires_at,
+                )
+                if not self._send_segment(source_endpoint, encode_manifest(manifest)):
+                    self._target_segment_operations.pop(operation_tag, None)
+                    self._finished_jobs.append(
+                        JobResult(job_id=job_metadata.job_id, success=False)
+                    )
+                return
+            operation_tag = existing.manifest.operation_tag
+            if not existing.acknowledged or existing.base_started:
+                return
+            existing.base_started = True
+
+        if operation_tag is None:
+            # Preserve KVCR's untagged API path for normal single-row
+            # deployments and integrations that implement only that contract.
+            op_handle = self._kvcr.deliver(
+                blocks,
+                request_id=job_metadata.req_context.req_id,
+            )
+        else:
+            op_handle = self._kvcr.deliver(
+                blocks,
+                request_id=job_metadata.req_context.req_id,
+                operation_tag=operation_tag,
+            )
+        if operation_tag is not None:
+            self._kvcr_op_to_segment_tag[op_handle] = operation_tag
         if _row_diagnostics_enabled():
             self._row_diagnostics_by_op[op_handle] = blocks
         source_state = job_metadata.req_context.get_state(ExternalKVSourceState)
@@ -901,9 +1223,33 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def get_finished_jobs(self) -> Iterable[JobResult]:
+        self._poll_segment_control()
+        if self._multi_segment:
+            now = time.monotonic()
+            for operation_tag, state in tuple(self._target_segment_operations.items()):
+                if now >= state.deadline and not state.base_started:
+                    self._target_segment_operations.pop(operation_tag, None)
+                    self._finished_jobs.append(
+                        JobResult(job_id=state.job_metadata.job_id, success=False)
+                    )
+                    continue
+                if state.acknowledged and not state.base_started:
+                    self.submit_load(state.job_metadata)
         results = self._finished_jobs
         self._finished_jobs = []
         results.extend(self._poll_finished_jobs())
+        for operation_tag, state in tuple(self._target_segment_operations.items()):
+            if state.base_result is None:
+                continue
+            if state.segment_success is None and time.monotonic() < state.deadline:
+                continue
+            self._target_segment_operations.pop(operation_tag, None)
+            if state.base_result.success and state.segment_success is True:
+                results.append(state.base_result)
+            else:
+                results.append(
+                    JobResult(job_id=state.job_metadata.job_id, success=False)
+                )
         return results
 
     @override
@@ -995,13 +1341,18 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                         hint_state.promoted.update(newly_promoted)
                     hint_state.active_jobs -= 1
                     self._maybe_finalize_hint_state(request_id)
-            results.append(
-                JobResult(
-                    job_id=job_id,
-                    success=success,
-                    successful_keys=successful_keys if not success else None,
-                )
+            completed = JobResult(
+                job_id=job_id,
+                success=success,
+                successful_keys=successful_keys if not success else None,
             )
+            operation_tag = self._kvcr_op_to_segment_tag.pop(op_handle, None)
+            if operation_tag is None:
+                results.append(completed)
+            else:
+                state = self._target_segment_operations.get(operation_tag)
+                if state is not None:
+                    state.base_result = completed
         results.extend(self._framework_pin_adapter.take_pin_job_results())
         return results
 
@@ -1020,6 +1371,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     def on_new_request(self, req_context: ReqContext) -> RequestOffloadingContext:
         hint = _parse_router_hint(req_context.kv_transfer_params)
         if hint is not None:
+            if self._multi_segment:
+                self._segment_sources[req_context.req_id] = hint.source
             if self._telemetry_enabled:
                 self._adapter_stats.increase_counter(
                     _vllm_metric_name(_HINT_BLOCKS_RECEIVED_METRIC),
@@ -1041,6 +1394,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
 
     @override
     def on_request_finished(self, req_context: ReqContext) -> None:
+        self._segment_sources.pop(req_context.req_id, None)
         state = self._hint_metric_states.get(req_context.req_id)
         if state is not None:
             unclassified = state.block_hashes - state.classified
@@ -1152,6 +1506,12 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             logger.warning("KVCR drain timed out during shutdown", exc_info=True)
         # TODO: Keep registered buffers alive if KVCR.close() fails.
         self._kvcr.close()
+        if self._segment_socket is not None:
+            self._segment_socket.close(linger=0)
+            self._segment_socket = None
+        for sender in self._segment_senders.values():
+            sender.close(linger=0)
+        self._segment_senders.clear()
         if self._local_dram_mmap is not None:
             self._local_dram_mmap.close()
             self._local_dram_mmap = None
