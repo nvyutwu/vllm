@@ -59,7 +59,12 @@ class KVCRSegmentManifest:
         if self.target_segment.rank_start == 0:
             raise ValueError("KVCR owns row zero; manifest must name extra row")
         self.target_segment.validate()
-        if self.expires_at <= time.monotonic():
+        # This field is carried over ZMQ to a different pod. ``monotonic``
+        # epochs are deliberately host-local and therefore cannot be put on
+        # the wire: a legitimate remote manifest can look immediately stale
+        # if that host booted earlier. Use the cluster-synchronised wall clock
+        # only for this cross-host lease.
+        if self.expires_at <= time.time():
             raise ValueError("expired KVCR segment manifest")
 
     def to_wire(self) -> dict[str, Any]:

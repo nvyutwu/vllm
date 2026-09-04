@@ -17,6 +17,7 @@ from vllm.v1.kv_offload.tiering.kvcr.multisegment import (
     encode_manifest,
     encode_terminal,
 )
+from vllm.v1.kv_offload.tiering.kvcr import multisegment
 from vllm.v1.kv_offload.tiering.p2p.segment import SegmentRegistration, _layout_digest
 
 pytestmark = pytest.mark.cpu_test
@@ -53,7 +54,7 @@ def test_manifest_round_trip_preserves_rank_and_target_blocks() -> None:
         source_keys=(b"physical-group-0", b"physical-group-mamba"),
         target_block_ids=(77, 81),
         target_segment=_registration(),
-        expires_at=time.monotonic() + 30,
+        expires_at=time.time() + 30,
     )
 
     assert decode_manifest(encode_manifest(manifest)) == manifest
@@ -79,11 +80,31 @@ def test_manifest_rejects_expired_target_reservation() -> None:
         source_keys=(b"physical-group-0",),
         target_block_ids=(77,),
         target_segment=_registration(),
-        expires_at=time.monotonic() - 1,
+        expires_at=time.time() - 1,
     )
 
     with pytest.raises(ValueError, match="expired"):
         encode_manifest(manifest)
+
+
+def test_manifest_lease_does_not_use_sender_monotonic_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manifest from a later-booted pod remains valid on this host."""
+    manifest = KVCRSegmentManifest(
+        operation_tag="cross-host-lease",
+        request_id="request-4",
+        reply_endpoint="tcp://target:17772",
+        source_keys=(b"physical-group-0",),
+        target_block_ids=(77,),
+        target_segment=_registration(),
+        expires_at=time.time() + 30,
+    )
+    # A remote pod can have any monotonic epoch. A value past the lease would
+    # have rejected the pre-v61 wire contract even though wall time is valid.
+    monkeypatch.setattr(multisegment.time, "monotonic", lambda: manifest.expires_at + 1)
+
+    assert decode_manifest(encode_manifest(manifest)) == manifest
 
 
 def test_source_pin_result_waits_for_extra_segment_and_base_release() -> None:

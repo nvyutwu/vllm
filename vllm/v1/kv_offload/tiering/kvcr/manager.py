@@ -1040,7 +1040,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     operation_tag,
                 )
             return False
-        if manifest.expires_at <= time.monotonic():
+        if manifest.expires_at <= time.time():
             if _segment_diagnostics_enabled():
                 logger.warning(
                     "KVCR segment transition=prepare_rejected reason=expired tag=%s",
@@ -1296,7 +1296,10 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     source_keys=source_keys,
                     target_block_ids=target_block_ids,
                     target_segment=target_segment,
-                    expires_at=time.monotonic() + self._segment_deadline_s,
+                    # The manifest crosses pod boundaries, so its lease must
+                    # use a shared clock; ``time.monotonic`` has a distinct
+                    # epoch on every host.
+                    expires_at=time.time() + self._segment_deadline_s,
                 )
                 self._target_segment_operations[operation_tag] = _TargetSegmentState(
                     job_metadata=job_metadata,
@@ -1433,7 +1436,9 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     def get_finished_jobs(self) -> Iterable[JobResult]:
         self._poll_segment_control()
         if self._multi_segment:
-            now = time.monotonic()
+            # ``state.deadline`` is the manifest's cross-host wall-clock
+            # lease. Do not compare it to this process's monotonic epoch.
+            now = time.time()
             for operation_tag, state in tuple(self._target_segment_operations.items()):
                 if now >= state.deadline and not state.base_started:
                     self._target_segment_operations.pop(operation_tag, None)
@@ -1457,7 +1462,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         for operation_tag, state in tuple(self._target_segment_operations.items()):
             if state.base_result is None:
                 continue
-            if state.segment_success is None and time.monotonic() < state.deadline:
+            if state.segment_success is None and time.time() < state.deadline:
                 continue
             self._target_segment_operations.pop(operation_tag, None)
             if _segment_diagnostics_enabled():

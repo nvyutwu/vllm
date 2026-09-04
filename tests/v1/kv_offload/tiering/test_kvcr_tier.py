@@ -494,7 +494,7 @@ def test_rank_complete_source_queues_all_batched_primary_blocks(monkeypatch):
         source_keys=(b"k0", b"k1"),
         target_block_ids=(1, 3),
         target_segment=registration,
-        expires_at=time.monotonic() + 30,
+        expires_at=time.time() + 30,
     )
     tier._segment_manifests[manifest.operation_tag] = manifest
     monkeypatch.setattr(
