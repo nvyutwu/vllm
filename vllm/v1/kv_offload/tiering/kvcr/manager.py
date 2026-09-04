@@ -10,7 +10,7 @@ import os
 import socket
 import time
 import uuid
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
@@ -52,6 +52,7 @@ from kvcr.types import (
     CacheTier,
     InventoryEvent,
     MemDescriptor,
+    OpEntryResult,
     OpHandle,
     PinRequestId,
     PinResult,
@@ -239,6 +240,16 @@ def _format_transfer_job_blocks(
             f"{get_offload_block_hash(key)[-8:].hex()}->b{int(block_id)}"
         )
     return ",".join(entries)
+
+
+def _format_completion_entries(entries: Mapping[BlockKey, OpEntryResult]) -> str:
+    """Format source deposit outcomes without exposing full block hashes."""
+    return ",".join(
+        f"g{get_offload_group_idx(OffloadKey(bytes(key)))}:"
+        f"{get_offload_block_hash(OffloadKey(bytes(key)))[-8:].hex()}="
+        f"{'ok' if entry.success else 'failed'}"
+        for key, entry in entries.items()
+    )
 
 
 _BUILTIN_POLICIES: dict[str, type[KVCachePolicy]] = {
@@ -1609,6 +1620,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             ) = job_state
             remaining -= len(entries)
             success = success and all(entry.success for entry in entries.values())
+            if _source_trace_enabled() and request_id is None:
+                logger.info(
+                    "KVCR source trace transition=deposit_result op=%s final=%s "
+                    "entries=[%s]",
+                    op_handle,
+                    remaining == 0,
+                    _format_completion_entries(entries),
+                )
             diagnostic_blocks = self._row_diagnostics_by_op.get(op_handle)
             if diagnostic_blocks is not None:
                 completed_rows = [
