@@ -131,6 +131,7 @@ _ROW_DIAGNOSTICS_ENV = "VLLM_KVCR_ROW_DIAGNOSTICS"
 _ROW_DIAGNOSTIC_MAX_BYTES = 4096
 _ROW_DIAGNOSTIC_SAMPLE_COUNT = 64
 _SEGMENT_DIAGNOSTICS_ENV = "VLLM_KVCR_SEGMENT_DIAGNOSTICS"
+_SOURCE_TRACE_ENV = "VLLM_KVCR_SOURCE_TRACE"
 
 logger = init_logger(__name__)
 
@@ -153,6 +154,21 @@ def _segment_diagnostics_enabled() -> bool:
     """
 
     return os.getenv(_SEGMENT_DIAGNOSTICS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _source_trace_enabled() -> bool:
+    """Whether to emit source-residency diagnostics for hybrid P2P debugging.
+
+    This is deliberately separate from row fingerprints: it records only
+    physical group IDs, an opaque hash suffix, and primary block IDs.  It must
+    never log prompts, complete hashes, addresses, or cache bytes.
+    """
+    return os.getenv(_SOURCE_TRACE_ENV, "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -210,6 +226,19 @@ def _format_pin_lookup(key: OffloadKey, result: LookupResult) -> str:
         f"g{get_offload_group_idx(key)}:"
         f"{get_offload_block_hash(key)[-8:].hex()}={result.name}"
     )
+
+
+def _format_transfer_job_blocks(
+    keys: Collection[OffloadKey], block_ids: Collection[int]
+) -> str:
+    """Format an opaque physical-group -> primary-block mapping for tracing."""
+    entries = []
+    for key, block_id in zip(keys, block_ids, strict=True):
+        entries.append(
+            f"g{get_offload_group_idx(key)}:"
+            f"{get_offload_block_hash(key)[-8:].hex()}->b{int(block_id)}"
+        )
+    return ",".join(entries)
 
 
 _BUILTIN_POLICIES: dict[str, type[KVCachePolicy]] = {
@@ -390,7 +419,10 @@ class _FrameworkPinAdapter:
             lookup_results = tuple(
                 (key, parent.lookup(key, req_context)) for key in offload_keys
             )
-            if os.environ.get("VLLM_KVCR_PIN_DIAGNOSTICS") == "1":
+            if (
+                os.environ.get("VLLM_KVCR_PIN_DIAGNOSTICS") == "1"
+                or _source_trace_enabled()
+            ):
                 logger.info(
                     "KVCR source pin lookup: request_id=%s keys=%s",
                     request_id,
@@ -400,6 +432,13 @@ class _FrameworkPinAdapter:
                 key for key, result in lookup_results if result is LookupResult.HIT
             )
             if not hit_keys:
+                if _source_trace_enabled():
+                    logger.info(
+                        "KVCR source trace transition=primary_pin_empty "
+                        "request=%s requested=%d",
+                        request_id,
+                        len(offload_keys),
+                    )
                 return None
 
             job = parent.create_store_job(hit_keys, req_context)
@@ -407,6 +446,14 @@ class _FrameworkPinAdapter:
             block_ids = tuple(int(block_id) for block_id in job.block_ids)
             if len(job_keys) != len(block_ids) or set(job_keys) != set(hit_keys):
                 return None
+            if _source_trace_enabled():
+                logger.info(
+                    "KVCR source trace transition=primary_pin_acquired "
+                    "request=%s job=%d blocks=[%s]",
+                    request_id,
+                    job.job_id,
+                    _format_transfer_job_blocks(job_keys, block_ids),
+                )
 
             descriptors: dict[BlockKey, MemDescriptor | None] = {
                 BlockKey(bytes(key)): None for key in offload_keys
@@ -741,6 +788,20 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             raise ValueError("primary KV memoryview must expose strides")
         self._primary_row_stride = int(primary_kv_view.strides[0])
         self._primary_num_blocks = primary_kv_view.nbytes // self._primary_row_stride
+        if _source_trace_enabled():
+            logger.info(
+                "KVCR source trace transition=geometry engine=%s rank=%s "
+                "world_size=%d local_world_size=%d dcp_size=%s "
+                "group_tokens=%s hash_tokens=%s blocks_per_chunk=%s",
+                getattr(offloading_spec.config, "engine_id", "unknown"),
+                getattr(parallel, "rank", "unknown"),
+                world_size,
+                local_world_size,
+                getattr(parallel, "dcp_size", "unknown"),
+                tuple(getattr(offloading_spec, "tokens_per_block", ())),
+                getattr(offloading_spec, "tokens_per_hash", "unknown"),
+                getattr(offloading_spec, "blocks_per_chunk", "unknown"),
+            )
         if secondary_g2_slots < 0:
             raise ValueError("secondary_g2_slots must be non-negative")
         if (
@@ -1048,6 +1109,16 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 )
             return False
         source_keys = tuple(bytes(key) for key in keys)
+        if _source_trace_enabled():
+            logger.info(
+                "KVCR source trace transition=extra_prepare_received "
+                "tag=%s completed=%d manifest_total=%d groups=%s pins=%d",
+                operation_tag,
+                len(source_keys),
+                len(manifest.source_keys),
+                [get_offload_group_idx(OffloadKey(key)) for key in source_keys],
+                len(pin_handles),
+            )
         if (
             len(source_keys) != len(manifest.source_keys)
             or set(source_keys) != set(manifest.source_keys)
@@ -1243,6 +1314,16 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 JobResult(job_id=job_metadata.job_id, success=True)
             )
             return
+        if _source_trace_enabled():
+            logger.info(
+                "KVCR source trace transition=target_primary_allocated "
+                "job=%d request=%s blocks=[%s]",
+                job_metadata.job_id,
+                job_metadata.req_context.req_id,
+                _format_transfer_job_blocks(
+                    job_metadata.keys, job_metadata.block_ids
+                ),
+            )
 
         operation_tag: str | None = None
         if self._multi_segment:
@@ -1415,6 +1496,16 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 JobResult(job_id=job_metadata.job_id, success=True)
             )
             return
+        if _source_trace_enabled():
+            logger.info(
+                "KVCR source trace transition=deposit job=%d request=%s "
+                "blocks=[%s]",
+                job_metadata.job_id,
+                job_metadata.req_context.req_id,
+                _format_transfer_job_blocks(
+                    job_metadata.keys, job_metadata.block_ids
+                ),
+            )
         if _row_diagnostics_enabled():
             logger.info(
                 "KVCR primary row fingerprints role=source_primary_pre_deposit "

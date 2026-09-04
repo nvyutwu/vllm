@@ -1184,6 +1184,14 @@ def test_kvcr_pin_lookup_diagnostic_redacts_block_hash():
     )
 
 
+def test_kvcr_source_trace_keeps_group_and_primary_block_but_redacts_hash():
+    key = make_offload_key(b"0123456789", 3)
+
+    assert kvcr_manager._format_transfer_job_blocks([key], [17]) == (
+        "g3:3233343536373839->b17"
+    )
+
+
 def test_kvcr_telemetry_is_opt_in_and_namespaced_at_vllm_boundary(monkeypatch):
     """Keep telemetry opt-in and namespace metrics only at the vLLM boundary."""
     assert KVCRSecondaryTierManager.build_metric_definitions({}) == {}
