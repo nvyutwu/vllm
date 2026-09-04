@@ -383,7 +383,7 @@ def test_rank_complete_target_promotes_only_after_both_rows_complete(monkeypatch
     tier = _make_tier(
         monkeypatch,
         kvcr,
-        control_ports=[31251],
+        control_ports=[31261],
         world_size=8,
         local_world_size=4,
         multi_segment=True,
