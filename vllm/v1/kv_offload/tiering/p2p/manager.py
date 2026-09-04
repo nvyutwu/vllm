@@ -34,6 +34,7 @@ from vllm.v1.kv_offload.tiering.base import (
 )
 from vllm.v1.kv_offload.tiering.p2p.control import ControlTransport, ZmqTransport
 from vllm.v1.kv_offload.tiering.p2p.data import DataTransport, NixlTransport
+from vllm.v1.kv_offload.tiering.p2p.segment import SegmentedNixlTransport
 from vllm.v1.kv_offload.tiering.p2p.session import P2PSession
 
 if TYPE_CHECKING:
@@ -207,6 +208,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         port: int | None = None,
         backends: list[str] | None = None,
         num_threads: int = 4,
+        multi_segment: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize the P2P secondary tier manager.
@@ -256,7 +258,10 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         # Do not let a partial transfer become a logical cache HIT.  A future
         # rank-complete gather -> P2P -> scatter staging path will clear this
         # guard; it must preserve every global-rank row before doing so.
-        self._rank_complete_staging_required = local_world_size < world_size
+        self._rank_complete_staging_required = (
+            local_world_size < world_size and not multi_segment
+        )
+        self._multi_segment = multi_segment and local_world_size < world_size
         if self._rank_complete_staging_required:
             logger.warning(
                 "P2P KV offload disabled: world_size=%d local_world_size=%d "
@@ -306,13 +311,31 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             blocks_per_file=offloading_spec.blocks_per_chunk,
             parallel_agnostic=True,
         ).get_run_config()
-        self._data: DataTransport = NixlTransport(
-            self._nixl_agent_name,
-            primary_kv_view,
-            config_fields=config_fields,
-            backends=backends,
-            num_threads=int(num_threads),
-        )
+        self._data: DataTransport
+        if self._multi_segment:
+            # Workers own the two pod-local mmap rows.  This scheduler facade
+            # issues one command per row and reports a logical transfer done
+            # only after all of them acknowledge.
+            self._data = SegmentedNixlTransport(
+                primary_kv_view,
+                config_fields=config_fields,
+                world_size=world_size,
+                local_world_size=local_world_size,
+            )
+            logger.info(
+                "P2P KV offload enabled with rank-complete mmap segments "
+                "world_size=%d local_world_size=%d",
+                world_size,
+                local_world_size,
+            )
+        else:
+            self._data = NixlTransport(
+                self._nixl_agent_name,
+                primary_kv_view,
+                config_fields=config_fields,
+                backends=backends,
+                num_threads=int(num_threads),
+            )
         self._control: ControlTransport = ZmqTransport(self._local_id, host, port)
 
         self._sessions: dict[str, P2PSession] = {}
@@ -351,9 +374,36 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         """
         return getattr(self, "_rank_complete_staging_required", False)
 
+    def _segments_ready(self) -> bool:
+        """Whether both worker-owned mmap rows are registered."""
+        if not getattr(self, "_multi_segment", False):
+            return True
+        return bool(getattr(self._data, "ready", False))
+
+    def update_worker_metadata(self, metadata: Any) -> None:
+        """Consume worker registrations and RDMA acknowledgements.
+
+        Called by the offloading connector after its normal all-worker output
+        aggregation.  It is intentionally a no-op for the legacy one-region
+        transport and keeps the secondary-tier scheduler interface unchanged.
+        """
+        if not getattr(self, "_multi_segment", False):
+            return
+        update = getattr(self._data, "update_worker_metadata", None)
+        if update is not None:
+            update(metadata.segment_registrations.values(), metadata.segment_results)
+
+    def take_worker_segment_commands(self) -> tuple[Any, ...]:
+        if not getattr(self, "_multi_segment", False):
+            return ()
+        take = getattr(self._data, "take_worker_commands", None)
+        return take() if take is not None else ()
+
     @override
     def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
         if self._requires_rank_complete_staging():
+            return LookupResult.MISS
+        if not self._segments_ready():
             return LookupResult.MISS
         source = req_context.get_state(P2PSourceInfo)
         if source is None:
@@ -399,7 +449,7 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             return RequestOffloadingContext()
         _annotate_req_context(req_context)
         source = req_context.get_state(P2PSourceInfo)
-        if source is not None:
+        if source is not None and self._segments_ready():
             self._get_or_create_session(source.peer_id)
         return RequestOffloadingContext()
 
@@ -449,6 +499,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             # The primary CPU tier has already completed its local store.  No
             # remote P2P work was advertised, so complete the secondary job
             # locally rather than leave a pinned primary block behind.
+            self._finished_jobs.append(JobResult(job_id=job_id, success=True))
+            return
+        if not self._segments_ready():
             self._finished_jobs.append(JobResult(job_id=job_id, success=True))
             return
         keys = list(job_metadata.keys)
@@ -514,6 +567,9 @@ class P2PSecondaryTierManager(SecondaryTierManager):
             # Defensive only: lookup() returns MISS under this guard, so a
             # promotion should never be scheduled.  Surface failure rather
             # than loading a partial logical block.
+            self._finished_jobs.append(JobResult(job_id=job_id, success=False))
+            return
+        if not self._segments_ready():
             self._finished_jobs.append(JobResult(job_id=job_id, success=False))
             return
         keys = list(job_metadata.keys)
@@ -663,6 +719,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
         otherwise open an outbound ControlConnection and build a
         connected session.
         """
+        if not self._segments_ready():
+            raise RuntimeError("rank-complete worker segments are not ready")
         session = self._sessions.get(peer_id)
         if session is not None:
             return session
@@ -686,6 +744,8 @@ class P2PSecondaryTierManager(SecondaryTierManager):
                 conn.peer_id,
             )
             try:
+                if not self._segments_ready():
+                    raise ValueError("rank-complete worker segments are not ready")
                 existing = self._sessions.get(conn.peer_id)
                 if existing is not None:
                     raise ValueError(f"duplicate connection from {conn.peer_id}")

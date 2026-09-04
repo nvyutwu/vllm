@@ -1622,6 +1622,7 @@ class OffloadingConnectorScheduler:
             load_jobs=self._current_batch_load_jobs,
             store_jobs=partial_store_jobs | normal_store_jobs,
             jobs_to_flush=self._current_batch_jobs_to_flush,
+            segment_commands=self.manager.take_worker_segment_commands(),
         )
 
         # All prepare_store calls for finished requests have been issued.
@@ -1659,6 +1660,7 @@ class OffloadingConnectorScheduler:
         if not isinstance(meta, OffloadingWorkerMetadata):
             assert meta is None
             meta = OffloadingWorkerMetadata()
+        self.manager.update_worker_metadata(meta)
         if not meta.transfer_stats.is_empty():
             transfer_stats = OffloadingConnectorStats()
             if not meta.transfer_stats.load.is_empty():

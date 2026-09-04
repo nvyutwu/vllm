@@ -34,6 +34,8 @@ from vllm.v1.kv_offload.base import (
     OffloadingSpec,
     OffloadingWorker,
 )
+from vllm.v1.kv_offload.file_mapper import FileMapper
+from vllm.v1.kv_offload.tiering.p2p.segment import SegmentAgent
 
 logger = init_logger(__name__)
 
@@ -62,9 +64,80 @@ class OffloadingConnectorWorker:
             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
         ] = []
         self._connector_worker_meta = OffloadingWorkerMetadata()
+        self._segment_agent: SegmentAgent | None = None
+
+    def _rank_complete_p2p_config(self) -> dict | None:
+        """Return the opted-in P2P config, if this worker owns one mmap row."""
+        for tier in self.spec.extra_config.get("secondary_tiers", []):
+            if (
+                isinstance(tier, dict)
+                and tier.get("tier_type") == "p2p"
+                and tier.get("multi_segment") is True
+            ):
+                return tier
+        return None
+
+    def _maybe_init_segment_agent(self) -> None:
+        tier = self._rank_complete_p2p_config()
+        if tier is None or self.worker is None or self._segment_agent is not None:
+            return
+        parallel = self.spec.config.parallel
+        world_size = parallel.world_size
+        local_world_size = parallel.local_world_size or world_size
+        if local_world_size >= world_size:
+            return
+        global_rank = parallel.rank
+        rank_start = global_rank - (global_rank % local_world_size)
+        if global_rank != rank_start:
+            return
+        try:
+            config_fields = FileMapper.from_offloading_spec(
+                root_dir="",
+                offloading_spec=self.spec,
+                blocks_per_file=self.spec.blocks_per_chunk,
+                parallel_agnostic=True,
+            ).get_run_config()
+            self._segment_agent = SegmentAgent(
+                engine_id=self.spec.config.engine_id,
+                rank_start=rank_start,
+                local_slots=local_world_size,
+                view=self.worker.get_segment_memoryview(),
+                config_fields=config_fields,
+                backends=tier.get("backends"),
+                num_threads=int(tier.get("num_threads", 4)),
+            )
+            logger.info(
+                "KVCR rank-complete P2P segment registered ranks=[%d,%d)",
+                rank_start,
+                rank_start + local_world_size,
+            )
+        except Exception:
+            # No registration means the scheduler retains the fail-closed
+            # fallback. Do not turn an optional secondary tier into an engine
+            # startup failure.
+            logger.exception("KVCR rank-complete P2P segment initialization failed")
+
+    def _run_segment_commands(self, metadata: OffloadingConnectorMetadata) -> None:
+        agent = self._segment_agent
+        if agent is None:
+            return
+        for command in metadata.segment_commands:
+            immediate = agent.submit(command)
+            if immediate is not None:
+                self._connector_worker_meta.segment_results = (
+                    *self._connector_worker_meta.segment_results,
+                    immediate,
+                )
+        completed = agent.poll()
+        if completed:
+            self._connector_worker_meta.segment_results = (
+                *self._connector_worker_meta.segment_results,
+                *completed,
+            )
 
     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
         self.worker = self.spec.get_worker(kv_caches)
+        self._maybe_init_segment_agent()
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         kv_cache_config = self.kv_cache_config
@@ -318,6 +391,7 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         assert self.worker is not None
+        self._run_segment_commands(metadata)
         for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
             success = self.worker.submit_store(job_id, src_spec, dst_spec)
             assert success
@@ -354,6 +428,9 @@ class OffloadingConnectorWorker:
             blocked on remote KV (and free aborted-during-load reqs).
         """
         assert self.worker is not None
+        # Poll continuously while the engine is taking no-forward P2P ticks.
+        # Commands were submitted in start_kv_transfers() on this same step.
+        self._run_segment_commands(OffloadingConnectorMetadata({}, {}))
         finished_recving: set[str] = set()
         for transfer_result in self.worker.get_finished():
             # we currently do not support job failures
@@ -382,7 +459,17 @@ class OffloadingConnectorWorker:
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         """Return completed transfer job IDs since the last call."""
-        if not self._connector_worker_meta.completed_jobs:
+        if self._segment_agent is not None:
+            self._connector_worker_meta.segment_registrations = {
+                self._segment_agent.registration.segment_id: (
+                    self._segment_agent.registration
+                )
+            }
+        if (
+            not self._connector_worker_meta.completed_jobs
+            and not self._connector_worker_meta.segment_registrations
+            and not self._connector_worker_meta.segment_results
+        ):
             return None
         meta = self._connector_worker_meta
         self._connector_worker_meta = OffloadingWorkerMetadata()
@@ -392,5 +479,8 @@ class OffloadingConnectorWorker:
         self._unsubmitted_store_jobs.clear()
         self._load_jobs.clear()
         self._connector_worker_meta = OffloadingWorkerMetadata()
+        if self._segment_agent is not None:
+            self._segment_agent.close()
+            self._segment_agent = None
         if self.worker is not None:
             self.worker.shutdown()
