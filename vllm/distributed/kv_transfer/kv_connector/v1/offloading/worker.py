@@ -140,6 +140,13 @@ class OffloadingConnectorWorker:
             return
         for command in metadata.segment_commands:
             immediate = agent.submit(command)
+            logger.info(
+                "KVCR segment transition=worker_command operation=%d "
+                "segment=%d accepted=%s",
+                command.operation_id,
+                command.segment_id,
+                immediate is None,
+            )
             if immediate is not None:
                 self._connector_worker_meta.segment_results = (
                     *self._connector_worker_meta.segment_results,
@@ -147,6 +154,10 @@ class OffloadingConnectorWorker:
                 )
         completed = agent.poll()
         if completed:
+            logger.info(
+                "KVCR segment transition=worker_poll_results operations=%s",
+                [(result.operation_id, result.success) for result in completed],
+            )
             self._connector_worker_meta.segment_results = (
                 *self._connector_worker_meta.segment_results,
                 *completed,

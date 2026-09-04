@@ -130,12 +130,29 @@ _TARGET_INVENTORY_MISMATCH_METRIC = "kvcr_target_inventory_mismatch"
 _ROW_DIAGNOSTICS_ENV = "VLLM_KVCR_ROW_DIAGNOSTICS"
 _ROW_DIAGNOSTIC_MAX_BYTES = 4096
 _ROW_DIAGNOSTIC_SAMPLE_COUNT = 64
+_SEGMENT_DIAGNOSTICS_ENV = "VLLM_KVCR_SEGMENT_DIAGNOSTICS"
 
 logger = init_logger(__name__)
 
 
 def _row_diagnostics_enabled() -> bool:
     return os.getenv(_ROW_DIAGNOSTICS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _segment_diagnostics_enabled() -> bool:
+    """Whether to emit rank-complete control-plane state transitions.
+
+    These logs deliberately contain only opaque operation/request identifiers,
+    rank ranges, and outcome codes.  They never print cache keys, addresses,
+    or model inputs.
+    """
+
+    return os.getenv(_SEGMENT_DIAGNOSTICS_ENV, "").strip().lower() in {
         "1",
         "true",
         "yes",
@@ -837,17 +854,52 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             if old is not None and old != registration:
                 raise ValueError("KVCR segment registration changed during runtime")
             self._segment_registrations[registration.segment_id] = registration
+            if old is None and _segment_diagnostics_enabled():
+                logger.info(
+                    "KVCR segment transition=registration_received "
+                    "segment=%d ranks=[%d,%d) blocks=%d block_len=%d",
+                    registration.segment_id,
+                    registration.rank_start,
+                    registration.rank_end,
+                    registration.num_blocks,
+                    registration.block_len,
+                )
         for result in getattr(metadata, "segment_results", ()):
             manifest = self._source_segment_operations.pop(result.operation_id, None)
             if manifest is None:
+                if _segment_diagnostics_enabled():
+                    logger.warning(
+                        "KVCR segment transition=result_unmatched operation=%d "
+                        "segment=%d success=%s",
+                        result.operation_id,
+                        result.segment_id,
+                        result.success,
+                    )
                 continue
+            if _segment_diagnostics_enabled():
+                logger.info(
+                    "KVCR segment transition=worker_result operation=%d tag=%s "
+                    "segment=%d success=%s",
+                    result.operation_id,
+                    manifest.operation_tag,
+                    result.segment_id,
+                    result.success,
+                )
             self._framework_pin_adapter.complete_deferred_operation(
                 manifest.operation_tag, result.success
             )
-            self._send_segment(
+            terminal_sent = self._send_segment(
                 manifest.reply_endpoint,
                 encode_terminal(manifest.operation_tag, result.success),
             )
+            if _segment_diagnostics_enabled():
+                logger.info(
+                    "KVCR segment transition=terminal_sent tag=%s success=%s "
+                    "sent=%s",
+                    manifest.operation_tag,
+                    result.success,
+                    terminal_sent,
+                )
 
     def take_worker_segment_commands(self) -> tuple[SegmentTransferCommand, ...]:
         commands = tuple(self._segment_commands)
@@ -892,30 +944,72 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     continue
                 target = self._target_segment_operations.get(operation_tag)
                 if target is None:
+                    if _segment_diagnostics_enabled():
+                        logger.warning(
+                            "KVCR segment transition=terminal_unmatched type=%s "
+                            "tag=%s success=%s",
+                            message_type,
+                            operation_tag,
+                            success,
+                        )
                     continue
                 if message_type == "ack":
                     target.acknowledged = success
                 elif message_type == "done":
                     target.segment_success = success
+                if _segment_diagnostics_enabled():
+                    logger.info(
+                        "KVCR segment transition=terminal_received type=%s "
+                        "tag=%s success=%s base_started=%s",
+                        message_type,
+                        operation_tag,
+                        success,
+                        target.base_started,
+                    )
                 continue
             if manifest.target_segment.segment_id not in self._segment_registrations:
-                self._send_segment(
+                sent = self._send_segment(
                     manifest.reply_endpoint,
                     encode_ack(manifest.operation_tag, False),
                 )
+                if _segment_diagnostics_enabled():
+                    logger.warning(
+                        "KVCR segment transition=manifest_rejected "
+                        "reason=missing_local_segment "
+                        "tag=%s segment=%d ack_sent=%s",
+                        manifest.operation_tag,
+                        manifest.target_segment.segment_id,
+                        sent,
+                    )
                 continue
             old = self._segment_manifests.get(manifest.operation_tag)
             if old is not None and old != manifest:
-                self._send_segment(
+                sent = self._send_segment(
                     manifest.reply_endpoint,
                     encode_ack(manifest.operation_tag, False),
                 )
+                if _segment_diagnostics_enabled():
+                    logger.warning(
+                        "KVCR segment transition=manifest_rejected reason=tag_conflict "
+                        "tag=%s ack_sent=%s",
+                        manifest.operation_tag,
+                        sent,
+                    )
                 continue
             self._segment_manifests[manifest.operation_tag] = manifest
-            self._send_segment(
+            sent = self._send_segment(
                 manifest.reply_endpoint,
                 encode_ack(manifest.operation_tag, True),
             )
+            if _segment_diagnostics_enabled():
+                logger.info(
+                    "KVCR segment transition=manifest_received tag=%s request=%s "
+                    "segment=%d ack_sent=%s",
+                    manifest.operation_tag,
+                    manifest.request_id,
+                    manifest.target_segment.segment_id,
+                    sent,
+                )
 
     @staticmethod
     def _segment_endpoint_for(source_control_endpoint: str) -> str | None:
@@ -937,15 +1031,42 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
     ) -> bool:
         """Source callback: bind a pinned KVCR write to its extra mmap row."""
         manifest = self._segment_manifests.pop(operation_tag, None)
-        if manifest is None or manifest.expires_at <= time.monotonic():
+        if manifest is None:
+            if _segment_diagnostics_enabled():
+                logger.warning(
+                    "KVCR segment transition=prepare_rejected "
+                    "reason=unknown_tag tag=%s",
+                    operation_tag,
+                )
+            return False
+        if manifest.expires_at <= time.monotonic():
+            if _segment_diagnostics_enabled():
+                logger.warning(
+                    "KVCR segment transition=prepare_rejected reason=expired tag=%s",
+                    operation_tag,
+                )
             return False
         if tuple(bytes(key) for key in keys) != manifest.source_keys:
+            if _segment_diagnostics_enabled():
+                logger.warning(
+                    "KVCR segment transition=prepare_rejected "
+                    "reason=key_mismatch tag=%s",
+                    operation_tag,
+                )
             return False
         block_ids = {
             (int(descriptor.addr) - self._primary_base_addr) // self._primary_row_stride
             for descriptor in descriptors.values()
         }
         if len(block_ids) != 1 or min(block_ids) < 0:
+            if _segment_diagnostics_enabled():
+                logger.warning(
+                    "KVCR segment transition=prepare_rejected "
+                    "reason=source_block_geometry "
+                    "tag=%s blocks=%d",
+                    operation_tag,
+                    len(block_ids),
+                )
             return False
         local_segment = self._segment_registrations.get(
             manifest.target_segment.segment_id
@@ -954,8 +1075,23 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             local_segment is None
             or not local_segment.compatible_with(manifest.target_segment)
         ):
+            if _segment_diagnostics_enabled():
+                logger.warning(
+                    "KVCR segment transition=prepare_rejected reason=layout_mismatch "
+                    "tag=%s segment=%d local_present=%s",
+                    operation_tag,
+                    manifest.target_segment.segment_id,
+                    local_segment is not None,
+                )
             return False
         if not self._framework_pin_adapter.defer_pins(operation_tag, pin_handles):
+            if _segment_diagnostics_enabled():
+                logger.warning(
+                    "KVCR segment transition=prepare_rejected reason=pin_defer_failed "
+                    "tag=%s pins=%d",
+                    operation_tag,
+                    len(pin_handles),
+                )
             return False
         operation_id = next(self._next_segment_operation_id)
         self._source_segment_operations[operation_id] = manifest
@@ -969,6 +1105,16 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 remote_indices=(manifest.target_block_id,),
             )
         )
+        if _segment_diagnostics_enabled():
+            logger.info(
+                "KVCR segment transition=command_queued operation=%d tag=%s "
+                "segment=%d source_block=%d target_block=%d",
+                operation_id,
+                operation_tag,
+                local_segment.segment_id,
+                next(iter(block_ids)),
+                manifest.target_block_id,
+            )
         return True
 
     @override
@@ -1104,6 +1250,17 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     or target_segment is None
                     or len(block_ids) != 1
                 ):
+                    if _segment_diagnostics_enabled():
+                        logger.warning(
+                            "KVCR segment transition=load_rejected job=%d "
+                            "reason=missing_prerequisite source_endpoint=%s "
+                            "target_endpoint=%s target_segment=%s blocks=%d",
+                            job_metadata.job_id,
+                            source_endpoint is not None,
+                            self._segment_endpoint is not None,
+                            target_segment.segment_id if target_segment else None,
+                            len(block_ids),
+                        )
                     self._finished_jobs.append(
                         JobResult(job_id=job_metadata.job_id, success=False)
                     )
@@ -1124,7 +1281,21 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     source_endpoint=source_endpoint,
                     deadline=manifest.expires_at,
                 )
-                if not self._send_segment(source_endpoint, encode_manifest(manifest)):
+                manifest_sent = self._send_segment(
+                    source_endpoint, encode_manifest(manifest)
+                )
+                if _segment_diagnostics_enabled():
+                    logger.info(
+                        "KVCR segment transition=manifest_sent tag=%s job=%d "
+                        "request=%s source=%s target_segment=%d sent=%s",
+                        operation_tag,
+                        job_metadata.job_id,
+                        job_metadata.req_context.req_id,
+                        source_endpoint,
+                        target_segment.segment_id,
+                        manifest_sent,
+                    )
+                if not manifest_sent:
                     self._target_segment_operations.pop(operation_tag, None)
                     self._finished_jobs.append(
                         JobResult(job_id=job_metadata.job_id, success=False)
@@ -1134,6 +1305,12 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             if not existing.acknowledged or existing.base_started:
                 return
             existing.base_started = True
+            if _segment_diagnostics_enabled():
+                logger.info(
+                    "KVCR segment transition=base_deliver_start tag=%s job=%d",
+                    operation_tag,
+                    job_metadata.job_id,
+                )
 
         if operation_tag is None:
             # Preserve KVCR's untagged API path for normal single-row
@@ -1150,6 +1327,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             )
         if operation_tag is not None:
             self._kvcr_op_to_segment_tag[op_handle] = operation_tag
+            if _segment_diagnostics_enabled():
+                logger.info(
+                    "KVCR segment transition=base_deliver_submitted tag=%s "
+                    "job=%d op=%s",
+                    operation_tag,
+                    job_metadata.job_id,
+                    op_handle,
+                )
         if _row_diagnostics_enabled():
             self._row_diagnostics_by_op[op_handle] = blocks
         source_state = job_metadata.req_context.get_state(ExternalKVSourceState)
@@ -1229,6 +1414,14 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             for operation_tag, state in tuple(self._target_segment_operations.items()):
                 if now >= state.deadline and not state.base_started:
                     self._target_segment_operations.pop(operation_tag, None)
+                    if _segment_diagnostics_enabled():
+                        logger.warning(
+                            "KVCR segment transition=target_timeout tag=%s "
+                            "job=%d stage=awaiting_ack acknowledged=%s",
+                            operation_tag,
+                            state.job_metadata.job_id,
+                            state.acknowledged,
+                        )
                     self._finished_jobs.append(
                         JobResult(job_id=state.job_metadata.job_id, success=False)
                     )
@@ -1244,6 +1437,15 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
             if state.segment_success is None and time.monotonic() < state.deadline:
                 continue
             self._target_segment_operations.pop(operation_tag, None)
+            if _segment_diagnostics_enabled():
+                logger.info(
+                    "KVCR segment transition=target_terminal tag=%s job=%d "
+                    "base_success=%s segment_success=%s",
+                    operation_tag,
+                    state.job_metadata.job_id,
+                    state.base_result.success,
+                    state.segment_success,
+                )
             if state.base_result.success and state.segment_success is True:
                 results.append(state.base_result)
             else:
@@ -1353,6 +1555,22 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 state = self._target_segment_operations.get(operation_tag)
                 if state is not None:
                     state.base_result = completed
+                    if _segment_diagnostics_enabled():
+                        logger.info(
+                            "KVCR segment transition=base_deliver_result "
+                            "tag=%s job=%d success=%s",
+                            operation_tag,
+                            job_id,
+                            completed.success,
+                        )
+                elif _segment_diagnostics_enabled():
+                    logger.warning(
+                        "KVCR segment transition=base_result_unmatched tag=%s "
+                        "job=%d success=%s",
+                        operation_tag,
+                        job_id,
+                        completed.success,
+                    )
         results.extend(self._framework_pin_adapter.take_pin_job_results())
         return results
 
