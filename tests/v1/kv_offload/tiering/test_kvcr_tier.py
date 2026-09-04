@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import ctypes
+import time
 from collections.abc import Collection, Iterable, Mapping
 from types import SimpleNamespace
 
@@ -423,11 +424,20 @@ def test_rank_complete_target_promotes_only_after_both_rows_complete(monkeypatch
         },
     )
     tier.on_new_request(ctx)
-    job = _job(71, ctx, block_id=2)
+    keys = [OffloadKey(b"k0"), OffloadKey(b"k1")]
+    job = TransferJob(
+        job_id=71,
+        keys=keys,
+        block_ids=np.array([2, 3], dtype=np.int64),
+        is_promotion=True,
+        req_context=ctx,
+    )
 
     tier.submit_load(job)
     assert kvcr.deliver_calls == []
     [state] = tier._target_segment_operations.values()
+    assert state.manifest.source_keys == (b"k0", b"k1")
+    assert state.manifest.target_block_ids == (2, 3)
 
     state.acknowledged = True
     assert list(tier.get_finished_jobs()) == []
@@ -436,6 +446,74 @@ def test_rank_complete_target_promotes_only_after_both_rows_complete(monkeypatch
 
     state.segment_success = True
     assert list(tier.get_finished_jobs()) == [JobResult(job_id=71, success=True)]
+    tier.shutdown()
+
+
+def test_rank_complete_source_queues_all_batched_primary_blocks(monkeypatch):
+    """The extra row must cover every block in a batched promotion."""
+    kvcr = RecordingKVCR()
+    tier = _make_tier(
+        monkeypatch,
+        kvcr,
+        control_ports=[31251],
+        world_size=8,
+        local_world_size=4,
+        multi_segment=True,
+    )
+    fingerprint = "kimi-k3-mla-mamba"
+    registration = SegmentRegistration(
+        segment_id=4,
+        rank_start=4,
+        rank_end=8,
+        local_slots=4,
+        base_addr=0xDEADBEEF,
+        num_blocks=4,
+        block_len=16,
+        config_fingerprint=fingerprint,
+        layout_digest=_layout_digest(
+            rank_start=4,
+            rank_end=8,
+            local_slots=4,
+            num_blocks=4,
+            block_len=16,
+            config_fingerprint=fingerprint,
+        ),
+        agent_metadata=b"target-extra-row",
+    )
+    tier.update_worker_metadata(
+        OffloadingWorkerMetadata(segment_registrations={4: registration})
+    )
+    from vllm.v1.kv_offload.tiering.kvcr.multisegment import (
+        KVCRSegmentManifest,
+    )
+
+    manifest = KVCRSegmentManifest(
+        operation_tag="batch-7",
+        request_id="request-7",
+        reply_endpoint="tcp://target:17772",
+        source_keys=(b"k0", b"k1"),
+        target_block_ids=(1, 3),
+        target_segment=registration,
+        expires_at=time.monotonic() + 30,
+    )
+    tier._segment_manifests[manifest.operation_tag] = manifest
+    monkeypatch.setattr(
+        tier._framework_pin_adapter, "defer_pins", lambda *_: True
+    )
+    descriptors = {
+        BlockKey(b"k0"): tier._make_descriptor(2),
+        BlockKey(b"k1"): tier._make_descriptor(0),
+    }
+
+    assert tier._prepare_extra_write(
+        manifest.operation_tag,
+        [BlockKey(b"k1"), BlockKey(b"k0")],
+        descriptors,
+        ["pin-7"],
+    )
+    [command] = tier._segment_commands
+    assert command.local_indices == (2, 0)
+    assert command.remote_indices == (1, 3)
     tier.shutdown()
 
 

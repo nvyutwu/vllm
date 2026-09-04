@@ -740,6 +740,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
         if primary_kv_view.strides is None:
             raise ValueError("primary KV memoryview must expose strides")
         self._primary_row_stride = int(primary_kv_view.strides[0])
+        self._primary_num_blocks = primary_kv_view.nbytes // self._primary_row_stride
         if secondary_g2_slots < 0:
             raise ValueError("secondary_g2_slots must be non-negative")
         if (
@@ -1046,7 +1047,11 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     operation_tag,
                 )
             return False
-        if tuple(bytes(key) for key in keys) != manifest.source_keys:
+        source_keys = tuple(bytes(key) for key in keys)
+        if (
+            len(source_keys) != len(manifest.source_keys)
+            or set(source_keys) != set(manifest.source_keys)
+        ):
             if _segment_diagnostics_enabled():
                 logger.warning(
                     "KVCR segment transition=prepare_rejected "
@@ -1054,18 +1059,28 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     operation_tag,
                 )
             return False
-        block_ids = {
-            (int(descriptor.addr) - self._primary_base_addr) // self._primary_row_stride
-            for descriptor in descriptors.values()
-        }
-        if len(block_ids) != 1 or min(block_ids) < 0:
+        try:
+            source_block_ids = tuple(
+                (int(descriptors[BlockKey(key)].addr) - self._primary_base_addr)
+                // self._primary_row_stride
+                for key in manifest.source_keys
+            )
+        except KeyError:
+            source_block_ids = ()
+        if (
+            len(source_block_ids) != len(manifest.target_block_ids)
+            or any(
+                block_id < 0 or block_id >= self._primary_num_blocks
+                for block_id in source_block_ids
+            )
+        ):
             if _segment_diagnostics_enabled():
                 logger.warning(
                     "KVCR segment transition=prepare_rejected "
                     "reason=source_block_geometry "
                     "tag=%s blocks=%d",
                     operation_tag,
-                    len(block_ids),
+                    len(source_block_ids),
                 )
             return False
         local_segment = self._segment_registrations.get(
@@ -1101,19 +1116,20 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                 segment_id=local_segment.segment_id,
                 peer_id=operation_tag,
                 remote=manifest.target_segment,
-                local_indices=(next(iter(block_ids)),),
-                remote_indices=(manifest.target_block_id,),
+                local_indices=source_block_ids,
+                remote_indices=manifest.target_block_ids,
             )
         )
         if _segment_diagnostics_enabled():
             logger.info(
                 "KVCR segment transition=command_queued operation=%d tag=%s "
-                "segment=%d source_block=%d target_block=%d",
+                "segment=%d blocks=%d source_first=%d target_first=%d",
                 operation_id,
                 operation_tag,
                 local_segment.segment_id,
-                next(iter(block_ids)),
-                manifest.target_block_id,
+                len(source_block_ids),
+                source_block_ids[0],
+                manifest.target_block_ids[0],
             )
         return True
 
@@ -1243,12 +1259,19 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     self._segment_sources.get(job_metadata.req_context.req_id, "")
                 )
                 target_segment = next(iter(self._segment_registrations.values()), None)
-                block_ids = {int(block_id) for block_id in job_metadata.block_ids}
+                target_block_ids = tuple(
+                    int(block_id) for block_id in job_metadata.block_ids
+                )
+                source_keys = tuple(bytes(key) for key in job_metadata.keys)
                 if (
                     source_endpoint is None
                     or self._segment_endpoint is None
                     or target_segment is None
-                    or len(block_ids) != 1
+                    or not source_keys
+                    or len(blocks) != len(source_keys)
+                    or len(source_keys) != len(target_block_ids)
+                    or len(set(source_keys)) != len(source_keys)
+                    or any(block_id < 0 for block_id in target_block_ids)
                 ):
                     if _segment_diagnostics_enabled():
                         logger.warning(
@@ -1259,7 +1282,7 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                             source_endpoint is not None,
                             self._segment_endpoint is not None,
                             target_segment.segment_id if target_segment else None,
-                            len(block_ids),
+                            len(target_block_ids),
                         )
                     self._finished_jobs.append(
                         JobResult(job_id=job_metadata.job_id, success=False)
@@ -1270,8 +1293,8 @@ class KVCRSecondaryTierManager(SecondaryTierManager):
                     operation_tag=operation_tag,
                     request_id=job_metadata.req_context.req_id,
                     reply_endpoint=self._segment_endpoint,
-                    source_keys=tuple(bytes(key) for key in blocks),
-                    target_block_id=next(iter(block_ids)),
+                    source_keys=source_keys,
+                    target_block_ids=target_block_ids,
                     target_segment=target_segment,
                     expires_at=time.monotonic() + self._segment_deadline_s,
                 )

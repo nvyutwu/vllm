@@ -45,13 +45,13 @@ def _registration() -> SegmentRegistration:
     )
 
 
-def test_manifest_round_trip_preserves_rank_and_target_block() -> None:
+def test_manifest_round_trip_preserves_rank_and_target_blocks() -> None:
     manifest = KVCRSegmentManifest(
         operation_tag="generation-9",
         request_id="request-4",
         reply_endpoint="tcp://target:17772",
         source_keys=(b"physical-group-0", b"physical-group-mamba"),
-        target_block_id=77,
+        target_block_ids=(77, 81),
         target_segment=_registration(),
         expires_at=time.monotonic() + 30,
     )
@@ -77,7 +77,7 @@ def test_manifest_rejects_expired_target_reservation() -> None:
         request_id="request-4",
         reply_endpoint="tcp://target:17772",
         source_keys=(b"physical-group-0",),
-        target_block_id=77,
+        target_block_ids=(77,),
         target_segment=_registration(),
         expires_at=time.monotonic() - 1,
     )

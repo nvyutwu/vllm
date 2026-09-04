@@ -20,7 +20,7 @@ from typing import Any
 
 from vllm.v1.kv_offload.tiering.p2p.segment import SegmentRegistration
 
-_WIRE_VERSION = 1
+_WIRE_VERSION = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,7 +31,12 @@ class KVCRSegmentManifest:
     request_id: str
     reply_endpoint: str
     source_keys: tuple[bytes, ...]
-    target_block_id: int
+    # ``TieringOffloadingManager`` batches all promotions for one request into
+    # a single TransferJob.  This tuple stays positionally aligned with
+    # ``source_keys`` so the source agent writes every rank-4 row page into
+    # the matching target primary slot before the batched base delivery is
+    # allowed to complete.
+    target_block_ids: tuple[int, ...]
     target_segment: SegmentRegistration
     expires_at: float
 
@@ -40,8 +45,17 @@ class KVCRSegmentManifest:
             raise ValueError("missing KVCR segment manifest identity")
         if not self.source_keys or any(not key for key in self.source_keys):
             raise ValueError("missing physical KVCR keys")
-        if self.target_block_id < 0:
-            raise ValueError("invalid target primary block")
+        if len(set(self.source_keys)) != len(self.source_keys):
+            raise ValueError("duplicate physical KVCR keys")
+        if len(self.source_keys) != len(self.target_block_ids):
+            raise ValueError("source keys and target primary blocks disagree")
+        if any(
+            isinstance(block_id, bool)
+            or not isinstance(block_id, int)
+            or block_id < 0
+            for block_id in self.target_block_ids
+        ):
+            raise ValueError("invalid target primary blocks")
         if self.target_segment.rank_start == 0:
             raise ValueError("KVCR owns row zero; manifest must name extra row")
         self.target_segment.validate()
@@ -59,7 +73,7 @@ class KVCRSegmentManifest:
             "source_keys": [
                 base64.b64encode(key).decode("ascii") for key in self.source_keys
             ],
-            "target_block_id": self.target_block_id,
+            "target_block_ids": list(self.target_block_ids),
             "target_segment": self.target_segment.to_wire(),
             "expires_at": self.expires_at,
         }
@@ -79,23 +93,22 @@ def decode_manifest(payload: bytes) -> KVCRSegmentManifest:
         if raw.get("type") != "prepare":
             raise ValueError("not a KVCR segment prepare message")
         keys = raw["source_keys"]
-        if not isinstance(keys, list):
-            raise ValueError("source_keys must be a list")
+        target_block_ids = raw["target_block_ids"]
+        if not isinstance(keys, list) or not isinstance(target_block_ids, list):
+            raise ValueError("source_keys and target_block_ids must be lists")
         manifest = KVCRSegmentManifest(
             operation_tag=raw["operation_tag"],
             request_id=raw["request_id"],
             reply_endpoint=raw["reply_endpoint"],
             source_keys=tuple(base64.b64decode(key, validate=True) for key in keys),
-            target_block_id=raw["target_block_id"],
+            target_block_ids=tuple(target_block_ids),
             target_segment=SegmentRegistration.from_wire(raw["target_segment"]),
             expires_at=raw["expires_at"],
         )
     except (KeyError, TypeError, UnicodeDecodeError, ValueError) as exc:
         raise ValueError(f"invalid KVCR segment manifest: {exc}") from exc
     if (
-        isinstance(manifest.target_block_id, bool)
-        or not isinstance(manifest.target_block_id, int)
-        or isinstance(manifest.expires_at, bool)
+        isinstance(manifest.expires_at, bool)
         or not isinstance(manifest.expires_at, (int, float))
     ):
         raise ValueError("invalid KVCR segment manifest field types")
