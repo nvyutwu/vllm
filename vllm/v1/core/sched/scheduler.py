@@ -924,6 +924,7 @@ class Scheduler(SchedulerInterface):
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
+                            num_external_lookup_tokens=connector_prefix_cache_queries,
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0

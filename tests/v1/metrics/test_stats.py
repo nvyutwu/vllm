@@ -236,6 +236,7 @@ def test_prompt_token_stats_mixed_sources():
         num_prompt_tokens=1000,
         num_local_cached_tokens=400,
         num_external_cached_tokens=200,
+        num_external_lookup_tokens=600,
     )
     stats.update_from_output(prefill_stats)
 
@@ -244,6 +245,7 @@ def test_prompt_token_stats_mixed_sources():
     assert stats.external_kv_transfer == 200
     assert stats.cached_tokens == 600
     assert stats.total == 1000
+    assert prefill_stats.num_external_lookup_tokens == 600
 
 
 def test_prompt_token_stats_full_local_cache_recompute():

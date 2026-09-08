@@ -265,6 +265,7 @@ class PrefillStats:
         num_cached_tokens: Tokens to be prefilled without actual compute work.
         num_local_cached_tokens: Tokens to be prefilled from local prefix cache.
         num_external_cached_tokens: Tokens to be prefilled from external KV transfer.
+        num_external_lookup_tokens: Tokens presented to the external cache lookup.
         num_cache_creation_tokens: Tokens computed and written to the prefix cache.
     """
 
@@ -273,6 +274,7 @@ class PrefillStats:
     num_cached_tokens: int = 0
     num_local_cached_tokens: int = 0
     num_external_cached_tokens: int = 0
+    num_external_lookup_tokens: int = 0
     num_cache_creation_tokens: int = 0
 
     def set(
@@ -280,6 +282,7 @@ class PrefillStats:
         num_prompt_tokens: int,
         num_local_cached_tokens: int,
         num_external_cached_tokens: int,
+        num_external_lookup_tokens: int = 0,
     ):
         num_cached_tokens = num_local_cached_tokens + num_external_cached_tokens
         assert num_cached_tokens <= num_prompt_tokens
@@ -289,6 +292,7 @@ class PrefillStats:
         self.num_cached_tokens = num_cached_tokens
         self.num_local_cached_tokens = num_local_cached_tokens
         self.num_external_cached_tokens = num_external_cached_tokens
+        self.num_external_lookup_tokens = num_external_lookup_tokens
 
     def finalize(self, num_cached_tokens: int) -> None:
         assert num_cached_tokens >= 0
