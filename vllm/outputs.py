@@ -124,6 +124,9 @@ class RequestOutput:
         encoder_prompt_token_ids: The token IDs of the encoder prompt.
                                   None if decoder-only.
         num_cached_tokens: The number of tokens with prefix cache hit.
+        num_local_cached_tokens: Tokens reused from the local GPU cache.
+        num_external_cached_tokens: Tokens loaded from an external cache.
+        num_external_lookup_tokens: Tokens presented to the external cache lookup.
         num_cache_creation_tokens: Prompt tokens currently counted as local
             prefix-cache writes for this request.
         kv_transfer_params: The params for remote K/V transfer.
@@ -145,6 +148,9 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         num_cache_creation_tokens: int | None = None,
         *,
+        num_local_cached_tokens: int | None = None,
+        num_external_cached_tokens: int | None = None,
+        num_external_lookup_tokens: int | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
@@ -166,6 +172,9 @@ class RequestOutput:
         self.encoder_prompt = encoder_prompt
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
+        self.num_local_cached_tokens = num_local_cached_tokens
+        self.num_external_cached_tokens = num_external_cached_tokens
+        self.num_external_lookup_tokens = num_external_lookup_tokens
         self.num_cache_creation_tokens = num_cache_creation_tokens
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
@@ -176,6 +185,11 @@ class RequestOutput:
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
         self.ec_transfer_params = next_output.ec_transfer_params
+        self.num_cached_tokens = next_output.num_cached_tokens
+        self.num_local_cached_tokens = next_output.num_local_cached_tokens
+        self.num_external_cached_tokens = next_output.num_external_cached_tokens
+        self.num_external_lookup_tokens = next_output.num_external_lookup_tokens
+        self.num_cache_creation_tokens = next_output.num_cache_creation_tokens
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
@@ -214,6 +228,9 @@ class RequestOutput:
             f"metrics={self.metrics}, "
             f"lora_request={self.lora_request}, "
             f"num_cached_tokens={self.num_cached_tokens}, "
+            f"num_local_cached_tokens={self.num_local_cached_tokens}, "
+            f"num_external_cached_tokens={self.num_external_cached_tokens}, "
+            f"num_external_lookup_tokens={self.num_external_lookup_tokens}, "
             f"num_cache_creation_tokens={self.num_cache_creation_tokens})"
         )
 
