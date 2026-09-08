@@ -175,6 +175,9 @@ class RequestState:
         self.is_prefilling = True
         self.queue = queue
         self.num_cached_tokens = 0
+        self.num_local_cached_tokens = 0
+        self.num_external_cached_tokens = 0
+        self.num_external_lookup_tokens = 0
         self.num_cache_creation_tokens = 0
         # Per-sequence spec-decode accumulator; arrives once (on finish) via
         # EngineCoreOutput, then attached to this sequence's CompletionOutput.
@@ -388,6 +391,9 @@ class RequestState:
             kv_transfer_params=kv_transfer_params,
             ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
+            num_local_cached_tokens=self.num_local_cached_tokens,
+            num_external_cached_tokens=self.num_external_cached_tokens,
+            num_external_lookup_tokens=self.num_external_lookup_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
         )
@@ -675,6 +681,15 @@ class OutputProcessor:
                 if engine_core_output.prefill_stats is not None:
                     req_state.num_cached_tokens = (
                         engine_core_output.prefill_stats.num_cached_tokens
+                    )
+                    req_state.num_local_cached_tokens = (
+                        engine_core_output.prefill_stats.num_local_cached_tokens
+                    )
+                    req_state.num_external_cached_tokens = (
+                        engine_core_output.prefill_stats.num_external_cached_tokens
+                    )
+                    req_state.num_external_lookup_tokens = (
+                        engine_core_output.prefill_stats.num_external_lookup_tokens
                     )
                     req_state.num_cache_creation_tokens = (
                         engine_core_output.prefill_stats.num_cache_creation_tokens
