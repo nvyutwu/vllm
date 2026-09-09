@@ -215,8 +215,8 @@ def _get_llg_tokenizer(tokenizer: TokenizerLike) -> Any:
 def _k3_default_repetition_detection() -> "RepetitionDetectionParams | None":
     """v21/v24: server-side default for repetition detection (env-overridable).
 
-    Set K3_REPETITION_DETECTION=0 to restore upstream behaviour (disabled) — REQUIRED on any arm
-    being measured for degeneration rate, since early termination destroys the signal.
+    Set K3_REPETITION_DETECTION=0 for degeneration measurements: early
+    termination would hide the signal. This restores the upstream default.
     """
     import os as _os
 
