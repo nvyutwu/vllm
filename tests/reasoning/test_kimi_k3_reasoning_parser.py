@@ -30,6 +30,8 @@ class DummyTokenizer:
             return [1, 2, 3]
         if text == THINK_CLOSE:
             return [4, 2, 3]
+        if text == RESPONSE_OPEN:
+            return [5, 6, 7]
         return [ord(ch) for ch in text]
 
 
