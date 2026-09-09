@@ -239,10 +239,7 @@ class MoonVision3dPatchEmbed(nn.Module):
                 stride=self.patch_size,
                 layout="nchw",
             )
-        # Preserve the production workaround for the GB200/CUDA13 cuDNN crash
-        # in the small patch-embedding convolution, including graph capture.
-        with torch.backends.cudnn.flags(enabled=False):
-            return self.proj(x)
+        return self.proj(x)
 
 
 class Rope2DPosEmbRepeated(nn.Module):
