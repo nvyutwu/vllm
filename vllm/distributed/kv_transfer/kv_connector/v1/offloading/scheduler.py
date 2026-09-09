@@ -234,11 +234,11 @@ class SchedulerOffloadConfig(NamedTuple):
             if g.is_eagle_group
         }
 
-        use_eagle_block_drop = (
+        use_eagle = (
             vllm_config.speculative_config is not None
-            and vllm_config.speculative_config.use_eagle_block_drop()
+            and vllm_config.speculative_config.use_eagle()
         )
-        if use_eagle_block_drop and not eagle_groups:
+        if use_eagle and not eagle_groups:
             eagle_groups = set(range(len(kv_cache_config.kv_cache_groups)))
 
         if eagle_groups:
