@@ -2771,6 +2771,10 @@ class VllmConfig:
         if (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.kv_connector is not None
+            and (
+                self.kv_transfer_config.kv_connector != "OffloadingConnector"
+                or self.kv_transfer_config.kv_connector_module_path is not None
+            )
             and self.parallel_config.cp_kv_cache_interleave_size != local_block_size
         ):
             interleave = self.parallel_config.cp_kv_cache_interleave_size
@@ -2793,12 +2797,16 @@ class VllmConfig:
         """
         block_size = self.cache_config.block_size
 
-        # Skip DCP interleave-size compatibility when a KV connector is configured:
-        # cp_kv_cache_interleave_size is pinned to block_size for PD by each worker
+        # PD workers pin interleave to block_size. Native offload keeps the
+        # rank-local kernel layout, so its interleave must pass normal validation.
         pd_active = (
             self.kv_transfer_config is not None
             and self.kv_transfer_config.kv_connector is not None
             and self.kv_transfer_config.is_kv_transfer_instance
+            and (
+                self.kv_transfer_config.kv_connector != "OffloadingConnector"
+                or self.kv_transfer_config.kv_connector_module_path is not None
+            )
         )
         if self.parallel_config.decode_context_parallel_size > 1 and not pd_active:
             assert (
