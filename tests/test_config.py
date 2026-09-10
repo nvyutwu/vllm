@@ -186,6 +186,7 @@ def test_kv_offloading_does_not_skip_dcp_interleave_validation():
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=2,
             cp_kv_cache_interleave_size=3,
+            dcp_kv_cache_interleave_size=1,
         ),
         scheduler_config=SimpleNamespace(disable_chunked_mm_input=False),
         kv_transfer_config=KVTransferConfig(
@@ -196,6 +197,36 @@ def test_kv_offloading_does_not_skip_dcp_interleave_validation():
 
     with pytest.raises(AssertionError, match="divisible by"):
         VllmConfig.validate_block_size(config)
+
+
+@pytest.mark.parametrize(
+    "interleave,deprecated,should_validate",
+    [(1, 3, False), (1, 4, True), (3, 4, True)],
+)
+def test_dcp_native_offload_validates_before_worker_override(
+    interleave, deprecated, should_validate
+):
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16, mamba_cache_mode="none"),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            cp_kv_cache_interleave_size=interleave,
+            dcp_kv_cache_interleave_size=deprecated,
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector="OffloadingConnector", kv_role="kv_both"
+        ),
+    )
+    cache = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=16))]
+    )
+    if should_validate:
+        VllmConfig.validate_block_size(config)
+        VllmConfig.adjust_dcp_kv_cache_interleave_size(config, cache)
+        assert config.parallel_config.cp_kv_cache_interleave_size == deprecated
+    else:
+        with pytest.raises(AssertionError, match="divisible by"):
+            VllmConfig.validate_block_size(config)
 
 
 def test_compile_config_repr_succeeds():
