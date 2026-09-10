@@ -129,6 +129,83 @@ def test_pd_dcp_interleave_size_is_adjusted_to_block_size(caplog):
     assert "automatically adjusted from 3 to block_size 16" in caplog.text
 
 
+@pytest.mark.parametrize(
+    "connector,module_path,interleave,deprecated,expected",
+    [
+        ("OffloadingConnector", None, 1, 1, 1),
+        ("OffloadingConnector", None, 2, 1, 2),
+        ("OffloadingConnector", None, 1, 4, 4),
+        ("NixlConnector", None, 1, 1, 1536),
+        ("NixlConnector", None, 2, 4, 1536),
+        ("OffloadingConnector", "external.connector", 1, 1, 1536),
+        ("MultiConnector", None, 1, 1, 1536),
+        ("UnknownConnector", None, 1, 1, 1536),
+        (None, None, 1, 1, 1),
+    ],
+)
+def test_dcp_native_offload_preserves_kernel_interleave(
+    connector, module_path, interleave, deprecated, expected
+):
+    # Native offload saves rank-local blocks; unlike PD it must not change the
+    # kernel token layout after cache allocation (FlashInfer MLA needs stride 1).
+    transfer = KVTransferConfig(
+        kv_connector=connector,
+        kv_connector_module_path=module_path,
+        kv_role="kv_both",
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": "OffloadingConnector"}]
+        },
+    )
+    config = SimpleNamespace(
+        kv_transfer_config=transfer,
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8,
+            cp_kv_cache_interleave_size=interleave,
+            dcp_kv_cache_interleave_size=deprecated,
+        ),
+    )
+    cache = SimpleNamespace(
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=1536))
+        ]
+    )
+    VllmConfig.adjust_dcp_kv_cache_interleave_size(config, cache)
+    assert config.parallel_config.cp_kv_cache_interleave_size == expected
+
+
+@pytest.mark.parametrize(
+    "connector,module_path,should_validate",
+    [
+        ("OffloadingConnector", None, True),
+        (None, None, True),
+        ("NixlConnector", None, False),
+        ("OffloadingConnector", "external.connector", False),
+        ("MultiConnector", None, False),
+        ("UnknownConnector", None, False),
+    ],
+)
+def test_dcp_native_offload_validates_unaligned_interleave(
+    connector, module_path, should_validate
+):
+    # Only PD may defer this check until workers pin the resolved block size.
+    config = SimpleNamespace(
+        cache_config=SimpleNamespace(block_size=16, mamba_cache_mode="none"),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=8, cp_kv_cache_interleave_size=3
+        ),
+        kv_transfer_config=KVTransferConfig(
+            kv_connector=connector,
+            kv_connector_module_path=module_path,
+            kv_role="kv_both",
+        ),
+    )
+    if should_validate:
+        with pytest.raises(AssertionError, match="divisible by"):
+            VllmConfig.validate_block_size(config)
+    else:
+        VllmConfig.validate_block_size(config)
+
+
 def test_compile_config_repr_succeeds():
     # setup: VllmBackend mutates the config object
     config = VllmConfig()
