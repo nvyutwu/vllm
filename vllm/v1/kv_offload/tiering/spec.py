@@ -55,7 +55,6 @@ Example out-of-tree tier configuration:
 
 from typing import Any
 
-import torch
 from typing_extensions import override
 
 from vllm.logger import init_logger
@@ -253,6 +252,12 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     def __init__(self, config: OffloadingConfig):
         super().__init__(config)
+        if self.local_world_size != config.parallel.world_size:
+            raise ValueError(
+                "Native secondary tiers do not support multi-node replicas: "
+                "the scheduler cannot access remote CPU cache shards. "
+                "Use CPUOffloadingSpec for multi-node CPU-only offloading."
+            )
         # Redeclare for mypy: parent sets this but `--follow-imports skip` hides it
         self._manager: OffloadingManager | None = None
 
@@ -384,18 +389,10 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
 
     @override
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
-        world_size = self.config.parallel.world_size
-        local_world_size = self.config.parallel.local_world_size or world_size
         if self.replicated_layout:
             rank = 0
         else:
-            # Fold the global physical device index into the NODE-LOCAL
-            # [0, local_world_size) slot range. The per-node /dev/shm region is
-            # sized to local_world_size slots (see CPUOffloadingSpec.__init__),
-            # so folding by world_size here would index past the narrowed row on
-            # a multi-node deploy whose device ordinals reach [local_world_size,
-            # world_size).
-            rank = torch.accelerator.current_device_index() % local_world_size
+            rank = self.config.parallel.rank % self.local_world_size
         worker_mmap = SharedOffloadRegion(
             engine_id=self._engine_id,
             num_blocks=self.num_blocks,
