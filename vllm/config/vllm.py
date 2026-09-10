@@ -2809,13 +2809,15 @@ class VllmConfig:
             )
         )
         if self.parallel_config.decode_context_parallel_size > 1 and not pd_active:
+            interleave_size = self.parallel_config.cp_kv_cache_interleave_size
+            if self.parallel_config.dcp_kv_cache_interleave_size > 1:
+                interleave_size = self.parallel_config.dcp_kv_cache_interleave_size
             assert (
-                self.parallel_config.cp_kv_cache_interleave_size <= block_size
-                and block_size % self.parallel_config.cp_kv_cache_interleave_size == 0
+                interleave_size <= block_size and block_size % interleave_size == 0
             ), (
                 f"Block_size({block_size}) should be greater "
                 "than or equal to and divisible by cp_kv_cache_interleave_size "
-                f"({self.parallel_config.cp_kv_cache_interleave_size})."
+                f"({interleave_size})."
             )
         # Mamba cache align-mode constraints
         if self.cache_config.mamba_cache_mode == "align":
