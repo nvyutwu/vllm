@@ -15,7 +15,7 @@ import vllm.v1.core.kv_cache_manager as kv_cache_manager
 import vllm.v1.core.kv_cache_utils as kv_cache_utils
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
-    AllBlocksCleared,
+    TierBlocksCleared,
     BlockRemoved,
     BlockStored,
 )
@@ -2194,7 +2194,8 @@ def test_kv_cache_events(blocks_to_cache: int):
     manager.reset_prefix_cache()
     events = manager.take_events()
 
-    assert isinstance(events[-1], AllBlocksCleared)
+    assert isinstance(events[-1], TierBlocksCleared)
+    assert events[-1].medium == "GPU"
     assert len(manager.block_pool.cached_block_hash_to_block) == 0
 
 

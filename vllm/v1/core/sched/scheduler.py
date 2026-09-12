@@ -15,7 +15,11 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_events import (
+    EventPublisherFactory,
+    KVEventBatch,
+    isolate_tier_clear_batches,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -2197,8 +2201,9 @@ class Scheduler(SchedulerInterface):
 
         # publish collected KV cache events
         if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)
+            for isolated_events in isolate_tier_clear_batches(events):
+                batch = KVEventBatch(ts=time.time(), events=isolated_events)
+                self.kv_event_publisher.publish(batch)
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
