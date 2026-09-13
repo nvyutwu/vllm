@@ -1383,6 +1383,63 @@ def test_failed_local_reset_does_not_publish():
     scheduler.kv_event_publisher.publish.assert_not_called()
 
 
+def test_idle_reset_without_a_connector_publishes_only_the_gpu_clear():
+    """The common deployment: no KV connector, but the default cascade in
+    ``EngineCore._reset_caches()`` hardcodes ``reset_connector=True``.
+
+    ``reset_connector_cache()`` reports no-op success there, which must not be
+    read as "every tier was cleared" -- publishing ``AllBlocksCleared`` would
+    make the router discard host and storage records that nothing reset.
+    """
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    assert scheduler.connector is None
+    scheduler.kv_event_publisher = Mock()
+    scheduler.kv_cache_manager.take_events = Mock(
+        return_value=[TierBlocksCleared(medium="GPU")]
+    )
+
+    assert scheduler.reset_prefix_cache(reset_connector=True)
+
+    scheduler.kv_event_publisher.publish.assert_called_once()
+    batch = scheduler.kv_event_publisher.publish.call_args.args[0]
+    assert batch.events == [TierBlocksCleared(medium="GPU")]
+
+
+def test_idle_reset_with_an_unimplemented_connector_reset_does_not_widen():
+    """``KVConnectorBase_V1.reset_cache`` returns ``None`` when a connector does
+    not implement it. ``None`` is not ``False``, so the call counts as success --
+    but nothing was cleared, so the invalidation must stay GPU-scoped."""
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.kv_event_publisher = Mock()
+    scheduler.kv_cache_manager.take_events = Mock(
+        return_value=[TierBlocksCleared(medium="GPU")]
+    )
+    scheduler.connector = Mock()
+    scheduler.connector.reset_cache.return_value = None
+    scheduler.connector.take_events.return_value = []
+    scheduler.connector_prefix_cache_stats = Mock()
+
+    assert scheduler.reset_prefix_cache(reset_connector=True)
+
+    scheduler.connector.reset_cache.assert_called_once()
+    batch = scheduler.kv_event_publisher.publish.call_args.args[0]
+    assert batch.events == [TierBlocksCleared(medium="GPU")]
+
+
+def test_connector_reset_is_attempted_exactly_once_per_reset():
+    """The widening decision and the return value come from one reset call."""
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.kv_event_publisher = Mock()
+    scheduler.kv_cache_manager.take_events = Mock(return_value=[])
+    scheduler.connector = Mock()
+    scheduler.connector.reset_cache.return_value = True
+    scheduler.connector.take_events.return_value = []
+    scheduler.connector_prefix_cache_stats = Mock()
+
+    assert scheduler.reset_prefix_cache(reset_connector=True)
+    scheduler.connector.reset_cache.assert_called_once()
+
+
 def test_reset_connector_cache_no_connector_is_no_op_success():
     """``reset_connector_cache`` must return True when no connector is
     configured.
