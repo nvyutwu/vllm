@@ -2198,6 +2198,12 @@ def test_kv_cache_events(blocks_to_cache: int):
     assert events[-1].medium == "GPU"
     assert len(manager.block_pool.cached_block_hash_to_block) == 0
 
+    # `take_events` hands over the queue rather than copying it, which is what
+    # lets the idle-reset path publish immediately without the next scheduler
+    # step republishing the same clear. Asserting it here, on the real queue,
+    # rather than in a scheduler test whose `take_events` is a Mock.
+    assert manager.take_events() == []
+
 
 def test_null_parent_block_hash():
     block_size = 1

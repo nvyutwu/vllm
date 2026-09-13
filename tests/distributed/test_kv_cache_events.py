@@ -140,6 +140,42 @@ def test_isolating_leaves_a_clear_free_stream_as_one_batch():
     assert list(isolate_tier_clear_batches([])) == []
 
 
+def test_a_mixed_batch_costs_a_legacy_consumer_every_event_in_it():
+    """Why `isolate_tier_clear_batches` exists.
+
+    A batch is decoded as one unit, so a consumer that predates
+    `TierBlocksCleared` does not skip the clear -- it loses every `BlockStored`
+    and `BlockRemoved` published alongside it, and its index goes stale in the
+    dangerous direction. Publishing the clear alone keeps the blast radius to
+    the one event the old consumer cannot represent.
+    """
+    legacy_batch_decoder = msgspec.msgpack.Decoder(
+        type=list[BlockStored | BlockRemoved | AllBlocksCleared]
+    )
+    store = BlockStored(
+        block_hashes=[_FAKE_HASH],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+        lora_id=None,
+        medium="GPU",
+        lora_name=None,
+    )
+    clear = TierBlocksCleared(medium="GPU")
+
+    # Mixed: the legacy consumer loses the store too.
+    with pytest.raises(msgspec.ValidationError):
+        legacy_batch_decoder.decode(msgspec.msgpack.encode([store, clear]))
+
+    # Isolated, as the publisher sends them: the store batch still decodes and
+    # only the clear batch is rejected.
+    batches = list(isolate_tier_clear_batches([store, clear]))
+    assert batches == [[store], [clear]]
+    assert legacy_batch_decoder.decode(msgspec.msgpack.encode(batches[0])) == [store]
+    with pytest.raises(msgspec.ValidationError):
+        legacy_batch_decoder.decode(msgspec.msgpack.encode(batches[1]))
+
+
 def test_legacy_all_clear_and_tier_clear_are_not_interchangeable_on_the_wire():
     # A legacy-only consumer must reject a scoped clear outright rather than
     # decode it as the all-tier event it is not.
