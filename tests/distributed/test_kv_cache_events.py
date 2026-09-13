@@ -6,7 +6,14 @@ from typing import Any
 import msgspec
 import pytest
 
-from vllm.distributed.kv_events import BlockRemoved, BlockStored
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    KVEventBatch,
+    TierBlocksCleared,
+    isolate_tier_clear_batches,
+)
 
 # Minimal ExternalBlockHash for testing (bytes are a valid ExternalBlockHash).
 _FAKE_HASH: bytes = b"\xab" * 32
@@ -44,6 +51,112 @@ class _LegacyBlockRemoved(
     block_hashes: list[bytes]
     medium: str | None
     group_idx: int | None = None
+
+
+class _LegacyAllBlocksCleared(
+    msgspec.Struct,
+    omit_defaults=True,  # type: ignore[call-arg]
+    gc=False,  # type: ignore[call-arg]
+    tag="AllBlocksCleared",  # type: ignore[call-arg]
+):
+    pass
+
+
+def test_tier_clear_has_distinct_wire_tag_and_legacy_clear_still_decodes():
+    decoder = msgspec.msgpack.Decoder(type=AllBlocksCleared)
+    legacy = decoder.decode(msgspec.msgpack.encode(_LegacyAllBlocksCleared()))
+    assert isinstance(legacy, AllBlocksCleared)
+
+    gpu = TierBlocksCleared(medium="GPU")
+    tier_decoder = msgspec.msgpack.Decoder(type=TierBlocksCleared)
+    assert tier_decoder.decode(msgspec.msgpack.encode(gpu)) == gpu
+    assert len({gpu, TierBlocksCleared(medium="CPU")}) == 2
+    with pytest.raises(msgspec.ValidationError):
+        decoder.decode(msgspec.msgpack.encode(gpu))
+
+    batch = KVEventBatch(ts=1.0, events=[gpu], data_parallel_rank=0)
+    decoded_batch = msgspec.msgpack.decode(
+        msgspec.msgpack.encode(batch), type=KVEventBatch
+    )
+    assert decoded_batch.events == [gpu]
+
+
+def test_tier_clear_is_published_as_a_singleton_between_ordinary_events():
+    before = BlockRemoved(block_hashes=[_FAKE_HASH], medium="GPU")
+    clear = TierBlocksCleared(medium="GPU")
+    after = BlockRemoved(block_hashes=[b"\xcd" * 32], medium="CPU")
+    batches = list(isolate_tier_clear_batches([before, clear, after]))
+    assert batches == [[before], [clear], [after]]
+
+
+def test_tier_clear_carries_an_ownership_domain_without_breaking_the_default():
+    framework = TierBlocksCleared(medium="CPU")
+    assert framework.ownership is None
+
+    owned = TierBlocksCleared(medium="CPU", ownership="kvcr")
+    decoder = msgspec.msgpack.Decoder(type=TierBlocksCleared)
+    assert decoder.decode(msgspec.msgpack.encode(owned)) == owned
+    assert owned != framework
+    assert len({framework, owned}) == 2
+
+    # `omit_defaults` keeps the framework's own resets byte-identical to the
+    # pre-ownership wire, so the field costs nothing on the hot path.
+    assert b"kvcr" not in msgspec.msgpack.encode(framework)
+    assert b"kvcr" in msgspec.msgpack.encode(owned)
+
+
+def test_isolating_tier_clears_preserves_stream_order_exactly():
+    first = BlockStored(
+        block_hashes=[_FAKE_HASH],
+        parent_block_hash=None,
+        token_ids=[1, 2],
+        block_size=2,
+        lora_id=None,
+        medium="GPU",
+        lora_name=None,
+    )
+    gpu_clear = TierBlocksCleared(medium="GPU")
+    cpu_clear = TierBlocksCleared(medium="CPU")
+    second = BlockRemoved(block_hashes=[_FAKE_HASH], medium="CPU")
+
+    batches = list(isolate_tier_clear_batches([first, gpu_clear, cpu_clear, second]))
+    assert batches == [[first], [gpu_clear], [cpu_clear], [second]]
+    # Flattening the batches must reproduce the input stream: a scoped clear is
+    # separated from neighbours, never reordered or dropped.
+    assert [event for batch in batches for event in batch] == [
+        first,
+        gpu_clear,
+        cpu_clear,
+        second,
+    ]
+
+
+def test_isolating_leaves_a_clear_free_stream_as_one_batch():
+    events = [
+        BlockRemoved(block_hashes=[_FAKE_HASH], medium="GPU"),
+        BlockRemoved(block_hashes=[b"\xcd" * 32], medium="GPU"),
+    ]
+    assert list(isolate_tier_clear_batches(events)) == [events]
+    assert list(isolate_tier_clear_batches([])) == []
+
+
+def test_legacy_all_clear_and_tier_clear_are_not_interchangeable_on_the_wire():
+    # A legacy-only consumer must reject a scoped clear outright rather than
+    # decode it as the all-tier event it is not.
+    legacy_decoder = msgspec.msgpack.Decoder(
+        type=BlockStored | BlockRemoved | AllBlocksCleared
+    )
+    with pytest.raises(msgspec.ValidationError):
+        legacy_decoder.decode(msgspec.msgpack.encode(TierBlocksCleared(medium="GPU")))
+
+    # And the new union still decodes every legacy event.
+    new_decoder = msgspec.msgpack.Decoder(
+        type=BlockStored | BlockRemoved | AllBlocksCleared | TierBlocksCleared
+    )
+    assert isinstance(
+        new_decoder.decode(msgspec.msgpack.encode(AllBlocksCleared())),
+        AllBlocksCleared,
+    )
 
 
 def _make_block_stored(

@@ -15,7 +15,13 @@ from vllm.distributed.ec_transfer.ec_connector.base import (
     ECConnectorRole,
 )
 from vllm.distributed.ec_transfer.ec_connector.factory import ECConnectorFactory
-from vllm.distributed.kv_events import EventPublisherFactory, KVEventBatch
+from vllm.distributed.kv_events import (
+    AllBlocksCleared,
+    EventPublisherFactory,
+    KVEventBatch,
+    TierBlocksCleared,
+    isolate_tier_clear_batches,
+)
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -2183,22 +2189,7 @@ class Scheduler(SchedulerInterface):
                     else scheduler_kv_connector_stats
                 )
 
-        # collect KV cache events from KV cache manager
-        events = self.kv_cache_manager.take_events()
-
-        # collect KV cache events from connector
-        if self.connector is not None:
-            connector_events = self.connector.take_events()
-            if connector_events:
-                if events is None:
-                    events = list(connector_events)
-                else:
-                    events.extend(connector_events)
-
-        # publish collected KV cache events
-        if events:
-            batch = KVEventBatch(ts=time.time(), events=events)
-            self.kv_event_publisher.publish(batch)
+        self._publish_kv_cache_events()
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.
@@ -2623,6 +2614,29 @@ class Scheduler(SchedulerInterface):
             )
         )
 
+    def _publish_kv_cache_events(self, all_tiers_cleared: bool = False) -> None:
+        events = self.kv_cache_manager.take_events()
+        if self.connector is not None:
+            connector_events = self.connector.take_events()
+            if connector_events:
+                if events is None:
+                    events = list(connector_events)
+                else:
+                    events.extend(connector_events)
+
+        if all_tiers_cleared:
+            events = [
+                event
+                for event in events or []
+                if not isinstance(event, (AllBlocksCleared, TierBlocksCleared))
+            ]
+            events.append(AllBlocksCleared())
+
+        if events:
+            for isolated_events in isolate_tier_clear_batches(events):
+                batch = KVEventBatch(ts=time.time(), events=isolated_events)
+                self.kv_event_publisher.publish(batch)
+
     def reset_prefix_cache(
         self, reset_running_requests: bool = False, reset_connector: bool = False
     ) -> bool:
@@ -2660,8 +2674,21 @@ class Scheduler(SchedulerInterface):
                 "which is not supported yet."
             )
 
+        connector_reset_successful = False
+        if reset_connector and reset_successful:
+            connector_reset_successful = self.reset_connector_cache()
+
+        if reset_successful:
+            # Utility calls can reset an idle engine without another scheduler
+            # step. Publish before returning so the router cannot select from
+            # stale cache state for the next request. A successful connector
+            # reset widens the invalidation to the legacy all-tier event.
+            self._publish_kv_cache_events(
+                all_tiers_cleared=reset_connector and connector_reset_successful
+            )
+
         if reset_connector:
-            reset_successful = self.reset_connector_cache() and reset_successful
+            reset_successful = connector_reset_successful and reset_successful
 
         return reset_successful
 
