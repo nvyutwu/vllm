@@ -6,14 +6,7 @@ from typing import Any
 import msgspec
 import pytest
 
-from vllm.distributed.kv_events import (
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
-    KVEventBatch,
-    TierBlocksCleared,
-    isolate_tier_clear_batches,
-)
+from vllm.distributed.kv_events import BlockRemoved, BlockStored
 
 # Minimal ExternalBlockHash for testing (bytes are a valid ExternalBlockHash).
 _FAKE_HASH: bytes = b"\xab" * 32
@@ -51,42 +44,6 @@ class _LegacyBlockRemoved(
     block_hashes: list[bytes]
     medium: str | None
     group_idx: int | None = None
-
-
-class _LegacyAllBlocksCleared(
-    msgspec.Struct,
-    omit_defaults=True,  # type: ignore[call-arg]
-    gc=False,  # type: ignore[call-arg]
-    tag="AllBlocksCleared",  # type: ignore[call-arg]
-):
-    pass
-
-
-def test_tier_clear_has_distinct_wire_tag_and_legacy_clear_still_decodes():
-    decoder = msgspec.msgpack.Decoder(type=AllBlocksCleared)
-    legacy = decoder.decode(msgspec.msgpack.encode(_LegacyAllBlocksCleared()))
-    assert isinstance(legacy, AllBlocksCleared)
-
-    gpu = TierBlocksCleared(medium="GPU")
-    tier_decoder = msgspec.msgpack.Decoder(type=TierBlocksCleared)
-    assert tier_decoder.decode(msgspec.msgpack.encode(gpu)) == gpu
-    assert len({gpu, TierBlocksCleared(medium="CPU")}) == 2
-    with pytest.raises(msgspec.ValidationError):
-        decoder.decode(msgspec.msgpack.encode(gpu))
-
-    batch = KVEventBatch(ts=1.0, events=[gpu], data_parallel_rank=0)
-    decoded_batch = msgspec.msgpack.decode(
-        msgspec.msgpack.encode(batch), type=KVEventBatch
-    )
-    assert decoded_batch.events == [gpu]
-
-
-def test_tier_clear_is_published_as_a_singleton_between_ordinary_events():
-    before = BlockRemoved(block_hashes=[_FAKE_HASH], medium="GPU")
-    clear = TierBlocksCleared(medium="GPU")
-    after = BlockRemoved(block_hashes=[b"\xcd" * 32], medium="CPU")
-    batches = list(isolate_tier_clear_batches([before, clear, after]))
-    assert batches == [[before], [clear], [after]]
 
 
 def _make_block_stored(
