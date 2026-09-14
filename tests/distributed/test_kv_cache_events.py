@@ -7,6 +7,7 @@ import msgspec
 import pytest
 
 from vllm.distributed.kv_events import (
+    MEDIUM_GPU,
     AllBlocksCleared,
     BlockRemoved,
     BlockStored,
@@ -79,6 +80,30 @@ def test_tier_clear_has_distinct_wire_tag_and_legacy_clear_still_decodes():
         msgspec.msgpack.encode(batch), type=KVEventBatch
     )
     assert decoded_batch.events == [gpu]
+
+
+def test_the_scoped_clear_wire_contract_matches_the_dynamo_decoder():
+    """Pin the two literals a paired consumer decodes, as they go on the wire.
+
+    Every other assertion in this file round-trips through msgspec's own typed
+    decoder, so renaming the class or changing ``MEDIUM_GPU`` keeps them all
+    green while silently breaking the consumer -- which lives in another repo.
+    That is not hypothetical: the first version of this producer was reverted
+    (54223f767e) precisely because Dynamo rejected the event it emitted.
+
+    Dynamo matches the tag string ``TierBlocksCleared`` under the ``type`` key
+    (``lib/kv-router/src/zmq_wire/deserialize.rs``) and resolves ``medium``
+    through ``StorageTier::from_kv_medium``. Both strings are the contract, not
+    an implementation detail; changing either one requires a paired Dynamo
+    release. The untyped decode is what makes this a wire assertion rather than
+    a round-trip.
+    """
+    payload = msgspec.msgpack.encode(TierBlocksCleared(medium=MEDIUM_GPU))
+
+    assert msgspec.msgpack.decode(payload) == {
+        "type": "TierBlocksCleared",
+        "medium": "GPU",
+    }
 
 
 def test_tier_clear_is_published_as_a_singleton_between_ordinary_events():
