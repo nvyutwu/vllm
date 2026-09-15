@@ -38,6 +38,9 @@ class _ConnectorMetricName:
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+    STORE_SKIPPED_UNREACHABLE_BOUNDARY = (
+        "vllm:kv_offload_store_skipped_unreachable_boundary"
+    )
     LOAD_WAIT_SECONDS = "vllm:kv_offload_load_wait_seconds"
     STORE_WAIT_SECONDS = "vllm:kv_offload_store_wait_seconds"
     LOAD_CHUNKS = "vllm:kv_offload_load_chunks"
@@ -220,6 +223,15 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             documentation=(
                 "Number of KV offload store allocation attempts that failed."
             ),
+        ),
+        _ConnectorMetricName.STORE_SKIPPED_UNREACHABLE_BOUNDARY: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of boundary-state (sliding-window / recurrent) chunk "
+                    "stores skipped because no prefix lookup can reach their "
+                    "boundary without partial-tail support."
+                ),
+            )
         ),
         _ConnectorMetricName.LOAD_WAIT_SECONDS: OffloadingHistogramMetadata(
             documentation=(

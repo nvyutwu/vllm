@@ -534,6 +534,18 @@ class OffloadingConnectorScheduler:
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
+        # A boundary-state (SWA / recurrent) chunk can only serve a load hit at a
+        # boundary the full-attention prefix lookup can reach: a multiple of the
+        # full-attention chunk size, unless partial tails are supported.
+        full_attention_chunks = {
+            self.config.kv_group_configs[idx].tokens_per_chunk
+            for idx in full_attention_groups
+        }
+        self._boundary_state_hit_alignment: int | None = (
+            None
+            if self.config.supports_partial_tail or not full_attention_chunks
+            else max(full_attention_chunks)
+        )
         self._partial_tail_block_size = (
             self.config.kv_group_configs[0].tokens_per_block
             if self.config.supports_partial_tail
@@ -1220,6 +1232,19 @@ class OffloadingConnectorScheduler:
                     or boundary > max_boundary
                     or boundary % group_config.tokens_per_chunk != 0
                 ):
+                    continue
+                hit_alignment = self._boundary_state_hit_alignment
+                if (
+                    hit_alignment is not None
+                    and group_config.sliding_window_size_in_chunks is not None
+                    and boundary % hit_alignment != 0
+                ):
+                    # Without partial-tail support the prefix lookup only lands on
+                    # full-attention chunk boundaries; a boundary state stored
+                    # elsewhere is unreachable and would only churn the pool.
+                    self._connector_stats.increase_counter(
+                        _ConnectorMetricName.STORE_SKIPPED_UNREACHABLE_BOUNDARY
+                    )
                     continue
 
                 key = self._make_boundary_key(req, group_idx, boundary)

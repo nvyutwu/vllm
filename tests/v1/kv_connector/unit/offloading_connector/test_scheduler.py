@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from tests.v1.kv_connector.unit.offloading_connector.test_config import (
+    _full_attention_spec,
     _make_mamba_hybrid_kv_cache_config,
     _make_vllm_config,
 )
@@ -212,6 +213,75 @@ def test_aligned_boundary_store_flushes_before_cow_destination_reuse():
     meta = scheduler.build_connector_meta(output)
 
     assert meta.jobs_to_flush == {job_id}
+
+
+def _make_dcp_shaped_hybrid_scheduler() -> OffloadingConnectorScheduler:
+    """Full-attention chunk = 2 x recurrent block, as with DCP-scaled attention
+    blocks next to unsharded Mamba blocks; partial tails are then unsupported."""
+    vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
+    vllm_config.cache_config.prefix_match_unit = 4
+    vllm_config.speculative_config = None
+    vllm_config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=True, publisher="null"
+    )
+    kv_cache_config = _make_mamba_hybrid_kv_cache_config()
+    kv_cache_config.kv_cache_groups[0] = KVCacheGroupSpec(
+        ["full_layer"], _full_attention_spec(block_size=32)
+    )
+    spec = MockOffloadingSpec(build_offloading_config(vllm_config, kv_cache_config))
+    return OffloadingConnectorScheduler(spec, vllm_config, kv_cache_config)
+
+
+def test_aligned_boundary_store_skips_unreachable_recurrent_tail_without_partial_tail():
+    scheduler = _make_dcp_shaped_hybrid_scheduler()
+    assert not scheduler.config.supports_partial_tail
+    assert scheduler._boundary_state_hit_alignment == 32
+
+    request = MagicMock()
+    request.request_id = "req"
+    request.kv_transfer_params = None
+    request.num_prompt_tokens = 60
+    request.num_tokens = 60
+    request.block_hashes = [BlockHash(f"h{i}".encode()) for i in range(15)]
+    request.all_token_ids = list(range(60))
+    request.lora_request = None
+    request.is_finished.return_value = False
+    scheduler.on_new_request(request)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+
+    # Recurrent (group 1) states offered at the aligned boundary 32 and at the
+    # prompt tail 48; only 32 can pair with a stored full-attention chunk.
+    jobs = scheduler._build_aligned_boundary_store_jobs(
+        {"req": [(1, 98, 32), (1, 99, 48)]}
+    )
+
+    assert len(jobs) == 1
+    [job] = jobs.values()
+    assert job.src_spec.block_ids.tolist() == [98]
+    assert scheduler.manager.prepare_store.call_count == 1
+    [stored_key] = scheduler.manager.prepare_store.call_args.args[0]
+    assert get_offload_group_idx(stored_key) == 1
+    stats = scheduler._connector_stats.reduce()
+    assert stats[_ConnectorMetricName.STORE_SKIPPED_UNREACHABLE_BOUNDARY] == 1
+
+
+def test_aligned_boundary_store_keeps_every_boundary_with_partial_tail():
+    scheduler = _make_partial_tail_scheduler()
+    _make_partial_tail_request(scheduler)
+    assert scheduler._boundary_state_hit_alignment is None
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    jobs = scheduler._build_aligned_boundary_store_jobs(
+        {"req": [(1, 98, 16), (1, 99, 28)]}
+    )
+    # 28 is not chunk-aligned for the recurrent group (16) and is filtered by the
+    # pre-existing chunk check; 16 is stored. Nothing is skipped as unreachable.
+    assert len(jobs) == 1
+    stats = scheduler._connector_stats.reduce()
+    assert stats.get(_ConnectorMetricName.STORE_SKIPPED_UNREACHABLE_BOUNDARY, 0) == 0
 
 
 def test_normal_store_excludes_align_mode_mamba_sources():
