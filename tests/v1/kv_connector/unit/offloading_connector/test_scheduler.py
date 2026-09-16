@@ -420,6 +420,82 @@ def test_partial_lookup_and_load_address_each_group_block_size_under_dcp():
     assert req_status.partial_tail_boundary is None
 
 
+def _dcp_lookup(hits: dict[int, set[bytes]]):
+    def lookup(key, req_context):
+        group = get_offload_group_idx(key)
+        return (
+            LookupResult.HIT
+            if get_offload_block_hash(key) in hits.get(group, set())
+            else LookupResult.MISS
+        )
+
+    return lookup
+
+
+def test_partial_lookup_under_dcp_hits_tail_without_recurrent_state_at_chunk_boundary():
+    # 46-token prompt, hash 4, full-attention chunk 32, recurrent block 16.
+    # Stored: full-attention chunk [0,32) (h7), the partial tail @44 for both
+    # groups (h10). NO recurrent state at the aligned boundary 32 -- the common
+    # case, since the producer keeps its recurrent state only at its own tail.
+    scheduler = _make_dcp_shaped_hybrid_scheduler()
+    _make_dcp_shaped_request(scheduler, num_tokens=46)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.side_effect = _dcp_lookup(
+        {0: {b"h7", b"h10"}, 1: {b"h10"}}
+    )
+    assert scheduler._lookup(req_status) == 44
+    assert req_status.partial_tail_boundary == 44
+
+
+def test_partial_lookup_under_dcp_returns_zero_without_stored_tail():
+    scheduler = _make_dcp_shaped_hybrid_scheduler()
+    _make_dcp_shaped_request(scheduler, num_tokens=46)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    # full-attention chunk resident, recurrent state nowhere reachable
+    scheduler.manager.lookup.side_effect = _dcp_lookup({0: {b"h7"}, 1: set()})
+    assert scheduler._lookup(req_status) == 0
+    assert req_status.partial_tail_boundary is None
+
+
+def test_partial_lookup_under_dcp_requires_resident_full_attention_chunks():
+    # Tail keys resident but the full-attention chunk [0,32) was evicted: the
+    # tail must not be reported, or the load would request a missing chunk.
+    scheduler = _make_dcp_shaped_hybrid_scheduler()
+    _make_dcp_shaped_request(scheduler, num_tokens=46)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.side_effect = _dcp_lookup({0: {b"h10"}, 1: {b"h10"}})
+    assert scheduler._lookup(req_status) == 0
+    assert req_status.partial_tail_boundary is None
+
+
+def test_partial_lookup_under_dcp_prefers_tail_over_aligned_recurrent_state():
+    # Both the aligned recurrent state @32 and the tail @44 exist (prompt shorter
+    # than two recurrent blocks past the chunk): the tail wins.
+    scheduler = _make_dcp_shaped_hybrid_scheduler()
+    _make_dcp_shaped_request(scheduler, num_tokens=46)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.side_effect = _dcp_lookup(
+        {0: {b"h7", b"h10"}, 1: {b"h7", b"h10"}}
+    )
+    assert scheduler._lookup(req_status) == 44
+
+
+def test_partial_lookup_under_dcp_defers_while_anchor_chunk_is_loading():
+    scheduler = _make_dcp_shaped_hybrid_scheduler()
+    _make_dcp_shaped_request(scheduler, num_tokens=46)
+    req_status = scheduler._req_status["req"]
+    req_status.update_offload_keys()
+    scheduler.manager.lookup.side_effect = _dcp_lookup(
+        {0: {b"h7", b"h10"}, 1: {b"h10"}}
+    )
+    scheduler._chunks_being_loaded.add(req_status.group_states[0].offload_keys[0])
+    assert scheduler._lookup(req_status) is None
+
+
 def test_partial_lookup_under_dcp_requires_recurrent_state_at_boundary():
     scheduler = _make_dcp_shaped_hybrid_scheduler()
     _make_dcp_shaped_request(scheduler, num_tokens=46)
