@@ -301,8 +301,15 @@ class SchedulerOffloadConfig(NamedTuple):
             for config in kv_group_configs
             if config.sliding_window_size_in_chunks is None
         }
+        # The window must span the full-attention OFFLOAD CHUNK, not the per-rank
+        # attention block. Under DCP the chunk is dcp x the attention block
+        # (Kimi-K3: 12288 = 1536 x 8), and the partial tail is everything between
+        # the last complete chunk boundary and the prompt's last hash boundary --
+        # up to chunk - tokens_per_hash tokens. Using the unscaled block caps the
+        # lookup search at round_down(chunk + block - 1, tokens_per_hash), so any
+        # tail longer than one attention block is stored and never probed.
         partial_tail_window = (
-            next(iter(full_attention_block_sizes))
+            next(iter(full_attention_block_sizes)) * dcp
             if len(full_attention_block_sizes) == 1
             else None
         )
