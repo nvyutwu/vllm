@@ -190,6 +190,9 @@ class SchedulerOffloadConfig(NamedTuple):
     # Full-attention block size in tokens; partial tails lie inside the block
     # after the last complete chunk hit. 0 when partial tails are unsupported.
     partial_tail_window: int = 0
+    # Shortest prompt tail (absolute boundary, in tokens) stored as a partial
+    # tail. 0 keeps every partial tail.
+    min_partial_tail_tokens: int = 0
 
     @classmethod
     def from_spec(
@@ -336,6 +339,9 @@ class SchedulerOffloadConfig(NamedTuple):
                 partial_tail_window
                 if supports_partial_tail and partial_tail_window is not None
                 else 0
+            ),
+            min_partial_tail_tokens=(
+                spec.min_partial_tail_tokens if supports_partial_tail else 0
             ),
         )
 
@@ -565,19 +571,20 @@ class OffloadingConnectorScheduler:
         self._mamba_align_size: int | None = resolve_mamba_align_size(
             spec, kv_cache_config
         )
-        # A boundary-state (SWA / recurrent) chunk can only serve a load hit at a
-        # boundary the full-attention prefix lookup can reach: a multiple of the
-        # full-attention chunk size, unless partial tails are supported.
+        # An aligned boundary-state (SWA / recurrent) store can only serve a load
+        # hit at a boundary the full-attention prefix lookup can reach: a
+        # multiple of the full-attention chunk size. Partial tails are stored by
+        # the partial-tail path under their own boundary key, so this holds
+        # whether or not partial tails are supported.
         full_attention_chunks = {
             self.config.kv_group_configs[idx].tokens_per_chunk
             for idx in full_attention_groups
         }
         self._boundary_state_hit_alignment: int | None = (
-            None
-            if self.config.supports_partial_tail or not full_attention_chunks
-            else max(full_attention_chunks)
+            max(full_attention_chunks) if full_attention_chunks else None
         )
         self._partial_tail_window = self.config.partial_tail_window
+        self._min_partial_tail_tokens = self.config.min_partial_tail_tokens
         self._cow_source_groups = frozenset(
             config.group_idx
             for config in self.config.kv_group_configs
@@ -1387,6 +1394,11 @@ class OffloadingConnectorScheduler:
                 if boundary % self._partial_tail_window != 0
             ]
             if not entries:
+                continue
+            if entries[0][2] < self._min_partial_tail_tokens:
+                self._connector_stats.increase_counter(
+                    _ConnectorMetricName.STORE_SKIPPED_SHORT_PARTIAL_TAIL
+                )
                 continue
             req_status = self._req_status.get(req_id)
             assert req_status is not None

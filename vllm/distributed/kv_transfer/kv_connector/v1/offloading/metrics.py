@@ -41,6 +41,9 @@ class _ConnectorMetricName:
     STORE_SKIPPED_UNREACHABLE_BOUNDARY = (
         "vllm:kv_offload_store_skipped_unreachable_boundary"
     )
+    STORE_SKIPPED_SHORT_PARTIAL_TAIL = (
+        "vllm:kv_offload_store_skipped_short_partial_tail"
+    )
     LOAD_WAIT_SECONDS = "vllm:kv_offload_load_wait_seconds"
     STORE_WAIT_SECONDS = "vllm:kv_offload_store_wait_seconds"
     LOAD_CHUNKS = "vllm:kv_offload_load_chunks"
@@ -227,9 +230,18 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
         _ConnectorMetricName.STORE_SKIPPED_UNREACHABLE_BOUNDARY: (
             OffloadingCounterMetadata(
                 documentation=(
-                    "Number of boundary-state (sliding-window / recurrent) chunk "
-                    "stores skipped because no prefix lookup can reach their "
-                    "boundary without partial-tail support."
+                    "Number of aligned boundary-state (sliding-window / "
+                    "recurrent) chunk stores skipped because their boundary is "
+                    "not a full-attention chunk multiple, so no prefix lookup "
+                    "can reach them."
+                ),
+            )
+        ),
+        _ConnectorMetricName.STORE_SKIPPED_SHORT_PARTIAL_TAIL: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of partial-tail stores skipped because the prompt "
+                    "tail is shorter than min_partial_tail_tokens."
                 ),
             )
         ),

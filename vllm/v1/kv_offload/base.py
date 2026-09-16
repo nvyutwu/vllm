@@ -598,6 +598,14 @@ class OffloadingSpec(ABC):
         self.offload_prompt_only: bool = bool(
             self.extra_config.get("offload_prompt_only", True)
         )
+        # Shortest prompt tail (tokens from the start of the prompt to its last
+        # hash boundary) worth storing as a partial tail. A partial tail costs
+        # one fixed-size pool row per KV cache group whatever its length, while
+        # the prefill it can save is proportional to the tail, so short tails
+        # are the worst use of a pool. 0 (default) stores every partial tail.
+        self.min_partial_tail_tokens: int = max(
+            0, int(self.extra_config.get("min_partial_tail_tokens", 0))
+        )
 
         self.tokens_per_block = tuple(group.tokens_per_block for group in config.groups)
         self.tokens_per_hash = config.cache.tokens_per_hash

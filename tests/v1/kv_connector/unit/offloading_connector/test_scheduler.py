@@ -221,11 +221,15 @@ def _make_dcp_shaped_hybrid_scheduler(
     prefix_match_unit: int = 4,
     eagle: bool = False,
     recurrent_block_size: int | None = None,
+    min_partial_tail_tokens: int = 0,
 ) -> OffloadingConnectorScheduler:
     """Full-attention offload block = dcp x attention block (16 x 2 = 32) next to
     the unsharded 16-token Mamba block, as Kimi-K3's 12288 vs 1536 under DCP 8."""
     vllm_config = _make_vllm_config(
-        extra_config={"self_describing_kv_events": True},
+        extra_config={
+            "self_describing_kv_events": True,
+            "min_partial_tail_tokens": min_partial_tail_tokens,
+        },
         tensor_parallel_size=decode_context_parallel_size,
         decode_context_parallel_size=decode_context_parallel_size,
     )
@@ -296,7 +300,7 @@ def test_partial_tail_supported_with_mixed_block_sizes_under_dcp():
     scheduler = _make_dcp_shaped_hybrid_scheduler()
     assert scheduler.config.supports_partial_tail
     assert scheduler.config.partial_tail_window == 32
-    assert scheduler._boundary_state_hit_alignment is None
+    assert scheduler._boundary_state_hit_alignment == 32
     # hash boundaries must split evenly across DCP ranks
     assert not _make_dcp_shaped_hybrid_scheduler(
         decode_context_parallel_size=3
@@ -514,21 +518,86 @@ def test_partial_lookup_under_dcp_requires_recurrent_state_at_boundary():
     assert req_status.partial_tail_boundary is None
 
 
-def test_aligned_boundary_store_keeps_every_boundary_with_partial_tail():
+def test_aligned_boundary_store_skips_unreachable_rows_with_partial_tail_too():
+    # Partial tails are stored by the partial-tail path under their own key, so
+    # an aligned recurrent store off the full-attention chunk grid is dead
+    # weight in either mode.
     scheduler = _make_partial_tail_scheduler()
     _make_partial_tail_request(scheduler)
-    assert scheduler._boundary_state_hit_alignment is None
+    assert scheduler.config.supports_partial_tail
+    assert scheduler._boundary_state_hit_alignment == 16
     scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
         generate_store_output(keys)
     )
     jobs = scheduler._build_aligned_boundary_store_jobs(
         {"req": [(1, 98, 16), (1, 99, 28)]}
     )
-    # 28 is not chunk-aligned for the recurrent group (16) and is filtered by the
-    # pre-existing chunk check; 16 is stored. Nothing is skipped as unreachable.
-    assert len(jobs) == 1
+    assert len(jobs) == 1  # 16 is on the chunk grid; 28 is filtered by the chunk check
     stats = scheduler._connector_stats.reduce()
     assert stats.get(_ConnectorMetricName.STORE_SKIPPED_UNREACHABLE_BOUNDARY, 0) == 0
+
+
+def test_aligned_boundary_store_skips_dead_recurrent_row_under_dcp_with_partial_tail():
+    # DCP-shaped: recurrent block 16, full-attention chunk 32. The recurrent
+    # state at 48 (a recurrent block end that is not a chunk multiple) can never
+    # pair with a chunk hit; the tail is stored separately by the partial path.
+    scheduler = _make_dcp_shaped_hybrid_scheduler()
+    assert scheduler.config.supports_partial_tail
+    _make_dcp_shaped_request(scheduler)
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    jobs = scheduler._build_aligned_boundary_store_jobs(
+        {"req": [(1, 98, 32), (1, 99, 48)]}
+    )
+    assert len(jobs) == 1
+    [job] = jobs.values()
+    assert job.src_spec.block_ids.tolist() == [98]
+    stats = scheduler._connector_stats.reduce()
+    assert stats[_ConnectorMetricName.STORE_SKIPPED_UNREACHABLE_BOUNDARY] == 1
+
+
+def _dcp_partial_tail_jobs(scheduler, boundary=44):
+    _make_dcp_shaped_request(scheduler)
+    req_status = scheduler._req_status["req"]
+    req_status.group_states[0].block_ids[:] = [11, 12]
+    req_status.group_states[1].block_ids[:] = [0, 0, 0, 24]
+    scheduler.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output(keys)
+    )
+    output = SimpleNamespace(
+        kv_connector_block_state=KVConnectorBlockState(
+            block_ids={}, boundary_state_offloads={"req": [(1, 99, boundary)]}
+        )
+    )
+    return scheduler._build_partial_tail_store_jobs(output)
+
+
+def test_min_partial_tail_tokens_gates_on_absolute_tail_length():
+    # tail 44: stored with the default (0) and with a minimum at or below 44,
+    # skipped and counted when the minimum exceeds the tail.
+    assert len(_dcp_partial_tail_jobs(_make_dcp_shaped_hybrid_scheduler())) == 1
+    assert (
+        len(
+            _dcp_partial_tail_jobs(
+                _make_dcp_shaped_hybrid_scheduler(min_partial_tail_tokens=44)
+            )
+        )
+        == 1
+    )
+    scheduler = _make_dcp_shaped_hybrid_scheduler(min_partial_tail_tokens=48)
+    assert scheduler.config.min_partial_tail_tokens == 48
+    assert _dcp_partial_tail_jobs(scheduler) == {}
+    stats = scheduler._connector_stats.reduce()
+    assert stats[_ConnectorMetricName.STORE_SKIPPED_SHORT_PARTIAL_TAIL] == 1
+
+
+def test_min_partial_tail_tokens_is_inert_without_partial_tail_support():
+    scheduler = _make_dcp_shaped_hybrid_scheduler(
+        eagle=True, min_partial_tail_tokens=48
+    )
+    assert not scheduler.config.supports_partial_tail
+    assert scheduler.config.min_partial_tail_tokens == 0
 
 
 def test_normal_store_excludes_align_mode_mamba_sources():
