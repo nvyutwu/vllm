@@ -1332,6 +1332,57 @@ def test_idle_reset_publishes_scoped_clear_without_scheduler_step():
     scheduler.kv_event_publisher.publish.assert_called_once()
 
 
+def test_gpu_only_reset_preserves_cpu_partial_tail_lookup():
+    from tests.v1.kv_connector.unit.offloading_connector.test_scheduler import (
+        _dcp_lookup,
+        _make_dcp_shaped_hybrid_scheduler,
+        _make_dcp_shaped_request,
+    )
+
+    offload = _make_dcp_shaped_hybrid_scheduler()
+    _make_dcp_shaped_request(offload, num_tokens=46)
+    state = offload._req_status["req"]
+    state.update_offload_keys()
+    resident = {0: {b"h7", b"h10"}, 1: {b"h10"}}
+    offload.manager.lookup.side_effect = _dcp_lookup(resident)
+    offload.manager.take_events.return_value = []
+    offload.manager.reset_cache.side_effect = resident.clear
+    assert offload._lookup(state) == 44
+    metadata = dict(offload._events_tracker._pending_event_metadata)
+    assert metadata
+
+    scheduler = create_scheduler(enable_prefix_caching=True)
+    scheduler.kv_event_publisher = Mock()
+    scheduler.kv_cache_manager.take_events = Mock(
+        return_value=[TierBlocksCleared(medium="GPU")]
+    )
+    scheduler.connector = Mock()
+    scheduler.connector_prefix_cache_stats = Mock()
+    scheduler.connector.take_events.side_effect = offload.take_events
+
+    def reset_connector():
+        offload.reset_cache()
+        return True
+
+    scheduler.connector.reset_cache.side_effect = reset_connector
+    assert scheduler.reset_prefix_cache(reset_connector=False)
+    scheduler.connector.reset_cache.assert_not_called()
+    offload.manager.reset_cache.assert_not_called()
+    assert offload._events_tracker._pending_event_metadata == metadata
+    assert offload._lookup(state) == 44
+    assert scheduler.kv_event_publisher.publish.call_args.args[0].events == [
+        TierBlocksCleared(medium="GPU")
+    ]
+
+    assert scheduler.reset_prefix_cache(reset_connector=True)
+    offload.manager.reset_cache.assert_called_once()
+    assert not offload._events_tracker._pending_event_metadata
+    assert offload._lookup(state) == 0
+    assert scheduler.kv_event_publisher.publish.call_args.args[0].events == [
+        AllBlocksCleared()
+    ]
+
+
 def test_idle_reset_with_connector_publishes_all_tier_clear():
     scheduler = create_scheduler(enable_prefix_caching=True)
     scheduler.kv_event_publisher = Mock()
