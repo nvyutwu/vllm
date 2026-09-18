@@ -116,6 +116,26 @@ class CPUOffloadingManager(OffloadingManager):
                 self.counts.popitem(last=False)
             self.counts[key] = 1
 
+    @property
+    def logical_cache_capacity(self) -> int:
+        return self._num_blocks
+
+    def peek(self, key: OffloadKey) -> LookupResult:
+        """Read readiness without access accounting, pins, or tier promotion.
+
+        Only the built-in CPU policies are certified for logical projection.
+        Their get() methods are dictionary reads, unlike tiered lookup().
+        """
+        from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
+        from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+
+        if type(self._policy) not in (LRUCachePolicy, ARCCachePolicy):
+            raise NotImplementedError("CPU policy has no certified readiness view")
+        block = self._policy.get(key)
+        if block is None:
+            return LookupResult.MISS
+        return LookupResult.HIT if block.is_ready else LookupResult.HIT_PENDING
+
     # --- OffloadingManager interface ---
 
     @override

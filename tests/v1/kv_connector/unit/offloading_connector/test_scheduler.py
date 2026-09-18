@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import torch
@@ -92,6 +92,319 @@ def _make_partial_tail_request(
     request.is_finished.return_value = False
     scheduler.on_new_request(request)
     return request
+
+
+def logical_view(publisher, strict=True):
+    from tests.v1.kv_connector.unit.offloading_connector.test_events import (
+        logical_view as fold,
+    )
+
+    return fold(publisher, strict)
+
+
+def _make_logical_native_case(
+    enabled=True,
+    mode="align",
+    capacity=16,
+    options_override=None,
+    supported=True,
+    legacy_enabled=True,
+):
+    from tests.v1.kv_connector.unit.offloading_connector.test_config import _mla_spec
+    from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+
+    options = dict(
+        enabled=enabled,
+        endpoint="tcp://*:5657",
+        replay_endpoint="tcp://*:5658",
+        namespace="test-model",
+    )
+    options.update(options_override or {})
+    config = _make_vllm_config(
+        extra_config={
+            "self_describing_kv_events": True,
+            "logical_cache_events": options,
+        },
+        tensor_parallel_size=8,
+        decode_context_parallel_size=8,
+    )
+    config.cache_config.block_size = 1536
+    config.cache_config.prefix_match_unit = 128
+    config.model_config.use_mla = True
+    config.speculative_config = None
+    config.parallel_config.data_parallel_size = 1
+    config.parallel_config.data_parallel_rank = 0
+    config.kv_events_config = KVEventsConfig(
+        enable_kv_cache_events=legacy_enabled, publisher="null"
+    )
+    groups = [
+        KVCacheGroupSpec(
+            [f"kda{i}"],
+            MambaSpec(
+                block_size=1536 if mode == "align" else 12288,
+                shapes=((1, 1),),
+                dtypes=(torch.float32,),
+                mamba_cache_mode=mode,
+            ),
+        )
+        for i in range(3)
+    ]
+    groups.append(KVCacheGroupSpec(["mla"], _mla_spec(block_size=1536, head_size=1)))
+    cache = KVCacheConfig(num_blocks=64, kv_cache_tensors=[], kv_cache_groups=groups)
+    spec = MockOffloadingSpec(build_offloading_config(config, cache))
+    spec.manager = CPUOffloadingManager(capacity, enable_events=legacy_enabled)
+    with patch(
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.logical."
+        "LogicalCachePublisher"
+    ) as publisher_factory:
+        scheduler = OffloadingConnectorScheduler(spec, config, cache)
+    req = MagicMock()
+    req.request_id = "logical-request"
+    req.kv_transfer_params = None
+    req.num_prompt_tokens = req.num_tokens = 23400
+    req.num_computed_tokens = 0
+    req.block_hashes = [
+        BlockHash(f"h{i}".encode())
+        for i in range(23400 // scheduler.config.tokens_per_hash)
+    ]
+    req.all_token_ids = list(range(23400))
+    req.lora_request = req.cache_salt = req.prompt_embeds = None
+    req.mm_features = []
+    req.skip_reading_prefix_cache = False
+    req.status = RequestStatus.RUNNING
+    req.is_finished.return_value = False
+    scheduler.on_new_request(req)
+    state = scheduler._req_status[req.request_id]
+    state.update_offload_keys()
+    for g in range(3):
+        state.group_states[g].block_ids[:] = [0] * 16
+    state.group_states[3].block_ids[:] = [11, 12]
+    if enabled and supported:
+        assert scheduler._logical_projector is not None
+    else:
+        publisher_factory.assert_not_called()
+        assert scheduler._logical_projector is None
+    return scheduler, req, state, publisher_factory.return_value
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"endpoint": "tcp://localhost:5557"},
+        {"replay_endpoint": "tcp://localhost:5657"},
+        {"namespace": ""},
+    ],
+)
+def test_logical_invalid_transport_does_not_construct_publisher(options):
+    _make_logical_native_case(options_override=options, supported=False)
+
+
+def test_logical_unknown_native_mode_does_not_guess_a_policy():
+    _make_logical_native_case(mode="none", supported=False)
+
+
+def test_logical_native_single_drain_with_legacy_events_disabled():
+    scheduler, req, state, publisher = _make_logical_native_case(legacy_enabled=False)
+    jobs = scheduler._build_partial_tail_store_jobs(
+        SimpleNamespace(
+            kv_connector_block_state=KVConnectorBlockState(
+                block_ids={},
+                boundary_state_offloads={
+                    req.request_id: [(g, 90 + g, 10752) for g in range(3)]
+                },
+            )
+        )
+    )
+    scheduler.update_connector_output(
+        KVConnectorOutput(
+            kv_connector_worker_meta=OffloadingWorkerMetadata(
+                completed_jobs={j: 8 for j in jobs}
+            )
+        )
+    )
+    with patch.object(
+        scheduler.manager, "take_events", wraps=scheduler.manager.take_events
+    ) as drain:
+        assert list(scheduler.take_events()) == []
+        drain.assert_called_once()
+    assert logical_view(publisher)["plans"]
+    assert list(scheduler.manager.take_events()) == []
+
+
+def _logical_query(snapshot, req, n):
+    """Generic CPU-root matching oracle; deliberately contains no Mamba rules."""
+    if snapshot["confidence"] != "known":
+        return 0
+    h = snapshot["hash_unit"]
+
+    def matches(end, identity):
+        return end <= n and req.block_hashes[end // h - 1] == identity
+
+    reachable = {(0, None)}
+    for s in sorted(snapshot["segments"], key=lambda s: s["end"]):
+        if (
+            s["kind"] == "complete"
+            and (s["start"], s["parent_hash"]) in reachable
+            and matches(s["end"], s["end_hash"])
+        ):
+            reachable.add((s["end"], s["end_hash"]))
+    best = 0
+    for p in snapshot["plans"]:
+        if (
+            n >= p["minimum_prompt_tokens"]
+            and (p["anchor"], p["anchor_hash"]) in reachable
+            and matches(p["end"], p["terminal_hash"])
+        ):
+            best = max(best, p["end"])
+    return best
+
+
+@pytest.mark.parametrize(
+    "tail,n,expected",
+    [
+        (False, 12288, 0),
+        (False, 12289, 10752),
+        (False, 11000, 0),
+        (True, 11000, 10752),
+        (True, 12288, 10752),
+    ],
+)
+def test_logical_native_interior_plan_oracle(tail, n, expected):
+    scheduler, req, state, publisher = _make_logical_native_case()
+    projector = scheduler._logical_projector
+    projector.register_complete(req, 12288)
+    projector.register_tail(req, 10752)
+    keys = [scheduler._make_boundary_key(req, g, 10752) for g in range(3)]
+    keys += [scheduler._make_boundary_key(req, 3, 12288)]
+    if tail:
+        keys += [scheduler._make_boundary_key(req, 3, 10752)]
+    out = scheduler.manager.prepare_store(keys, state.req_context)
+    scheduler.manager.complete_store(out.keys_to_store, state.req_context)
+    list(scheduler.take_events())
+    req.num_tokens = req.num_prompt_tokens = n
+    req.block_hashes = req.block_hashes[: n // 128]
+    for g in state.group_states:
+        g.offload_keys.clear()
+    state.update_offload_keys()
+    native, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    snapshot = logical_view(publisher)
+    assert native == _logical_query(snapshot, req, n) == expected
+
+
+def test_logical_native_all_mode_uses_native_coarse_geometry():
+    scheduler, req, state, publisher = _make_logical_native_case(mode="all")
+    assert scheduler.config.tokens_per_hash == 12288
+    scheduler._logical_projector.register_complete(req, 12288)
+    keys = [scheduler._make_boundary_key(req, g, 12288) for g in range(4)]
+    out = scheduler.manager.prepare_store(keys, state.req_context)
+    scheduler.manager.complete_store(out.keys_to_store, state.req_context)
+    list(scheduler.take_events())
+    native, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    snap = logical_view(publisher)
+    assert native == _logical_query(snap, req, 23400) == 12288
+    assert [(p["end"], p["anchor"]) for p in snap["plans"]] == [(12288, 12288)]
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+@pytest.mark.parametrize("failure", ["missing_companion", "divergence"])
+def test_logical_primary_zero_and_explicit_planted_fallback(fallback, failure):
+    scheduler, req, state, publisher = _make_logical_native_case()
+    projector = scheduler._logical_projector
+    projector.register_complete(req, 12288)
+    projector.register_tail(req, 15104)
+    keys = [scheduler._make_boundary_key(req, 3, 12288)]
+    keys += [
+        scheduler._make_boundary_key(req, g, 15104)
+        for g in range(4)
+        if failure != "missing_companion" or g != 0
+    ]
+    if fallback:
+        keys += [scheduler._make_boundary_key(req, g, 12288) for g in range(3)]
+    out = scheduler.manager.prepare_store(keys, state.req_context)
+    scheduler.manager.complete_store(out.keys_to_store, state.req_context)
+    list(scheduler.take_events())
+    if failure == "divergence":
+        req.block_hashes[14080 // 128 :] = [
+            BlockHash(f"changed{i}".encode())
+            for i in range(len(req.block_hashes) - 14080 // 128)
+        ]
+        for g in state.group_states:
+            g.offload_keys.clear()
+        state.update_offload_keys()
+    native, _ = scheduler.get_num_new_matched_tokens(req, 0)
+    snapshot = logical_view(publisher)
+    assert native == _logical_query(snapshot, req, 23400) == (12288 if fallback else 0)
+
+
+def test_logical_native_multi_handoff_completion_reset_and_feature_off_parity():
+    import msgspec
+
+    traces = []
+    for enabled in (False, True):
+        scheduler, req, state, publisher = _make_logical_native_case(enabled=enabled)
+        handoffs = [(g, 90 + g, e) for e in (10752, 23296) for g in range(3)]
+        output = SimpleNamespace(
+            kv_connector_block_state=KVConnectorBlockState(
+                block_ids={}, boundary_state_offloads={req.request_id: handoffs}
+            )
+        )
+        jobs = scheduler._build_partial_tail_store_jobs(output)
+        jobs.update(
+            scheduler._build_store_jobs(
+                SimpleNamespace(
+                    num_scheduled_tokens={req.request_id: 23400}, finished_req_ids=set()
+                )
+            )
+        )
+        trace = [
+            (
+                sorted(scheduler._jobs[j].keys),
+                job.src_spec.block_ids.tolist(),
+                job.src_spec.group_sizes,
+                job.src_spec.block_indices,
+            )
+            for j, job in jobs.items()
+        ]
+        for count in (7, 1):
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs={j: count for j in jobs}
+                    )
+                )
+            )
+            events = list(scheduler.take_events())
+            if count == 7:
+                assert not events
+                if enabled:
+                    assert not logical_view(publisher)["plans"]
+        trace.append(msgspec.msgpack.encode(events))
+        hit = scheduler.get_num_new_matched_tokens(req, 0)[0]
+        assert hit == 23296
+        if enabled:
+            snap = logical_view(publisher)
+            assert {p["end"] for p in snap["plans"]} == {10752, 23296}
+            assert _logical_query(snap, req, 23400) == hit
+        traces.append(trace)
+        scheduler.reset_cache()
+        if enabled:
+            reset = publisher.publish.call_args.args[0].events[0]
+            assert reset["type"] == "LogicalSnapshot"
+            assert reset["epoch"] != snap["epoch"]
+            assert reset["cursor"] == 0
+            assert reset["segments"] == reset["plans"] == []
+            # Old completions cannot repopulate after the immediate idle clear.
+            scheduler.update_connector_output(
+                KVConnectorOutput(
+                    kv_connector_worker_meta=OffloadingWorkerMetadata(
+                        completed_jobs={j: 8 for j in jobs}
+                    )
+                )
+            )
+            assert list(scheduler.take_events()) == []
+            assert publisher.publish.call_args.args[0].events[0] == reset
+    assert traces[0] == traces[1]
 
 
 def _reduce_kv_connector_stats(runner):

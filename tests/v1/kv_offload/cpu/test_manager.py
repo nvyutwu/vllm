@@ -53,6 +53,62 @@ def make_cpu_manager(
     )
 
 
+def test_logical_readiness_peek_refuses_an_uncertified_cache_policy():
+    """An out-of-tree policy must not silently get a readiness view.
+
+    `peek` is only certified for the built-in LRU/ARC, whose `get()` is a plain
+    dictionary read. A custom policy may promote, pin or reorder on `get()`, so
+    observation there would change the very state it claims to observe. The
+    projector factory turns this refusal into "no logical stream", leaving
+    native behaviour untouched.
+    """
+    manager = make_cpu_manager(
+        cache_policy="UncertifiedCachePolicy",
+        cache_policy_module_path=__name__,
+    )
+    assert type(manager._policy) is UncertifiedCachePolicy
+    with pytest.raises(NotImplementedError):
+        manager.peek(to_key(1))
+
+
+class UncertifiedCachePolicy(ARCCachePolicy):
+    """Stands in for any out-of-tree policy: a subclass is still not ARC."""
+
+
+@pytest.mark.parametrize("policy", ["lru", "arc"])
+def test_logical_readiness_peek_preserves_admission_eviction_and_pins(policy):
+    """Observation must not behave like a lookup on a promotion-capable tier."""
+    traces = []
+    for observe in (False, True):
+        manager = make_cpu_manager(
+            num_blocks=2, cache_policy=policy, store_threshold=2, enable_events=True
+        )
+        keys = to_keys([1, 2])
+        assert manager.prepare_store(keys, _EMPTY_REQ_CTX).keys_to_store == []
+        out = manager.prepare_store(keys, _EMPTY_REQ_CTX)
+        if observe:
+            assert manager.peek(keys[0]) == LookupResult.HIT_PENDING
+            assert manager.peek(to_key(99)) == LookupResult.MISS
+        manager.complete_store(out.keys_to_store, _EMPTY_REQ_CTX)
+        manager.prepare_load(keys[:1], _EMPTY_REQ_CTX)
+        for _ in range(20 if observe else 0):
+            assert manager.peek(keys[1]) == LookupResult.HIT
+            assert manager.peek(keys[0]) == LookupResult.HIT
+        manager.complete_load(keys[:1], _EMPTY_REQ_CTX)
+        manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX)
+        out = manager.prepare_store(to_keys([3]), _EMPTY_REQ_CTX)
+        traces.append(
+            (
+                out.keys_to_store,
+                out.evicted_keys,
+                out.store_spec.block_ids.tolist(),
+                list(manager.counts.items()),
+                list(manager.take_events()),
+            )
+        )
+    assert traces[0] == traces[1]
+
+
 @dataclass
 class ExpectedPrepareStoreOutput:
     keys_to_store: list[int]

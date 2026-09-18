@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from unittest.mock import MagicMock
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -38,6 +39,505 @@ from vllm.v1.kv_offload.base import (
     make_offload_key,
 )
 from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
+
+
+def _logical_case(
+    capacity=16,
+    threshold=1,
+    buffer_steps=32,
+    publisher=None,
+    unknown_reannounce_steps=1000,
+):
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.logical import (
+        LogicalCPUProjector,
+    )
+    from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+
+    manager = CPUOffloadingManager(
+        capacity, enable_events=True, store_threshold=threshold
+    )
+    if publisher is None:
+        publisher = MagicMock()
+        publisher.publish.return_value = None
+        publisher.take_overflow.return_value = False
+    projector = LogicalCPUProjector(
+        manager,
+        publisher,
+        namespace="test-model",
+        full_group=3,
+        recurrent_groups=(0, 1, 2),
+        block_size=12288,
+        hash_unit=128,
+        recurrent_chunk=1536,
+        buffer_steps=buffer_steps,
+        unknown_reannounce_steps=unknown_reannounce_steps,
+    )
+    req = SimpleNamespace(
+        block_hashes=[BlockHash(f"h{i}".encode()) for i in range(288)],
+        all_token_ids=list(range(36864)),
+        lora_request=None,
+        mm_features=[],
+        cache_salt=None,
+        prompt_embeds=None,
+    )
+    return manager, publisher, projector, req
+
+
+def _logical_keys(req, end, groups):
+    return [make_offload_key(req.block_hashes[end // 128 - 1], g) for g in groups]
+
+
+def _logical_ready(manager, keys):
+    from vllm.v1.kv_offload.base import ReqContext
+
+    ctx = ReqContext(req_id="logical-test")
+    out = manager.prepare_store(keys, ctx)
+    assert out is not None
+    manager.complete_store(out.keys_to_store, ctx)
+
+
+def logical_view(publisher, strict=True):
+    """Fold a published cut sequence exactly as a conforming consumer must.
+
+    A snapshot re-bases the view; an update applies only when it is contiguous
+    with the accepted cut in the same epoch. Reading the last message instead
+    would let a producer that silently broke continuity still pass.
+    """
+    view = None
+    for published in publisher.publish.call_args_list:
+        message = published.args[0].events[0]
+        if view is not None and message["epoch"] != view["epoch"]:
+            view = None
+        if message["type"] == "LogicalSnapshot":
+            view = dict(
+                message,
+                segments={s["id"]: s for s in message["segments"]},
+                plans={p["id"]: p for p in message["plans"]},
+            )
+            continue
+        assert message["type"] == "LogicalUpdate"
+        if view is None or message["cursor"] != view["cursor"] + 1:
+            assert not strict, "discontiguous logical update"
+            view = None
+            continue
+        segments = dict(view["segments"])
+        plans = dict(view["plans"])
+        for plan_id in message["removed_plans"]:
+            plans.pop(plan_id, None)
+        for segment_id in message["removed_segments"]:
+            segments.pop(segment_id, None)
+            for plan_id in [i for i, p in plans.items() if p["binding"] == segment_id]:
+                del plans[plan_id]
+        for segment in message["added_segments"]:
+            segments[segment["id"]] = segment
+        for plan in message["added_plans"]:
+            plans[plan["id"]] = plan
+        view = dict(message, segments=segments, plans=plans)
+    if view is None:
+        return None
+    return dict(
+        view,
+        segments=sorted(view["segments"].values(), key=lambda s: s["id"]),
+        plans=sorted(view["plans"].values(), key=lambda p: p["id"]),
+    )
+
+
+def _logical_snapshot(projector, manager, publisher):
+    projector.observe(tuple(manager.take_events()))
+    return logical_view(publisher)
+
+
+@pytest.mark.parametrize("tail", [False, True])
+def test_logical_complete_and_exact_tail_have_distinct_prompt_predicates(tail):
+    manager, publisher, projector, req = _logical_case()
+    projector.register_complete(req, 12288)
+    projector.register_tail(req, 10752)
+    keys = _logical_keys(req, 10752, range(3)) + _logical_keys(req, 12288, [3])
+    if tail:
+        keys += _logical_keys(req, 10752, [3])
+    _logical_ready(manager, keys)
+    snap = _logical_snapshot(projector, manager, publisher)
+    plans = [p for p in snap["plans"] if p["end"] == 10752]
+    assert {(p["kind"], p["anchor"], p["minimum_prompt_tokens"]) for p in plans} == (
+        {("complete", 12288, 12289), ("tail", 0, 10753)}
+        if tail
+        else {("complete", 12288, 12289)}
+    )
+
+
+def test_logical_readiness_joins_existing_keys_and_separate_jobs():
+    from vllm.v1.kv_offload.base import ReqContext
+
+    manager, publisher, projector, req = _logical_case(threshold=2)
+    keys = _logical_keys(req, 23296, range(4))
+    ctx = ReqContext(req_id="logical-test")
+    manager.prepare_store(keys[:2], ctx)
+    _logical_ready(manager, keys[:2])
+    projector.register_tail(req, 23296)
+    partial = manager.prepare_store(keys, ctx)
+    assert partial is not None and partial.keys_to_store == []
+    assert not _logical_snapshot(projector, manager, publisher)["plans"]
+    partial = manager.prepare_store(keys, ctx)
+    assert partial is not None and partial.keys_to_store == keys[2:]
+    manager.complete_store(keys[2:3], ctx)
+    assert not _logical_snapshot(projector, manager, publisher)["plans"]
+    # The attention row was absent at the first offer: register its metadata again.
+    projector.register_tail(req, 23296)
+    manager.complete_store(keys[3:], ctx)
+    snap = _logical_snapshot(projector, manager, publisher)
+    assert [(p["end"], p["anchor"]) for p in snap["plans"]] == [(23296, 12288)]
+
+
+def test_logical_prefix_loss_changes_reachability_not_downstream_plan():
+    manager, publisher, projector, req = _logical_case(capacity=5)
+    projector.register_complete(req, 12288)
+    projector.register_tail(req, 23296)
+    _logical_ready(manager, _logical_keys(req, 12288, [3]))
+    _logical_ready(manager, _logical_keys(req, 23296, range(4)))
+    snap = _logical_snapshot(projector, manager, publisher)
+    assert len(snap["segments"]) == 2 and len(snap["plans"]) == 1
+    _logical_ready(manager, [make_offload_key(BlockHash(b"other"), 3)])
+    snap = _logical_snapshot(projector, manager, publisher)
+    assert len(snap["segments"]) == 1
+    assert snap["plans"][0]["end"] == 23296
+
+
+def test_logical_companion_loss_withdraws_plan_without_coverage_delta():
+    manager, publisher, projector, req = _logical_case(capacity=4)
+    projector.register_tail(req, 15104)
+    _logical_ready(manager, _logical_keys(req, 15104, range(4)))
+    before = _logical_snapshot(projector, manager, publisher)
+    _logical_ready(manager, [make_offload_key(BlockHash(b"other"), 0)])
+    after = _logical_snapshot(projector, manager, publisher)
+    assert after["segments"] == before["segments"]
+    assert before["plans"] and not after["plans"]
+
+
+def test_logical_duplicate_events_and_reset_are_atomic_cpu_snapshots():
+    manager, publisher, projector, req = _logical_case()
+    projector.register_tail(req, 10752)
+    _logical_ready(manager, _logical_keys(req, 10752, range(4)))
+    events = tuple(manager.take_events())
+    projector.observe(events)
+    before = publisher.publish.call_args.args[0].events[0]
+    count = publisher.publish.call_count
+    projector.observe(events + events)
+    assert publisher.publish.call_count == count
+    manager.reset_cache()
+    projector.reset()
+    after = publisher.publish.call_args.args[0].events[0]
+    assert after["epoch"] != before["epoch"]
+    assert after["cursor"] == 0 and after["namespace"] == "test-model"
+    assert after["segments"] == after["plans"] == []
+    projector.observe(events)
+    assert publisher.publish.call_args.args[0].events[0] == after
+
+
+def test_logical_complete_bindings_are_bounded_and_die_with_enclosing_row():
+    manager, publisher, projector, req = _logical_case(capacity=4)
+    projector.register_complete(req, 12288)
+    _logical_ready(manager, _logical_keys(req, 12288, [3]))
+    _logical_ready(manager, _logical_keys(req, 10752, range(3)))
+    assert _logical_snapshot(projector, manager, publisher)["plans"]
+    _logical_ready(manager, [make_offload_key(BlockHash(b"other"), 3)])
+    snap = _logical_snapshot(projector, manager, publisher)
+    assert not snap["plans"] and not projector.rows
+
+
+def _logical_messages(publisher):
+    return [c.args[0].events[0] for c in publisher.publish.call_args_list]
+
+
+def test_logical_change_after_a_baseline_is_an_incremental_cut():
+    """The reviewed contract is a snapshot plus contiguous updates, not a
+    complete view on every publication."""
+    manager, publisher, projector, req = _logical_case()
+    projector.register_complete(req, 12288)
+    _logical_ready(manager, _logical_keys(req, 12288, [3]))
+    baseline = _logical_snapshot(projector, manager, publisher)
+    assert len(baseline["segments"]) == 1 and not baseline["plans"]
+    assert _logical_messages(publisher)[-1]["type"] == "LogicalSnapshot"
+
+    _logical_ready(manager, _logical_keys(req, 10752, range(3)))
+    view = _logical_snapshot(projector, manager, publisher)
+    cut = _logical_messages(publisher)[-1]
+    assert cut["type"] == "LogicalUpdate"
+    assert cut["cursor"] == baseline["cursor"] + 1
+    assert cut["epoch"] == baseline["epoch"]
+    # Only the newly certified endpoint travels; the resident row does not.
+    assert cut["added_segments"] == [] and cut["removed_segments"] == []
+    assert cut["removed_plans"] == []
+    assert [p["end"] for p in cut["added_plans"]] == [10752]
+    assert len(view["segments"]) == 1 and [p["end"] for p in view["plans"]] == [10752]
+
+
+def test_logical_update_is_never_applied_without_its_baseline():
+    manager, publisher, projector, req = _logical_case()
+    projector.register_complete(req, 12288)
+    _logical_ready(manager, _logical_keys(req, 12288, [3]))
+    _logical_snapshot(projector, manager, publisher)
+    _logical_ready(manager, _logical_keys(req, 10752, range(3)))
+    _logical_snapshot(projector, manager, publisher)
+
+    messages = _logical_messages(publisher)
+    baseline = max(i for i, m in enumerate(messages) if m["type"] == "LogicalSnapshot")
+    assert any(m["type"] == "LogicalUpdate" for m in messages[baseline + 1 :])
+    orphaned = MagicMock()
+    orphaned.publish.call_args_list = publisher.publish.call_args_list[baseline + 1 :]
+    # A consumer that joined after the baseline holds no view at all; it must
+    # not synthesise one from the deltas it happens to have seen.
+    assert logical_view(orphaned, strict=False) is None
+
+
+def test_logical_updates_never_outrun_the_replay_window():
+    manager, publisher, projector, req = _logical_case(capacity=32, buffer_steps=3)
+    for end in (10752, 11136, 21504, 23040):
+        projector.register_tail(req, end)
+        _logical_ready(manager, _logical_keys(req, end, range(4)))
+        _logical_snapshot(projector, manager, publisher)
+
+    kinds = [m["type"] for m in _logical_messages(publisher)]
+    assert kinds.count("LogicalUpdate") >= 2, kinds
+    run = 0
+    for kind in kinds:
+        run = run + 1 if kind == "LogicalUpdate" else 0
+        # buffer_steps=3 retains three cuts, so at most two updates may separate
+        # consecutive snapshots or a late subscriber cannot rebuild.
+        assert run <= 2, kinds
+
+
+def test_logical_publisher_backpressure_rebases_with_a_snapshot():
+    overflow: dict[str, int | None] = {"at": None}
+    publisher = MagicMock()
+    publisher.publish.return_value = None
+    publisher.take_overflow.side_effect = lambda: (
+        len(publisher.publish.call_args_list) == overflow["at"]
+    )
+    manager, publisher, projector, req = _logical_case(publisher=publisher)
+    projector.register_complete(req, 12288)
+    _logical_ready(manager, _logical_keys(req, 12288, [3]))
+    _logical_snapshot(projector, manager, publisher)
+
+    overflow["at"] = len(publisher.publish.call_args_list) + 1
+    _logical_ready(manager, _logical_keys(req, 10752, range(3)))
+    view = _logical_snapshot(projector, manager, publisher)
+    tail = _logical_messages(publisher)[-2:]
+    assert [m["type"] for m in tail] == ["LogicalUpdate", "LogicalSnapshot"]
+    # The dropped backlog may have held the cut the update continued from, so
+    # the repair is authoritative and carries the same view.
+    assert [p["end"] for p in tail[-1]["plans"]] == [10752]
+    assert [p["end"] for p in view["plans"]] == [10752]
+
+
+def test_logical_observation_failure_reports_the_loss_in_the_same_pass():
+    manager, publisher, projector, req = _logical_case()
+    projector.register_complete(req, 12288)
+    _logical_ready(manager, _logical_keys(req, 12288, [3]))
+    _logical_snapshot(projector, manager, publisher)
+    before = publisher.publish.call_count
+
+    _logical_ready(manager, _logical_keys(req, 10752, range(3)))
+    events = tuple(manager.take_events())
+    assert events
+    with patch.object(manager, "peek", side_effect=RuntimeError("native failure")):
+        projector.observe(events)
+    assert publisher.publish.call_count == before + 1
+    loss = _logical_messages(publisher)[-1]
+    assert loss["type"] == "LogicalSnapshot"
+    assert loss["confidence"] == "unknown" and loss["reason"] == "observation failure"
+    assert loss["segments"] == loss["plans"] == []
+    assert logical_view(publisher)["confidence"] == "unknown"
+
+
+@pytest.mark.parametrize("embeds", [torch.zeros(4, 8), torch.zeros(1)])
+def test_logical_prompt_embeds_are_refused_by_presence_not_truthiness(embeds):
+    """A tensor's truthiness is the wrong question in both directions.
+
+    More than one element raises, which the catch-all would report as "invalid
+    row metadata" rather than an unsupported hash domain. A single zero element
+    is FALSY, which is worse: the request would pass the guard and be registered
+    as if it were token-only.
+    """
+    manager, publisher, projector, req = _logical_case()
+    req.prompt_embeds = embeds
+    projector.register_complete(req, 12288)
+    assert not projector.rows
+    view = _logical_snapshot(projector, manager, publisher)
+    assert view["confidence"] == "unknown"
+    assert view["reason"] == "unsupported request hash inputs"
+
+
+def test_logical_shutdown_keeps_a_queued_cut_when_there_is_room():
+    """Only a FULL queue may lose a cut. At shutdown there is no later cut to
+    re-base from, so an unconditional drop would be a silent mid-stream loss."""
+    from uuid import uuid4
+
+    from vllm.distributed.kv_events import EventBatch
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.logical import (
+        LogicalCachePublisher,
+    )
+
+    suffix = uuid4().hex
+    publisher = LogicalCachePublisher(
+        0,
+        endpoint=f"inproc://shutdown-{suffix}",
+        replay_endpoint=f"inproc://shutdown-replay-{suffix}",
+        topic="logical-cache-v1",
+        max_queue_size=8,
+        buffer_steps=4,
+    )
+    try:
+        publisher.publish(EventBatch(ts=0.0, events=[{"type": "LogicalSnapshot"}]))
+        assert not publisher.take_overflow()
+    finally:
+        publisher.shutdown()
+    # The publisher thread drains before exiting, so the cut reached the wire.
+    assert len(publisher._buffer) == 1
+
+
+def test_logical_unknown_view_keeps_announcing_itself():
+    """Saying "unknown" exactly once is unsafe: a dropped frame would leave a
+    consumer holding stale POSITIVE credit, and a sticky unknown producer has
+    nothing else to publish that would ever reveal it."""
+    manager, publisher, projector, req = _logical_case(unknown_reannounce_steps=3)
+    projector.register_complete(req, 12288)
+    _logical_ready(manager, _logical_keys(req, 12288, [3]))
+    _logical_ready(manager, _logical_keys(req, 10752, range(3)))
+    assert _logical_snapshot(projector, manager, publisher)["plans"]
+
+    _logical_ready(manager, _logical_keys(req, 21504, range(4)))
+    events = tuple(manager.take_events())
+    with patch.object(manager, "peek", side_effect=RuntimeError("native failure")):
+        projector.observe(events)
+    announced = _logical_messages(publisher)[-1]
+    assert announced["confidence"] == "unknown"
+    count = publisher.publish.call_count
+
+    # Idle observations: the view has nothing new to say, but silence is not
+    # safe here, so the loss is restated on a bounded interval.
+    for _ in range(3):
+        projector.observe(())
+    assert publisher.publish.call_count == count + 1
+    repeat = _logical_messages(publisher)[-1]
+    assert repeat["type"] == "LogicalSnapshot"
+    assert repeat["confidence"] == "unknown"
+    assert repeat["reason"] == announced["reason"]
+    assert repeat["epoch"] == announced["epoch"]
+    assert repeat["cursor"] == announced["cursor"] + 1
+    assert repeat["segments"] == repeat["plans"] == []
+
+
+def test_logical_churn_state_is_bounded_by_the_pool_not_by_history():
+    """Fixed capacity, long history: nothing retained may grow with the history."""
+    manager, publisher, projector, req = _logical_case(capacity=4)
+    ends = [e for e in range(128, 36864, 128) if e % 12288][:40]
+    assert len(ends) == 40
+    widths = []
+    for end in ends:
+        projector.register_tail(req, end)
+        _logical_ready(manager, _logical_keys(req, end, range(4)))
+        view = _logical_snapshot(projector, manager, publisher)
+        widths.append((len(projector.rows), len(view["segments"]), len(view["plans"])))
+
+    rows, segments, plans = max(widths)
+    assert rows <= 4, widths
+    # The consumer's view is what the producer actually said; it must stay
+    # bounded by the pool too, or a long-lived worker grows the frontend.
+    assert segments <= 4 and plans <= 4, widths
+    assert len(projector._sent_segments) <= 4
+    assert len(projector._sent_plans) <= 4
+    # And the stream stays inside its replay window the whole way.
+    assert projector._since_snapshot <= projector.snapshot_interval
+
+
+def test_logical_registration_is_bounded_before_native_admission():
+    manager, publisher, projector, req = _logical_case(capacity=2)
+    for end in (12288, 24576):
+        projector.register_complete(req, end)
+        _logical_ready(manager, _logical_keys(req, end, [3]))
+    _logical_snapshot(projector, manager, publisher)
+    assert len(projector.rows) == 2
+
+    # Registration runs ahead of the native store: the pool is full and no row
+    # can be pruned, so the projection is retired instead of growing past it.
+    projector.register_complete(req, 36864)
+    assert not projector.rows
+    view = _logical_snapshot(projector, manager, publisher)
+    assert view["confidence"] == "unknown" and view["reason"] == "row bound exceeded"
+    assert view["segments"] == view["plans"] == []
+
+
+def test_logical_transport_isolates_wildcard_legacy_and_replays_latest_snapshot():
+    import time
+    from uuid import uuid4
+
+    import msgspec
+    import zmq
+
+    from vllm.distributed.kv_events import EventBatch, ZmqEventPublisher
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.logical import (
+        LogicalCachePublisher,
+    )
+
+    suffix = uuid4().hex
+    legacy_address = f"inproc://legacy-{suffix}"
+    logical_address = f"inproc://logical-{suffix}"
+    replay_address = f"inproc://replay-{suffix}"
+    legacy = ZmqEventPublisher(0, endpoint=legacy_address)
+    logical = LogicalCachePublisher(
+        2,
+        endpoint=logical_address,
+        replay_endpoint=replay_address,
+        topic="logical-cache-v1",
+        max_queue_size=1,
+        buffer_steps=1,
+    )
+    context = zmq.Context.instance()
+    wildcard = context.socket(zmq.SUB)
+    wildcard.setsockopt(zmq.SUBSCRIBE, b"")
+    wildcard.connect(legacy_address)
+    replay = context.socket(zmq.DEALER)
+    replay.setsockopt(zmq.RCVTIMEO, 2000)
+    replay.connect(f"{replay_address}_dp2")
+    try:
+        legacy.publish(EventBatch(ts=0.0, events=[{"type": "AllBlocksCleared"}]))
+        assert wildcard.poll(2000)
+        assert msgspec.msgpack.decode(wildcard.recv_multipart()[2])[1] == [
+            {"type": "AllBlocksCleared"}
+        ]
+        for cursor in range(20):
+            logical.publish(
+                EventBatch(
+                    ts=0.0,
+                    events=[
+                        dict(
+                            type="LogicalSnapshot", cursor=cursor, segments=[], plans=[]
+                        )
+                    ],
+                )
+            )
+        deadline = time.monotonic() + 5
+        observed = None
+        while time.monotonic() < deadline:
+            replay.send_multipart([b"", (0).to_bytes(8, "big")])
+            while True:
+                delimiter, topic, sequence, payload = replay.recv_multipart()
+                assert delimiter == b""
+                if sequence == ZmqEventPublisher.END_SEQ:
+                    break
+                assert topic == b"logical-cache-v1"
+                observed = msgspec.msgpack.decode(payload)
+            if observed and observed[1][0]["cursor"] == 19:
+                break
+        assert observed is not None
+        assert observed[2] == 2 and observed[1][0]["cursor"] == 19
+        assert not wildcard.poll(100)
+    finally:
+        wildcard.close(linger=0)
+        replay.close(linger=0)
+        logical.shutdown()
+        legacy.shutdown()
+
 
 _CPU_MEDIUM = Medium.CPU
 _FULL_ATTENTION_EVENT_SPEC = OffloadingEventGroupSpec(

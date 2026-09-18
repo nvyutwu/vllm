@@ -617,6 +617,19 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+        self._logical_projector = None
+        self._legacy_events_enabled = spec.kv_events_config.enable_kv_cache_events
+        logical_options = spec.extra_config.get("logical_cache_events")
+        if isinstance(logical_options, dict) and logical_options.get("enabled") is True:
+            from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
+                logical as logical_module,
+            )
+
+            create_logical_projector = logical_module.create_logical_projector
+
+            self._logical_projector = create_logical_projector(
+                self, vllm_config, kv_cache_config, logical_options
+            )
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState
@@ -1339,6 +1352,11 @@ class OffloadingConnectorScheduler:
                     continue
 
                 key = self._make_boundary_key(req, group_idx, boundary)
+                if (
+                    self._logical_projector is not None
+                    and group_idx in self._full_attention_groups
+                ):
+                    self._logical_projector.register_complete(req, boundary)
                 store_output = self.manager.prepare_store([key], req_status.req_context)
                 if store_output is None:
                     self._connector_stats.increase_counter(
@@ -1493,6 +1511,8 @@ class OffloadingConnectorScheduler:
             # Null or staled-out source block; the aligned path skips these too.
             return
 
+        if self._logical_projector is not None:
+            self._logical_projector.register_tail(req, boundary)
         store_output = self.manager.prepare_store(keys, req_status.req_context)
         if store_output is None:
             self._connector_stats.increase_counter(
@@ -1618,6 +1638,13 @@ class OffloadingConnectorScheduler:
                         group_config.is_eagle_group,
                     ):
                         continue
+                    if (
+                        self._logical_projector is not None
+                        and group_config.group_idx in self._full_attention_groups
+                    ):
+                        self._logical_projector.register_complete(
+                            req, (abs_chunk_idx + 1) * group_config.tokens_per_chunk
+                        )
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
@@ -2002,7 +2029,13 @@ class OffloadingConnectorScheduler:
             ``BlockStored`` or ``BlockRemoved`` events corresponding to
             the underlying :class:`OffloadingEvent` stream.
         """
-        yield from self._events_tracker.take_events(self.manager.take_events())
+        if self._logical_projector is None:
+            yield from self._events_tracker.take_events(self.manager.take_events())
+            return
+        native_events = tuple(self.manager.take_events())
+        self._logical_projector.observe(native_events)
+        if self._legacy_events_enabled:
+            yield from self._events_tracker.take_events(native_events)
 
     def reset_cache(self) -> None:
         """Reset the offloading manager cache, evicting all stored chunks."""
@@ -2039,6 +2072,12 @@ class OffloadingConnectorScheduler:
         # The manager pool is empty; pending event payloads and announced
         # reference counts are stale.
         self._events_tracker.reset()
+        if self._logical_projector is not None:
+            # Discard pre-reset observations; late worker jobs are fenced above.
+            tuple(self.manager.take_events())
+            # Independent publisher: connector-only/idle resets notify now,
+            # without depending on the core GPU event drain or clearing GPU state.
+            self._logical_projector.reset()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
         # The load flush IDs collected above must be delivered to workers.
@@ -2046,4 +2085,6 @@ class OffloadingConnectorScheduler:
             self._chunks_being_loaded.clear()
 
     def shutdown(self) -> None:
+        if self._logical_projector is not None:
+            self._logical_projector.shutdown()
         self.manager.shutdown()
