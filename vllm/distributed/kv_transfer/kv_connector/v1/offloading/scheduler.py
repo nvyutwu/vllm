@@ -1022,9 +1022,9 @@ class OffloadingConnectorScheduler:
             anchor_hit = max(complete_hit, full_attention_hit)
 
         local_tokens = req_status.num_locally_computed_tokens
-        complete_boundary = local_tokens + complete_hit
+        complete_boundary = local_tokens + anchor_hit
         tokens_per_hash = self.config.tokens_per_hash
-        block_end = local_tokens + anchor_hit + self._partial_tail_window
+        block_end = complete_boundary + self._partial_tail_window
         max_boundary = round_down(
             min(req_status.req.num_prompt_tokens - 1, block_end - 1), tokens_per_hash
         )
@@ -1033,8 +1033,6 @@ class OffloadingConnectorScheduler:
 
         pending = False
         for boundary in range(max_boundary, complete_boundary, -tokens_per_hash):
-            if boundary % self._partial_tail_window == 0:
-                continue
             boundary_pending = False
             boundary_missed = False
             boundary_keys = []
@@ -1047,12 +1045,10 @@ class OffloadingConnectorScheduler:
                 if result is LookupResult.MISS:
                     boundary_missed = True
                     break
-                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY) or (
-                    self._chunks_being_loaded and key in self._chunks_being_loaded
-                ):
+                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
                     boundary_pending = True
 
-            pending |= boundary_pending and not boundary_missed
+            pending |= boundary_pending
             if not boundary_missed and not boundary_pending:
                 for group_config, key in zip(
                     self.config.kv_group_configs, boundary_keys
