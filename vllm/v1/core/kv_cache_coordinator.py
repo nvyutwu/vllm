@@ -103,6 +103,9 @@ class KVCacheCoordinator(ABC):
             enable_kv_cache_events=enable_kv_cache_events,
             metrics_collector=metrics_collector,
         )
+        # Full-attention boundaries are the only ones every group publishes;
+        # recurrent keys are anchored on that grid when the knob is on.
+        self.block_pool.recurrent_anchor_tokens = scheduler_block_size
 
         # KV cache group indices that get the EAGLE last-block drop.
         self.eagle_group_ids: set[int] = {

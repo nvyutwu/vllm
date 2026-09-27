@@ -218,6 +218,18 @@ class OffloadingKVEventsConfig:
     # OffloadingConnector opt-in for self-describing BlockStored payloads.
     # Effective only when enable_kv_cache_events is true.
     self_describing_kv_events: bool
+    # Publish recurrent (SSM/KDA) CPU rows as self-describing events anchored
+    # on the full-attention offload chunk grid: block_size = hash unit, one
+    # hash per hash unit from the enclosing full-attention chunk start to the
+    # boundary, parent = the chunk-start hash. Lets a KV-aware router place a
+    # recurrent resume point without reproducing the engine hash function.
+    anchored_recurrent_events: bool = False
+    # Announce removals of hash-unit chain rows (partial tails, anchored
+    # recurrent rows) by their key (final hash) instead of every content hash.
+    # Interior hashes are shared with every other row covering the same
+    # prefix, so a key-indexed consumer would otherwise drop live rows when a
+    # longer sibling is evicted. Implied by anchored_recurrent_events.
+    chain_removals_by_key: bool = False
 
 
 class OffloadingManager(ABC):
@@ -588,6 +600,12 @@ class OffloadingSpec(ABC):
             enable_kv_cache_events=config.enable_kv_cache_events,
             self_describing_kv_events=bool(
                 self.extra_config.get("self_describing_kv_events", False)
+            ),
+            anchored_recurrent_events=bool(
+                self.extra_config.get("anchored_recurrent_events", False)
+            ),
+            chain_removals_by_key=bool(
+                self.extra_config.get("chain_removals_by_key", False)
             ),
         )
 

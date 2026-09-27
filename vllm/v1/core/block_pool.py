@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -192,6 +193,20 @@ class BlockPool:
 
         self.enable_kv_cache_events = enable_kv_cache_events
         self.kv_event_queue: list[KVCacheEvent] = []
+        # Anchored recurrent events (prototype knob; a PR would carry this in
+        # kv_events_config): publish every recurrent (SSM/KDA) prefix-cache key
+        # as a hash-unit chain from the start of its enclosing full-attention
+        # block (`recurrent_anchor_tokens`) to the key's boundary, parented on
+        # the full-attention boundary the attention group already published.
+        # A KV-aware router can then attach the resume point to the prefix it
+        # belongs to by hashing the carried tokens, without reproducing the
+        # engine hash function and without depending on sparse-retention
+        # siblings that were never announced.
+        self.anchored_recurrent_events = (
+            os.environ.get("VLLM_KV_EVENTS_ANCHORED_RECURRENT", "0") == "1"
+        )
+        self.recurrent_anchor_tokens: int | None = None
+        self.anchored_recurrent_groups: set[int] = set()
 
         self.metrics_collector = metrics_collector
 
@@ -298,7 +313,20 @@ class BlockPool:
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
-        if self.enable_kv_cache_events:
+        if self.enable_kv_cache_events and self._use_anchored_recurrent(
+            kv_cache_group_id
+        ):
+            for i, blk in enumerate(new_full_blocks):
+                if blk.is_null or (block_mask is not None and not block_mask[i]):
+                    continue
+                self.kv_event_queue.append(
+                    self._build_anchored_recurrent_event(
+                        request,
+                        (num_cached_blocks + i + 1) * block_size,
+                        kv_cache_group_id,
+                    )
+                )
+        elif self.enable_kv_cache_events:
             if num_cached_blocks == 0:
                 parent_block_hash: ExternalBlockHash | None = None
             else:
@@ -340,6 +368,50 @@ class BlockPool:
                     extra_keys_list=extra_keys_list,
                 )
             )
+
+    def _use_anchored_recurrent(self, kv_cache_group_id: int) -> bool:
+        return (
+            self.anchored_recurrent_events
+            and self.recurrent_anchor_tokens is not None
+            and kv_cache_group_id in self.anchored_recurrent_groups
+        )
+
+    def _build_anchored_recurrent_event(
+        self,
+        request: Request,
+        boundary_tokens: int,
+        kv_cache_group_id: int,
+    ) -> BlockStored:
+        """``BlockStored`` for one recurrent prefix-cache key at ``boundary_tokens``.
+
+        Shape: ``block_size = hash_block_size``; one hash per hash unit from the
+        enclosing full-attention block start to the boundary; the parent is the
+        full-attention block boundary (or None in the first block); ``token_ids``
+        span exactly the carried hashes. Only the final hash is a lookup key.
+        """
+        window = self.recurrent_anchor_tokens
+        assert window is not None and window > 0
+        h = self.hash_block_size
+        assert boundary_tokens > 0 and boundary_tokens % h == 0
+        chunk_start = ((boundary_tokens - 1) // window) * window
+        first = chunk_start // h
+        last = boundary_tokens // h
+        hashes = [maybe_convert_block_hash(x) for x in request.block_hashes[first:last]]
+        parent = (
+            maybe_convert_block_hash(request.block_hashes[first - 1])
+            if first > 0
+            else None
+        )
+        return self._build_block_stored_event(
+            request,
+            block_hashes=hashes,
+            parent_block_hash=parent,
+            start_token_idx=chunk_start,
+            end_token_idx=boundary_tokens,
+            block_size=h,
+            kv_cache_group_id=kv_cache_group_id,
+            extra_keys_list=[],
+        )
 
     def _build_block_stored_event(
         self,
@@ -510,7 +582,17 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
-        if self.enable_kv_cache_events and not already_cached:
+        if (
+            self.enable_kv_cache_events
+            and not already_cached
+            and self._use_anchored_recurrent(kv_cache_group_id)
+        ):
+            self.kv_event_queue.append(
+                self._build_anchored_recurrent_event(
+                    request, num_tokens, kv_cache_group_id
+                )
+            )
+        elif self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens, block_size
             )

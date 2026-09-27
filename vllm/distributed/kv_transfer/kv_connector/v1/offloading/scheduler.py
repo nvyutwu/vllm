@@ -617,6 +617,8 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs: dict[int, set[int]] = {}
 
         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+        if self.config.supports_partial_tail:
+            self._events_tracker.recurrent_anchor_window = self._partial_tail_window
 
     def _maybe_observe_lookup_async_delay(
         self, req_status: RequestOffloadState

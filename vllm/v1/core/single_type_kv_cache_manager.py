@@ -1384,6 +1384,8 @@ class MambaManager(SingleTypeKVCacheManager):
         # class applies for attention groups whose KV cache is partitioned.
         self.block_size = kv_cache_spec.block_size
         self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+        if self.mamba_cache_mode == "align":
+            self.block_pool.anchored_recurrent_groups.add(self.kv_cache_group_id)
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
         if self.mamba_cache_mode == "align":

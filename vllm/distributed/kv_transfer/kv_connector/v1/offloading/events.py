@@ -113,6 +113,25 @@ class OffloadingEventsTracker:
 
         # OffloadKey -> payload snapshot, kept until final removal or reset.
         self._pending_event_metadata: dict[OffloadKey, _OffloadEventMetadata] = {}
+        # Full-attention offload chunk (tokens) that anchors recurrent rows; set
+        # by the connector scheduler once the partial-tail window is known.
+        self.recurrent_anchor_window: int | None = None
+        self.anchored_recurrent_enabled = (
+            self.self_describing_enabled and config.anchored_recurrent_events
+        )
+        # Chain-shaped rows are removed by key when either knob asks for it: a
+        # key-indexed consumer (the hybrid engine-hash probe) needs it even
+        # without anchored recurrent rows.
+        self.chain_removals_by_key = self.self_describing_enabled and (
+            config.anchored_recurrent_events or config.chain_removals_by_key
+        )
+
+    def _anchored_recurrent(self, group_config: "GroupOffloadConfig") -> bool:
+        return (
+            self.anchored_recurrent_enabled
+            and group_config.requires_cow_source
+            and self.recurrent_anchor_window is not None
+        )
 
     def record_store(
         self,
@@ -129,6 +148,13 @@ class OffloadingEventsTracker:
         if not self.self_describing_enabled:
             return
         if group_config.sliding_window_size_in_chunks is not None:
+            if self._anchored_recurrent(group_config):
+                self._record_anchored_recurrent(
+                    req,
+                    group_config,
+                    (chunk_idx + 1) * group_config.tokens_per_chunk,
+                    offload_key,
+                )
             return
         meta = self._build_event_metadata(req, group_config, chunk_idx)
         if existing := self._pending_event_metadata.get(offload_key):
@@ -161,6 +187,10 @@ class OffloadingEventsTracker:
     ) -> None:
         """Snapshot metadata for a newly stored partial recurrent tail."""
         if group_config.sliding_window_size_in_chunks is not None:
+            if self._anchored_recurrent(group_config):
+                self._record_anchored_recurrent(
+                    req, group_config, boundary_tokens, offload_key
+                )
             return
         self._record_partial_tail(req, group_config, boundary_tokens, offload_key)
 
@@ -173,9 +203,64 @@ class OffloadingEventsTracker:
     ) -> None:
         """Backfill metadata for a partial recurrent tail lookup hit."""
         if group_config.sliding_window_size_in_chunks is not None:
+            if (
+                self._anchored_recurrent(group_config)
+                and offload_key not in self._pending_event_metadata
+            ):
+                self._record_anchored_recurrent(
+                    req, group_config, boundary_tokens, offload_key
+                )
             return
         if offload_key not in self._pending_event_metadata:
             self._record_partial_tail(req, group_config, boundary_tokens, offload_key)
+
+    def _record_anchored_recurrent(
+        self,
+        req: Request,
+        group_config: "GroupOffloadConfig",
+        boundary_tokens: int,
+        offload_key: OffloadKey,
+    ) -> None:
+        """Self-describing payload for one recurrent (SSM/KDA) resume point.
+
+        The row holds the state at ``boundary_tokens``. It is described as a
+        hash-unit chain from the start of the enclosing full-attention offload
+        chunk to the boundary, parented on the chunk-start hash, so a consumer
+        that indexes full-attention chunks can attach the resume point to the
+        prefix it belongs to by hashing the carried tokens. ``block_size`` is
+        the hash unit; only the final hash is a lookup key in the engine.
+        """
+        window = self.recurrent_anchor_window
+        assert window is not None and window > 0
+        tokens_per_hash = group_config.tokens_per_chunk // group_config.hashes_per_chunk
+        assert boundary_tokens > 0 and boundary_tokens % tokens_per_hash == 0
+        chunk_start = ((boundary_tokens - 1) // window) * window
+        first_hash_idx = chunk_start // tokens_per_hash
+        last_hash_idx = boundary_tokens // tokens_per_hash
+        assert last_hash_idx <= len(req.block_hashes)
+        maybe_block_hashes = req.block_hashes[first_hash_idx:last_hash_idx]
+        block_hashes = tuple(h for h in maybe_block_hashes if h is not None)
+        assert block_hashes and len(block_hashes) == len(maybe_block_hashes)
+        parent_block_hash = (
+            req.block_hashes[first_hash_idx - 1] if first_hash_idx > 0 else None
+        )
+        lora_id = req.lora_request.adapter_id if req.lora_request is not None else None
+        lora_name = req.lora_request.name if req.lora_request is not None else None
+        meta = _OffloadEventMetadata(
+            block_hashes=block_hashes,
+            parent_block_hash=parent_block_hash,
+            token_ids=tuple(req.all_token_ids[chunk_start:boundary_tokens]),
+            block_size=tokens_per_hash,
+            lora_id=lora_id,
+            lora_name=lora_name,
+            extra_keys=None,
+            group_idx=group_config.group_idx,
+            kv_cache_spec=group_config.kv_event_group_spec,
+            active_residencies={(Medium.CPU, None)},
+        )
+        if existing := self._pending_event_metadata.get(offload_key):
+            meta.active_residencies.update(existing.active_residencies)
+        self._pending_event_metadata[offload_key] = meta
 
     def _record_partial_tail(
         self,
@@ -402,8 +487,19 @@ class OffloadingEventsTracker:
             meta = self._pending_event_metadata.get(key)
             if meta is not None:
                 group_idx = meta.group_idx
+                # A hash-unit chain row (partial tail, anchored recurrent row)
+                # lists its whole content in BlockStored, but only its final
+                # hash is the row's key. Announce removals by key: the interior
+                # hashes are shared with every other row covering the same
+                # prefix, and a consumer that indexes keys must not lose a live
+                # row because a longer sibling was evicted.
+                removed_hashes = (
+                    meta.block_hashes[-1:]
+                    if self.chain_removals_by_key and len(meta.block_hashes) > 1
+                    else meta.block_hashes
+                )
                 by_group.setdefault(group_idx, []).extend(
-                    maybe_convert_block_hash(h) for h in meta.block_hashes
+                    maybe_convert_block_hash(h) for h in removed_hashes
                 )
                 meta.active_residencies.discard((event.medium, event.ownership))
                 if not meta.active_residencies:
