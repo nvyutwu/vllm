@@ -158,6 +158,7 @@ class SingleTypeKVCacheManager(ABC):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        prefill_end: int = 0,
     ) -> int:
         """
         Get the number of blocks needed to be allocated for the request.
@@ -178,6 +179,10 @@ class SingleTypeKVCacheManager(ABC):
             apply_admission_cap: If True, clamp by `num_required_blocks` by
                 `_max_admission_blocks_per_request`for recycling-aware specs
                 (SWA, chunked-local).
+            prefill_end: The token index the request's prefill ends at, the
+                same value the scheduler splits chunks against. Mamba reserves
+                a prefill checkpoint only on the chunk reaching it; 0 (dense
+                retention) reserves one on every chunk.
 
         Returns:
             The number of blocks to allocate.
@@ -1151,6 +1156,7 @@ class CircularBufferManager(FullAttentionManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        prefill_end: int = 0,
     ) -> int:
         return 0 if self.req_to_blocks.get(request_id) else 1
 
@@ -1600,6 +1606,7 @@ class MambaManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_tokens_main_model: int,
         apply_admission_cap: bool = False,
+        prefill_end: int = 0,
     ) -> int:
         assert isinstance(self.kv_cache_spec, MambaSpec)
         if (
@@ -1626,6 +1633,7 @@ class MambaManager(SingleTypeKVCacheManager):
                 num_local_computed_tokens,
                 num_tokens_main_model,
                 apply_admission_cap=apply_admission_cap,
+                prefill_end=prefill_end,
             )
         else:
             # We don't allocate blocks for lookahead tokens in align mode, because if
@@ -1653,8 +1661,17 @@ class MambaManager(SingleTypeKVCacheManager):
             )
             if has_partial_hit:
                 num_new_blocks = max(num_new_blocks, 0) + 1
+            # Under sparse retention only the prefill-end chunk's checkpoint is
+            # kept, so a mid-prompt chunk would reserve a block that is released
+            # the next step, evicting a cached block to get it. The worker masks
+            # the export when the checkpoint column is null. With partial hits
+            # the scheduler ends the prompt-end chunk at the last hash boundary
+            # and computes the remainder separately, so gate on that boundary.
+            hash_block_size = self.block_pool.hash_block_size
+            checkpoint_floor = prefill_end - prefill_end % hash_block_size
             checkpoint_block = int(
-                self._needs_internal_checkpoint(
+                num_tokens >= checkpoint_floor
+                and self._needs_internal_checkpoint(
                     request_id, num_tokens, total_computed_tokens
                 )
             )
