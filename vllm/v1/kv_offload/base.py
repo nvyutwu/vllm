@@ -596,16 +596,20 @@ class OffloadingSpec(ABC):
         self.config = config
         self.extra_config = config.extra_config
         self.replicated_layout: bool = False
+        anchored_recurrent_events = bool(
+            self.extra_config.get("anchored_recurrent_events", False)
+        )
         self.kv_events_config = OffloadingKVEventsConfig(
             enable_kv_cache_events=config.enable_kv_cache_events,
             self_describing_kv_events=bool(
                 self.extra_config.get("self_describing_kv_events", False)
             ),
-            anchored_recurrent_events=bool(
-                self.extra_config.get("anchored_recurrent_events", False)
-            ),
-            chain_removals_by_key=bool(
-                self.extra_config.get("chain_removals_by_key", False)
+            anchored_recurrent_events=anchored_recurrent_events,
+            # Anchored recurrent rows are chain rows: their removals must be
+            # announced by key, so the knob implies chain_removals_by_key.
+            chain_removals_by_key=(
+                anchored_recurrent_events
+                or bool(self.extra_config.get("chain_removals_by_key", False))
             ),
         )
 
