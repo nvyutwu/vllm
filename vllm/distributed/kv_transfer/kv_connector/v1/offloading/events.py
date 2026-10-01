@@ -93,6 +93,9 @@ class _OffloadEventMetadata:
     group_idx: int
     kv_cache_spec: OffloadingEventGroupSpec
     active_residencies: set[tuple[Medium, str | None]]
+    # True for hash-unit chain rows (partial tail, anchored recurrent row): the row's
+    # key is its final hash only. False for chunk rows, whose every hash is a key.
+    chain_row: bool = False
 
 
 class OffloadingEventsTracker:
@@ -257,6 +260,7 @@ class OffloadingEventsTracker:
             group_idx=group_config.group_idx,
             kv_cache_spec=group_config.kv_event_group_spec,
             active_residencies={(Medium.CPU, None)},
+            chain_row=True,
         )
         if existing := self._pending_event_metadata.get(offload_key):
             meta.active_residencies.update(existing.active_residencies)
@@ -315,6 +319,7 @@ class OffloadingEventsTracker:
             group_idx=group_config.group_idx,
             kv_cache_spec=group_config.kv_event_group_spec,
             active_residencies={(Medium.CPU, None)},
+            chain_row=True,
         )
         if existing := self._pending_event_metadata.get(offload_key):
             meta.active_residencies.update(existing.active_residencies)
@@ -489,13 +494,15 @@ class OffloadingEventsTracker:
                 group_idx = meta.group_idx
                 # A hash-unit chain row (partial tail, anchored recurrent row)
                 # lists its whole content in BlockStored, but only its final
-                # hash is the row's key. Announce removals by key: the interior
-                # hashes are shared with every other row covering the same
-                # prefix, and a consumer that indexes keys must not lose a live
-                # row because a longer sibling was evicted.
+                # hash is the row's key. Announce its removal by key: the
+                # interior hashes are shared with every other row covering
+                # the same prefix, and a consumer that indexes keys must not
+                # lose a live row because a longer sibling was evicted. Chunk
+                # rows (several hashes when blocks_per_chunk > 1) announce
+                # every hash they stored.
                 removed_hashes = (
                     meta.block_hashes[-1:]
-                    if self.chain_removals_by_key and len(meta.block_hashes) > 1
+                    if self.chain_removals_by_key and meta.chain_row
                     else meta.block_hashes
                 )
                 by_group.setdefault(group_idx, []).extend(
