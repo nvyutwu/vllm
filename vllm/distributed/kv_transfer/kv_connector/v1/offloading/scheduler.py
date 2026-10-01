@@ -1507,8 +1507,11 @@ class OffloadingConnectorScheduler:
                     req, group_config, boundary, key
                 )
 
-        group_by_key = {key: idx for idx, key in enumerate(keys)}
-        accepted_groups = [group_by_key[key] for key in store_output.keys_to_store]
+        # Keep group order (as the aligned store path does): group_sizes and
+        # block_indices are indexed by group, so source_blocks must follow the
+        # group order of `keys`, not the manager's returned key order.
+        accepted_keys = set(store_output.keys_to_store)
+        accepted_groups = [idx for idx, key in enumerate(keys) if key in accepted_keys]
         group_sizes = [0] * len(self.config.kv_group_configs)
         block_indices = [0] * len(self.config.kv_group_configs)
         for group_idx in accepted_groups:
