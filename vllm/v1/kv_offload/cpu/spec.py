@@ -112,6 +112,16 @@ class CPUOffloadingSpec(OffloadingSpec):
                     ),
                 )
             )
+        protect_threshold = int(extra_config.get("protect_threshold", 0))
+        if protect_threshold >= 1:
+            definitions[CPUOffloadingMetrics.CPU_PROTECTED_BLOCKS] = (
+                OffloadingGaugeMetadata(
+                    documentation=(
+                        "Number of CPU KV-cache blocks currently exempt from "
+                        "eviction by the frequency floor (protect_threshold)."
+                    ),
+                )
+            )
         return definitions
 
     def __init__(self, config: OffloadingConfig):
@@ -205,6 +215,14 @@ class CPUOffloadingSpec(OffloadingSpec):
             # Maximum entries in the internal tracker's LRU table.
             max_tracker_size = int(self.extra_config.get("max_tracker_size", 64_000))
 
+            # protect_threshold: a resident block observed (offered for store
+            # or hit) this many times is exempt from eviction, up to
+            # max_protected_fraction of the CPU pool. 0 (default) disables it.
+            protect_threshold = int(self.extra_config.get("protect_threshold", 0))
+            max_protected_fraction = float(
+                self.extra_config.get("max_protected_fraction", 0.1)
+            )
+
             self._manager = CPUOffloadingManager(
                 num_blocks=self.num_blocks,
                 bytes_per_block=self.kv_bytes_per_chunk,
@@ -213,6 +231,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                protect_threshold=protect_threshold,
+                max_protected_fraction=max_protected_fraction,
             )
         return self._manager
 

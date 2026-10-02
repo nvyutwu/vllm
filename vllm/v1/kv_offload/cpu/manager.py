@@ -48,6 +48,8 @@ class CPUOffloadingManager(OffloadingManager):
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
         bytes_per_block: int = 0,
+        protect_threshold: int = 0,
+        max_protected_fraction: float = 0.1,
     ):
         self.medium: Medium = Medium.CPU
         self._num_blocks: int = num_blocks
@@ -69,9 +71,20 @@ class CPUOffloadingManager(OffloadingManager):
         self.stores_skipped_in_current_batch: int = 0
         self.allocation_sizes_in_current_batch: list[int] = []
 
+        # Frequency floor: a resident block observed (offered for store or hit)
+        # at least protect_threshold times is exempt from eviction, so a popular
+        # shared prefix survives the churn of large one-off prompts. Bounded by
+        # max_protected_fraction of the pool so stores can always make room.
+        # 0 disables the floor.
+        self.protect_threshold: int = protect_threshold
+        self.max_protected_blocks: int = (
+            int(num_blocks * max_protected_fraction) if protect_threshold >= 1 else 0
+        )
+        self.protected: set[OffloadKey] = set()
+
         # Number of block references. It is ordered so can evict the LRU entry in O(1).
         self.counts: OrderedDict[OffloadKey, int] | None = (
-            OrderedDict() if store_threshold >= 2 else None
+            OrderedDict() if store_threshold >= 2 or protect_threshold >= 1 else None
         )
 
     # --- block pool ---
@@ -106,7 +119,8 @@ class CPUOffloadingManager(OffloadingManager):
         return CPULoadStoreSpec([block.block_id for block in blocks])
 
     def _record_access(self, key: OffloadKey) -> None:
-        """Count one observation of ``key`` for store admission."""
+        """Count one observation of ``key`` for store admission and the
+        frequency floor."""
         assert self.counts is not None
         if key in self.counts:
             self.counts.move_to_end(key)
@@ -115,6 +129,21 @@ class CPUOffloadingManager(OffloadingManager):
             if len(self.counts) >= self.max_tracker_size:
                 self.counts.popitem(last=False)
             self.counts[key] = 1
+        self._maybe_protect(key)
+
+    def _maybe_protect(self, key: OffloadKey) -> None:
+        """Exempt ``key`` from eviction once it is resident and has been
+        observed protect_threshold times, while the protected set has room."""
+        if self.protect_threshold < 1 or key in self.protected:
+            return
+        assert self.counts is not None
+        if self.counts.get(key, 0) < self.protect_threshold:
+            return
+        if len(self.protected) >= self.max_protected_blocks:
+            return
+        if self._policy.get(key) is None:
+            return
+        self.protected.add(key)
 
     # --- OffloadingManager interface ---
 
@@ -152,6 +181,11 @@ class CPUOffloadingManager(OffloadingManager):
 
     @override
     def touch(self, keys: Collection[OffloadKey], req_context: ReqContext) -> None:
+        # A hit on a resident block is a reuse observation. Only resident keys
+        # reach touch(), so this never changes store admission for new keys.
+        if self.counts is not None:
+            for key in keys:
+                self._record_access(key)
         self._policy.touch(keys, req_context)
 
     @override
@@ -202,7 +236,8 @@ class CPUOffloadingManager(OffloadingManager):
 
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
-            protected = set(keys)
+            # So are the frequency floor's protected blocks.
+            protected = set(keys) | self.protected
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
                 return None
@@ -213,6 +248,7 @@ class CPUOffloadingManager(OffloadingManager):
 
             for key, block in evicted:
                 self._free_block(block)
+                self.protected.discard(key)
                 to_evict.append(key)
 
         if to_evict and self.events is not None:
@@ -267,6 +303,7 @@ class CPUOffloadingManager(OffloadingManager):
                     self._num_write_pending_blocks -= 1
                     self._policy.remove(key)
                     self._free_block(block)
+                    self.protected.discard(key)
 
         if stored_keys and self.events is not None:
             self.events.append(
@@ -287,6 +324,7 @@ class CPUOffloadingManager(OffloadingManager):
         self._policy.clear()
         self._num_evictable_cache_blocks = 0
         self._num_write_pending_blocks = 0
+        self.protected.clear()
 
         self._free_list.clear()
         self._num_allocated_blocks = 0
@@ -345,5 +383,10 @@ class CPUOffloadingManager(OffloadingManager):
                 self.stores_skipped_in_current_batch,
             )
             self.stores_skipped_in_current_batch = 0
+
+        if self.protect_threshold >= 1:
+            stats.set_gauge(
+                CPUOffloadingMetrics.CPU_PROTECTED_BLOCKS, len(self.protected)
+            )
 
         return stats

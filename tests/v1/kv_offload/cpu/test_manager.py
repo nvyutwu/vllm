@@ -42,6 +42,8 @@ def make_cpu_manager(
     enable_events: bool = False,
     store_threshold: int = 0,
     max_tracker_size: int = 64_000,
+    protect_threshold: int = 0,
+    max_protected_fraction: float = 0.1,
 ) -> CPUOffloadingManager:
     return CPUOffloadingManager(
         num_blocks=num_blocks,
@@ -50,6 +52,8 @@ def make_cpu_manager(
         enable_events=enable_events,
         store_threshold=store_threshold,
         max_tracker_size=max_tracker_size,
+        protect_threshold=protect_threshold,
+        max_protected_fraction=max_protected_fraction,
     )
 
 
@@ -997,6 +1001,83 @@ def test_filter_reused_manager():
     assert prepare_store_output is not None
     assert prepare_store_output.keys_to_store == []
     assert manager.counts.get(to_keys([1])[0]) == 1
+
+
+def test_frequency_floor_protects_hot_keys():
+    """
+    protect_threshold=2, max_protected_fraction=0.5 on a 4-block pool: a resident
+    block observed twice (store offer + hit, or two offers) is exempt from
+    eviction, at most 2 blocks are protected, and a store that cannot make room
+    without touching them fails instead of evicting them.
+    """
+    manager = make_cpu_manager(
+        num_blocks=4,
+        cache_policy="lru",
+        enable_events=True,
+        protect_threshold=2,
+        max_protected_fraction=0.5,
+    )
+    # The floor keeps counts even though store_threshold is off.
+    assert manager.counts is not None
+    assert manager.max_protected_blocks == 2
+
+    # Fill the pool: [1, 2, 3, 4] each observed once.
+    manager.prepare_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1, 2, 3, 4]), _EMPTY_REQ_CTX)
+    assert not manager.protected
+
+    # A hit on [1] is its 2nd observation -> protected.
+    manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+    assert manager.protected == {to_key(1)}
+
+    # A repeated store offer of [2] (another request sharing the prefix) is its
+    # 2nd observation -> protected; nothing new is stored.
+    prepare_store_output = manager.prepare_store(to_keys([2]), _EMPTY_REQ_CTX)
+    assert prepare_store_output is not None
+    assert prepare_store_output.keys_to_store == []
+    assert manager.protected == {to_key(1), to_key(2)}
+
+    # [3] reaches the threshold too, but the cap (2 blocks) is full.
+    manager.touch(to_keys([3]), _EMPTY_REQ_CTX)
+    manager.touch(to_keys([3]), _EMPTY_REQ_CTX)
+    assert manager.counts[to_key(3)] == 3
+    assert to_key(3) not in manager.protected
+
+    # LRU order (oldest first) is now 2, 4, 1, 3. Storing [5, 6] must evict
+    # the two unprotected blocks 4 and 3, skipping 2 and 1.
+    prepare_store_output = manager.prepare_store(to_keys([5, 6]), _EMPTY_REQ_CTX)
+    assert prepare_store_output is not None
+    assert prepare_store_output.keys_to_store == to_keys([5, 6])
+    assert prepare_store_output.evicted_keys == to_keys([4, 3])
+    manager.complete_store(to_keys([5, 6]), _EMPTY_REQ_CTX)
+    assert manager.lookup(to_key(1), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(2), _EMPTY_REQ_CTX) is LookupResult.HIT
+    assert manager.lookup(to_key(4), _EMPTY_REQ_CTX) is LookupResult.MISS
+
+    # Only 2 unprotected evictable blocks remain ([5, 6]); a 3-block store
+    # cannot make room and fails rather than evicting a protected block.
+    assert manager.prepare_store(to_keys([7, 8, 9]), _EMPTY_REQ_CTX) is None
+    assert manager.protected == {to_key(1), to_key(2)}
+
+    # The gauge reports the protected count; reset clears it.
+    stats = manager.get_stats()
+    assert stats is not None
+    assert stats.reduce()[CPUOffloadingMetrics.CPU_PROTECTED_BLOCKS] == 2
+    manager.reset_cache()
+    assert not manager.protected
+
+
+def test_frequency_floor_off_by_default_keeps_counts_off():
+    manager = make_cpu_manager(num_blocks=2)
+    assert manager.counts is None
+    assert manager.max_protected_blocks == 0
+    manager.prepare_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    manager.complete_store(to_keys([1, 2]), _EMPTY_REQ_CTX)
+    manager.touch(to_keys([1]), _EMPTY_REQ_CTX)
+    assert not manager.protected
+    stats = manager.get_stats()
+    assert stats is not None
+    assert CPUOffloadingMetrics.CPU_PROTECTED_BLOCKS not in stats.reduce()
 
 
 def test_evictable_cache_block_count():
