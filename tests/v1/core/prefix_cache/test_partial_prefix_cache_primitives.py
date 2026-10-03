@@ -469,7 +469,7 @@ def test_cache_partial_block_demote_primary_keeps_shorter_key():
     ``block_has_partial_keys`` then reports the block as copy-on-write."""
     hash_block_size, block_size, gid = 2, 6, 0
     pool = BlockPool(
-        num_gpu_blocks=2,
+        num_gpu_blocks=3,  # the null block takes one slot
         enable_caching=True,
         hash_block_size=hash_block_size,
         enable_kv_cache_events=True,

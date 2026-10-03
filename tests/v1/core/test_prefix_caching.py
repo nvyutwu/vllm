@@ -4433,6 +4433,10 @@ def _junction_manager(
 
 
 def _new_step(manager: KVCacheManager) -> None:
+    """End a scheduler step the way the scheduler does: run the queued CoW
+    copies (release their retained endpoints) and clear the per-step sets."""
+    _, retained = manager.take_kv_cache_block_copies()
+    manager.block_pool.free_blocks(retained)
     for m in manager.coordinator.single_type_managers:
         m.new_step_starts()
 

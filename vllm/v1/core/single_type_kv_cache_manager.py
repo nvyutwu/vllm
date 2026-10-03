@@ -1992,8 +1992,9 @@ class MambaManager(SingleTypeKVCacheManager):
         """Bound the retained junction (opening) states to
         ``max_junction_states``: beyond the cap the oldest junction key is
         dropped (its block returns to the free list; the full-attention KV of
-        that opening is untouched). Keys on a block still in use are skipped and
-        left to the pool's own LRU."""
+        that opening is untouched). A key whose block is still retained (a
+        pending CoW copy, or a request resuming from it) is kept at the front
+        and retried on the next insertion."""
         if key in self._junction_keys:
             self._junction_keys.move_to_end(key)
             return
@@ -2002,8 +2003,12 @@ class MambaManager(SingleTypeKVCacheManager):
         while cap > 0 and len(self._junction_keys) > cap:
             oldest, _ = self._junction_keys.popitem(last=False)
             block = self.block_pool.cached_block_hash_to_block.get_one_block(oldest)
-            if block is None or block.is_null or block.ref_cnt > 0:
-                continue
+            if block is None or block.is_null:
+                continue  # already evicted by the pool's own LRU
+            if block.ref_cnt > 0:
+                self._junction_keys[oldest] = None
+                self._junction_keys.move_to_end(oldest, last=False)
+                break
             self.block_pool.evict_cached_block_keys(block)
 
 
