@@ -294,3 +294,29 @@ def test_unaligned_resume_never_runs_past_its_block(
             f"intermediate chunk end {end} is neither block-aligned nor the "
             f"partial-tail boundary"
         )
+
+
+def test_junction_checkpoint_split_stops_on_hash_grid() -> None:
+    """Lazy junction checkpoint: with `junction_checkpoint` on, a chunk crossing
+    the request's shared-prefix boundary stops at that boundary floored to the
+    hash unit, so the Mamba state of the opening is stored where the sibling's
+    full-attention alias hit lands. Off, the boundary's block floor (0 here) is
+    not a stop and the chunk ends at the last cacheable block boundary."""
+    (request,) = create_requests(1, num_tokens=PROMPT_LEN, block_size=ATTN_BLOCK_SIZE)
+    request.shared_prefix_boundary = 1000  # inside mamba block 0 (1600)
+
+    def split(junction: bool) -> int:
+        stub = SimpleNamespace(
+            cache_config=SimpleNamespace(block_size=MAMBA_BLOCK_SIZE),
+            use_eagle=False,
+            max_num_scheduled_tokens=16384,
+            scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+            mamba_partial_cache_hit=True,
+            hash_block_size=ATTN_BLOCK_SIZE,
+            mamba_has_prefill_checkpoint_blocks=False,
+            junction_checkpoint=junction,
+        )
+        return Scheduler._mamba_block_aligned_split(stub, request, PROMPT_LEN)
+
+    assert split(junction=True) == 1000 // ATTN_BLOCK_SIZE * ATTN_BLOCK_SIZE  # 992
+    assert split(junction=False) == MAMBA_BLOCK_SIZE

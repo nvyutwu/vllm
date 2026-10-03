@@ -162,6 +162,25 @@ class CacheConfig:
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups."""
+    junction_checkpoint: bool = False
+    """Lazy junction checkpoint for hybrid (full-attention + Mamba) prefix
+    caching. Registers interior ``junction_alias_stride``-token prefix-cache
+    keys ("aliases") on the first ``junction_alias_blocks`` cache blocks of a
+    prompt, so a later request that shares only an opening is detected at its
+    divergence point, stops its first prefill chunk there (hash-grid aligned
+    instead of block-floored) and stores the Mamba state at that position.
+    One state per shared opening, written by the second sibling; aliases are
+    hash keys only, nothing is stored per alias. Requires
+    ``mamba_cache_mode="align"`` and a ``prefix_match_unit`` finer than the
+    Mamba block."""
+    junction_alias_stride: int | None = Field(default=None, gt=0)
+    """Token stride of the interior alias keys; must be a multiple of
+    ``prefix_match_unit``. ``None`` means ``prefix_match_unit``."""
+    junction_alias_blocks: int = Field(default=1, ge=0)
+    """How many leading cache blocks of a prompt receive interior alias keys."""
+    max_junction_states: int = Field(default=32, ge=0)
+    """Cap on retained junction (opening) Mamba states; beyond it the oldest is
+    dropped while its full-attention KV stays. ``0`` means unbounded."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -272,6 +291,10 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "junction_checkpoint",
+            "junction_alias_stride",
+            "junction_alias_blocks",
+            "max_junction_states",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "mamba_page_size_padded",

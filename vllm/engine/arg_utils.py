@@ -569,6 +569,10 @@ class EngineArgs:
     prefix_cache_retention_interval: int | None = dataclasses.field(
         default_factory=_default_prefix_cache_retention_interval
     )
+    junction_checkpoint: bool = False
+    junction_alias_stride: int | None = None
+    junction_alias_blocks: int = 1
+    max_junction_states: int = 32
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     offload_backend: str = OffloadConfig.offload_backend
@@ -1297,6 +1301,18 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
+        )
+        cache_group.add_argument(
+            "--junction-checkpoint", **cache_kwargs["junction_checkpoint"]
+        )
+        cache_group.add_argument(
+            "--junction-alias-stride", **cache_kwargs["junction_alias_stride"]
+        )
+        cache_group.add_argument(
+            "--junction-alias-blocks", **cache_kwargs["junction_alias_blocks"]
+        )
+        cache_group.add_argument(
+            "--max-junction-states", **cache_kwargs["max_junction_states"]
         )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
@@ -2097,6 +2113,10 @@ class EngineArgs:
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
             prefix_cache_retention_interval=retention_interval,
+            junction_checkpoint=self.junction_checkpoint,
+            junction_alias_stride=self.junction_alias_stride,
+            junction_alias_blocks=self.junction_alias_blocks,
+            max_junction_states=self.max_junction_states,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,

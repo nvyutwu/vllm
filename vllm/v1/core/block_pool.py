@@ -521,6 +521,7 @@ class BlockPool:
         num_tokens: int,
         kv_cache_group_id: int,
         block_size: int,
+        demote_primary: bool = False,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -548,6 +549,12 @@ class BlockPool:
                 entry hash itself is always the prefix-chain hash at
                 ``num_tokens``; ``block_size`` is used to assert that the
                 entry is partial within the owning cache block.
+            demote_primary: When the new key is longer than the block's
+                current primary key, keep the shorter primary as an extra
+                (alias) key instead of removing every key on the block. Valid
+                for append-only KV (full attention): the shorter prefix is
+                still a correct description of the block's leading content. A
+                Mamba block holds exactly one state, so it must not use this.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -575,8 +582,17 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
-            removed_hashes = self._remove_cached_block_hashes(block)
-            self._emit_block_removed_events(removed_hashes)
+            if demote_primary:
+                # The shorter key stays live (its hash -> block mapping is
+                # kept); only the primary slot moves to the longer key.
+                old_primary = block.block_hash
+                block.reset_hash()
+                self.cached_block_hashes_by_block.setdefault(
+                    block.block_id, set()
+                ).add(old_primary)
+            else:
+                removed_hashes = self._remove_cached_block_hashes(block)
+                self._emit_block_removed_events(removed_hashes)
         self._insert_block_hash(
             block_hash_with_group_id,
             block,
@@ -667,6 +683,46 @@ class BlockPool:
             parent_hash = None
             block_start = 0
         return parent_hash, block_start
+
+    def has_partial_key(
+        self,
+        request: Request,
+        block: KVCacheBlock,
+        num_tokens: int,
+        kv_cache_group_id: int,
+    ) -> bool:
+        """Whether ``block`` is reachable through the request's prefix-chain
+        hash at ``num_tokens`` (as its primary key or an alias)."""
+        if block.is_null:
+            return False
+        key = make_block_hash_with_group_id(
+            self._get_partial_block_hash(request, num_tokens), kv_cache_group_id
+        )
+        return block.block_hash == key or self.cached_block_hash_to_block.contain(
+            key, block.block_id
+        )
+
+    def block_has_partial_keys(self, block: KVCacheBlock, block_size: int) -> bool:
+        """Whether ``block`` carries a key that describes less than its full
+        extent: a partial primary key or any alias. A request whose hit ends
+        inside such a block may share only part of its content and must not
+        write into it (copy-on-write)."""
+        if block.is_null:
+            return False
+        if (
+            block.block_hash is not None
+            and block.block_hash_num_tokens is not None
+            and block.block_hash_num_tokens % block_size != 0
+        ):
+            return True
+        return bool(self.cached_block_hashes_by_block.get(block.block_id))
+
+    def evict_cached_block_keys(self, block: KVCacheBlock) -> int:
+        """Drop every prefix-cache key of ``block`` (with removal events). The
+        block itself stays where it is in the free list."""
+        removed_hashes = self._remove_cached_block_hashes(block)
+        self._emit_block_removed_events(removed_hashes)
+        return len(removed_hashes)
 
     def _remove_cached_block_hashes(
         self,

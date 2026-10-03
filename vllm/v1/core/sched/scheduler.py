@@ -344,6 +344,12 @@ class Scheduler(SchedulerInterface):
             and self.hash_block_size < self.block_size
             and self.kv_cache_manager.coordinator.enable_partial_hash_hits
         )
+        # Lazy junction checkpoint: the split also stops at the shared-prefix
+        # boundary floored to the hash unit, where the Mamba manager stores the
+        # opening's state for later siblings (CacheConfig.junction_checkpoint).
+        self.junction_checkpoint = self.mamba_partial_cache_hit and bool(
+            getattr(self.cache_config, "junction_checkpoint", False)
+        )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
         # is called once per scheduled step in FIFO order, so these stay in sync.
@@ -459,6 +465,13 @@ class Scheduler(SchedulerInterface):
             # so sibling requests sharing the prefix can reuse it.
             start + (request.shared_prefix_boundary - start) // block_size * block_size
             if start < request.shared_prefix_boundary < end
+            else 0,
+            # Lazy junction checkpoint: stop exactly at the shared-prefix
+            # boundary on the hash grid, so the Mamba state of the opening is
+            # stored where the next sibling's full-attention alias hit lands.
+            request.shared_prefix_boundary // self.hash_block_size * self.hash_block_size
+            if getattr(self, "junction_checkpoint", False)
+            and start < request.shared_prefix_boundary < end
             else 0,
         )
         # Stop at the earliest mandatory position strictly inside the chunk.

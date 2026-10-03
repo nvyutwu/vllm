@@ -460,3 +460,61 @@ def test_partial_block_promotes_to_direct_full_block_hash(dcp_world_size: int):
     )
     assert pool.get_cached_block(promoted_full_hash, [kv_cache_group_id]) == [blocks[1]]
     assert pool.get_cached_block(partial_hash, [kv_cache_group_id]) is None
+
+
+def test_cache_partial_block_demote_primary_keeps_shorter_key():
+    """With ``demote_primary`` a longer partial key takes the primary slot and
+    the shorter key stays live as an alias of the same block (append-only KV:
+    both prefixes describe the block's leading content), with no removal event.
+    ``block_has_partial_keys`` then reports the block as copy-on-write."""
+    hash_block_size, block_size, gid = 2, 6, 0
+    pool = BlockPool(
+        num_gpu_blocks=2,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=True,
+    )
+    req = make_request(
+        "req_demote", prompt_token_ids=list(range(5)), hash_block_size=hash_block_size, hash_fn=sha256
+    )
+    block = pool.get_new_blocks(1)[0]
+    short = pool.cache_partial_block(
+        request=req, block=block, num_tokens=2, kv_cache_group_id=gid, block_size=block_size
+    )
+    assert block.block_hash == short and block.block_hash_num_tokens == 2
+    pool.take_events()
+
+    long = pool.cache_partial_block(
+        request=req,
+        block=block,
+        num_tokens=4,
+        kv_cache_group_id=gid,
+        block_size=block_size,
+        demote_primary=True,
+    )
+    assert block.block_hash == long and block.block_hash_num_tokens == 4
+    assert pool.cached_block_hash_to_block.get_one_block(short) is block
+    assert short in pool.cached_block_hashes_by_block[block.block_id]
+    events = pool.take_events()
+    assert len(events) == 1 and isinstance(events[0], BlockStored)
+    assert pool.block_has_partial_keys(block, block_size)
+    assert pool.has_partial_key(req, block, 2, gid)
+    assert pool.has_partial_key(req, block, 4, gid)
+
+    # Without demote_primary the longer key still replaces every key (Mamba).
+    other = pool.get_new_blocks(1)[0]
+    pool.cache_partial_block(
+        request=req, block=other, num_tokens=2, kv_cache_group_id=1, block_size=block_size
+    )
+    pool.take_events()
+    pool.cache_partial_block(
+        request=req, block=other, num_tokens=4, kv_cache_group_id=1, block_size=block_size
+    )
+    kinds = [type(e).__name__ for e in pool.take_events()]
+    assert kinds == ["BlockRemoved", "BlockStored"]
+    assert other.block_id not in pool.cached_block_hashes_by_block
+
+    assert pool.evict_cached_block_keys(block) == 2
+    assert pool.cached_block_hash_to_block.get_one_block(short) is None
+    assert pool.cached_block_hash_to_block.get_one_block(long) is None
+    assert not pool.block_has_partial_keys(block, block_size)

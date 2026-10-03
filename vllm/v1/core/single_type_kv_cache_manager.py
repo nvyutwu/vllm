@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 from abc import ABC, abstractmethod
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Sequence
 from typing import ClassVar
 
@@ -128,6 +128,13 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_boundary_state_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
+        # Lazy junction checkpoint (CacheConfig.junction_checkpoint), set by the
+        # coordinator: full-attention managers register interior alias keys,
+        # Mamba managers store and cap junction states.
+        self.junction_alias_stride: int | None = None
+        self.junction_alias_blocks: int = 0
+        self.junction_checkpoint: bool = False
+        self.max_junction_states: int = 0
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -143,11 +150,15 @@ class SingleTypeKVCacheManager(ABC):
         if num_local_computed_tokens % self.block_size == 0:
             return False
         block_idx = num_local_computed_tokens // self.block_size
-        return (
-            block_idx < len(new_computed_blocks)
-            and new_computed_blocks[block_idx].block_hash_num_tokens
-            == num_local_computed_tokens
-        )
+        if block_idx >= len(new_computed_blocks):
+            return False
+        block = new_computed_blocks[block_idx]
+        if block.block_hash_num_tokens == num_local_computed_tokens:
+            return True
+        # The hit was reached through an alias key, or ends below a partial
+        # primary key: the requester's continuation differs from the block's
+        # content past the hit, so it must not write into the shared block.
+        return self.block_pool.block_has_partial_keys(block, self.block_size)
 
     def get_num_blocks_to_allocate(
         self,
@@ -809,6 +820,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
         if self.block_size == hash_block_size:
             return
         self._cache_partial_tail_block(request, num_tokens)
+        self._cache_junction_aliases(request, num_tokens)
 
     def _cache_partial_tail_block(
         self,
@@ -838,7 +850,55 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+            # A longer tail key must not wipe the interior alias keys below it.
+            demote_primary=True,
         )
+
+    def _cache_junction_aliases(self, request: Request, num_tokens: int) -> None:
+        """Register interior prefix-cache keys ("aliases") on the prompt's
+        leading block(s), every ``junction_alias_stride`` tokens.
+
+        They are lookup metadata only: a later request that shares only an
+        opening with this prompt walks its own hashes, matches the alias at the
+        divergence point and reports it as ``shared_prefix_boundary``, which
+        the scheduler turns into a Mamba junction checkpoint. Keys are
+        registered highest-first so a longer key demotes a shorter primary
+        instead of removing it; promotion to a full block removes them, and the
+        next call re-registers them.
+        """
+        stride = self.junction_alias_stride
+        if not stride or self.junction_alias_blocks <= 0:
+            return
+        blocks = self.req_to_blocks[request.request_id]
+        # Prompt positions only: openings live in the prompt, and a stable
+        # alias set keeps the KV-event stream quiet during decode.
+        limit = min(num_tokens, request.num_prompt_tokens)
+        for block_idx in range(min(self.junction_alias_blocks, len(blocks))):
+            block = blocks[block_idx]
+            if block.is_null:
+                continue
+            block_start = block_idx * self.block_size
+            block_end = block_start + self.block_size
+            if limit <= block_start + stride:
+                break
+            top = block_start + (min(limit, block_end - 1) - block_start) // stride * stride
+            if top <= block_start:
+                continue
+            if self.block_pool.has_partial_key(
+                request, block, top, self.kv_cache_group_id
+            ):
+                continue  # already registered (and not wiped by a promotion)
+            pos = top
+            while pos > block_start:
+                self.block_pool.cache_partial_block(
+                    request=request,
+                    block=block,
+                    num_tokens=pos,
+                    kv_cache_group_id=self.kv_cache_group_id,
+                    block_size=self.block_size,
+                    demote_primary=True,
+                )
+                pos -= stride
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         blocks = self.req_to_blocks[running_request_id]
@@ -1388,6 +1448,8 @@ class MambaManager(SingleTypeKVCacheManager):
             self.block_pool.anchored_recurrent_groups.add(self.kv_cache_group_id)
         self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
         self.cached_blocks_this_step: set[BlockHashWithGroupId] = set()
+        # Junction (opening) states in creation order, for the retention cap.
+        self._junction_keys: OrderedDict[BlockHashWithGroupId, None] = OrderedDict()
         if self.mamba_cache_mode == "align":
             # Mapping from request ID to the index of the block
             # allocated in the previous step
@@ -1884,7 +1946,19 @@ class MambaManager(SingleTypeKVCacheManager):
         latest_prompt_hash_boundary = (
             request.num_prompt_tokens // hash_block_size
         ) * hash_block_size
-        if num_tokens != latest_prompt_hash_boundary:
+        # Lazy junction checkpoint: a chunk that ends exactly at the request's
+        # shared-prefix boundary (hash-grid aligned) stores the opening's state.
+        junction_boundary = 0
+        if self.junction_checkpoint and request.shared_prefix_boundary > 0:
+            junction_boundary = (
+                request.shared_prefix_boundary // hash_block_size * hash_block_size
+            )
+        is_junction = (
+            junction_boundary > 0
+            and num_tokens == junction_boundary
+            and num_tokens != latest_prompt_hash_boundary
+        )
+        if num_tokens != latest_prompt_hash_boundary and not is_junction:
             return None
 
         block_idx = num_tokens // self.block_size
@@ -1910,7 +1984,27 @@ class MambaManager(SingleTypeKVCacheManager):
             # upcoming CoW copies it into a durable cow_block; record the req so
             # allocate_new_blocks hands that block to the connector for offload.
             self._producer_partial_tail_reqs[request.request_id] = num_tokens
+            if is_junction:
+                self._track_junction_state(partial_hash)
         return partial_hash
+
+    def _track_junction_state(self, key: BlockHashWithGroupId) -> None:
+        """Bound the retained junction (opening) states to
+        ``max_junction_states``: beyond the cap the oldest junction key is
+        dropped (its block returns to the free list; the full-attention KV of
+        that opening is untouched). Keys on a block still in use are skipped and
+        left to the pool's own LRU."""
+        if key in self._junction_keys:
+            self._junction_keys.move_to_end(key)
+            return
+        self._junction_keys[key] = None
+        cap = self.max_junction_states
+        while cap > 0 and len(self._junction_keys) > cap:
+            oldest, _ = self._junction_keys.popitem(last=False)
+            block = self.block_pool.cached_block_hash_to_block.get_one_block(oldest)
+            if block is None or block.is_null or block.ref_cnt > 0:
+                continue
+            self.block_pool.evict_cached_block_keys(block)
 
 
 class CrossAttentionManager(SingleTypeKVCacheManager):

@@ -663,7 +663,54 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         cache_hit_alignment_tokens = self._cache_hit_alignment_tokens
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+        self._configure_junction_checkpoint()
         self.verify_and_split_kv_cache_groups()
+
+    def _configure_junction_checkpoint(self) -> None:
+        """Lazy junction checkpoint (``CacheConfig.junction_checkpoint``).
+
+        Full-attention managers register interior alias keys on a prompt's
+        leading block(s) so a sibling sharing only an opening is detected at
+        its divergence point; Mamba managers store the state at that junction
+        and bound how many such states are retained. Needs fine-grained hits.
+        """
+        from vllm.v1.core.single_type_kv_cache_manager import (
+            FullAttentionManager,
+            MambaManager,
+        )
+
+        cfg = self.kv_cache_config
+        if not bool(getattr(cfg, "junction_checkpoint", False)):
+            return
+        if not self.enable_partial_hash_hits:
+            logger.warning_once(
+                "junction_checkpoint requested but fine-grained prefix-cache hits "
+                "are unavailable (needs mamba_cache_mode=align and a "
+                "prefix_match_unit finer than the Mamba block); disabling it."
+            )
+            return
+        stride = getattr(cfg, "junction_alias_stride", None) or self.hash_block_size
+        if stride % self.hash_block_size != 0:
+            raise ValueError(
+                f"junction_alias_stride ({stride}) must be a multiple of "
+                f"prefix_match_unit ({self.hash_block_size})"
+            )
+        alias_blocks = getattr(cfg, "junction_alias_blocks", 1)
+        max_states = getattr(cfg, "max_junction_states", 32)
+        for manager in self.single_type_managers:
+            if isinstance(manager, FullAttentionManager):
+                manager.junction_alias_stride = stride
+                manager.junction_alias_blocks = alias_blocks
+            elif isinstance(manager, MambaManager):
+                manager.junction_checkpoint = True
+                manager.max_junction_states = max_states
+        logger.info(
+            "Lazy junction checkpoint enabled: alias stride %d tokens on the "
+            "first %d block(s) of each prompt, at most %d retained junction states.",
+            stride,
+            alias_blocks,
+            max_states,
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

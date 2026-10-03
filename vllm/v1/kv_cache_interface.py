@@ -1222,6 +1222,14 @@ class KVCacheConfig:
     """
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
+    junction_checkpoint: bool = False
+    """Lazy junction checkpoint (see ``CacheConfig.junction_checkpoint``)."""
+    junction_alias_stride: int | None = None
+    """Interior alias key stride in tokens (``None`` = hash block size)."""
+    junction_alias_blocks: int = 1
+    """Leading cache blocks of a prompt that receive interior alias keys."""
+    max_junction_states: int = 32
+    """Cap on retained junction Mamba states (0 = unbounded)."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
 

@@ -4411,3 +4411,127 @@ def test_swa_shared_prefix_reuse_under_zero_retention():
     assert last_req_hit(retention=0, pin=False) == 0
     # retention=0 with the pin keeps the junction window -> reuse restored.
     assert last_req_hit(retention=0, pin=True) == 4 * block_size
+
+
+def _junction_manager(
+    block_size: int, hash_block_size: int, max_states: int = 32
+) -> KVCacheManager:
+    config = replace(
+        _make_hybrid_kv_cache_config(block_size, 200, ["full", "mamba_align"]),
+        junction_checkpoint=True,
+        junction_alias_stride=hash_block_size,
+        junction_alias_blocks=1,
+        max_junction_states=max_states,
+    )
+    return make_kv_cache_manager(
+        config,
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        retention_interval=0,
+    )
+
+
+def _new_step(manager: KVCacheManager) -> None:
+    for m in manager.coordinator.single_type_managers:
+        m.new_step_starts()
+
+
+def test_junction_checkpoint_three_siblings():
+    """Lazy junction checkpoint. Three requests share an 8-token opening inside
+    the 16-token block 0 and diverge afterwards. The first stores nothing at the
+    opening (only interior alias keys on its block 0); the second is detected at
+    the opening through the alias, stops its first chunk there and stores the
+    Mamba state; the third resumes at the opening with both groups, copying the
+    shared full-attention block instead of writing into it."""
+    block_size, hash_block_size = 16, 4
+    manager = _junction_manager(block_size, hash_block_size)
+    fa, mamba = manager.coordinator.single_type_managers
+    shared = [7] * 8  # two hash units, inside block 0
+
+    def distinct(v):
+        return [v] * 24
+
+    # req0: cold. Block 0 is promoted to a full block and keeps aliases at 4, 8, 12.
+    req0 = make_request("0", shared + distinct(50), hash_block_size, sha256)
+    cb, nc, boundary = manager.get_computed_blocks(req0)
+    assert (nc, boundary) == (0, 0)
+    manager.allocate_slots(req0, len(req0.all_token_ids), nc, cb)
+    req0.num_computed_tokens = len(req0.all_token_ids)
+    fa_block0 = fa.req_to_blocks["0"][0]
+    assert fa_block0.block_hash_num_tokens == block_size
+    for pos in (4, 8, 12):
+        assert manager.block_pool.has_partial_key(
+            req0, fa_block0, pos, fa.kv_cache_group_id
+        )
+    assert not mamba._junction_keys
+    _new_step(manager)
+
+    # req1: the full-attention walk stops at the alias at 8; Mamba has no state
+    # there, so the hit is 0 and the junction is reported at 8.
+    req1 = make_request("1", shared + distinct(60), hash_block_size, sha256)
+    cb, nc, boundary = manager.get_computed_blocks(req1)
+    assert (nc, boundary) == (0, 8)
+    req1.shared_prefix_boundary = boundary
+    # The scheduler's junction stop ends the first chunk exactly at 8: the
+    # Mamba state of the opening is stored under the key at 8.
+    manager.allocate_slots(req1, boundary, nc, cb)
+    req1.num_computed_tokens = boundary
+    assert len(mamba._junction_keys) == 1
+    junction_key = next(iter(mamba._junction_keys))
+    assert (
+        manager.block_pool.cached_block_hash_to_block.get_one_block(junction_key)
+        is not None
+    )
+    _new_step(manager)
+    # Finish req1: the producer CoW moves the junction state to a durable block.
+    manager.allocate_slots(req1, len(req1.all_token_ids) - boundary)
+    req1.num_computed_tokens = len(req1.all_token_ids)
+    _new_step(manager)
+
+    # req2: both groups hit the opening -> resume at 8, nothing left to detect.
+    req2 = make_request("2", shared + distinct(70), hash_block_size, sha256)
+    cb, nc, boundary = manager.get_computed_blocks(req2)
+    assert (nc, boundary) == (8, 0)
+    # The full-attention hit went through an alias of a block whose content past
+    # the hit is another request's: it must be copied, not shared.
+    assert fa._has_partial_local_hit(cb.blocks[fa.kv_cache_group_id], nc)
+    assert manager.allocate_slots(req2, len(req2.all_token_ids) - nc, nc, cb) is not None
+
+
+def test_junction_checkpoint_cap_drops_oldest_state_but_keeps_aliases():
+    """``max_junction_states`` bounds the retained opening states: the oldest
+    junction key is dropped, while the opening's full-attention aliases stay, so
+    a later sibling is detected there again and the state is re-created lazily."""
+    block_size, hash_block_size = 16, 4
+    manager = _junction_manager(block_size, hash_block_size, max_states=1)
+    fa, mamba = manager.coordinator.single_type_managers
+
+    def share_opening(tag: int, opening: list[int]):
+        r0 = make_request(f"{tag}0", opening + [tag * 10 + 1] * 24, hash_block_size, sha256)
+        cb, nc, _ = manager.get_computed_blocks(r0)
+        manager.allocate_slots(r0, 32, nc, cb)
+        r0.num_computed_tokens = 32
+        _new_step(manager)
+        r1 = make_request(f"{tag}1", opening + [tag * 10 + 2] * 24, hash_block_size, sha256)
+        cb, nc, boundary = manager.get_computed_blocks(r1)
+        assert (nc, boundary) == (0, 8)
+        r1.shared_prefix_boundary = boundary
+        manager.allocate_slots(r1, boundary, nc, cb)
+        r1.num_computed_tokens = boundary
+        _new_step(manager)
+        manager.allocate_slots(r1, 24)
+        r1.num_computed_tokens = 32
+        _new_step(manager)
+        return next(reversed(mamba._junction_keys))
+
+    key1 = share_opening(1, [7] * 8)
+    key2 = share_opening(2, [9] * 8)
+    assert list(mamba._junction_keys) == [key2]
+    assert manager.block_pool.cached_block_hash_to_block.get_one_block(key1) is None
+    assert manager.block_pool.cached_block_hash_to_block.get_one_block(key2) is not None
+    # The first opening is still detected (aliases survive the cap) and would
+    # be re-checkpointed lazily by this request.
+    r = make_request("13", [7] * 8 + [13] * 24, hash_block_size, sha256)
+    _, nc, boundary = manager.get_computed_blocks(r)
+    assert (nc, boundary) == (0, 8)

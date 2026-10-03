@@ -1430,6 +1430,10 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            junction_checkpoint=vllm_config.cache_config.junction_checkpoint,
+            junction_alias_stride=vllm_config.cache_config.junction_alias_stride,
+            junction_alias_blocks=vllm_config.cache_config.junction_alias_blocks,
+            max_junction_states=vllm_config.cache_config.max_junction_states,
         )
 
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
@@ -1494,6 +1498,10 @@ def get_kv_cache_config_from_groups(
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
+        junction_checkpoint=vllm_config.cache_config.junction_checkpoint,
+        junction_alias_stride=vllm_config.cache_config.junction_alias_stride,
+        junction_alias_blocks=vllm_config.cache_config.junction_alias_blocks,
+        max_junction_states=vllm_config.cache_config.max_junction_states,
     )
 
 
