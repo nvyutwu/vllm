@@ -79,6 +79,7 @@ class Sim:
         retention: int | None = 0,
         flashkda: bool = True,
         num_blocks: int = 512,
+        eagle: bool = False,
     ):
         cfg = KVCacheConfig(
             num_blocks=num_blocks,
@@ -116,8 +117,10 @@ class Sim:
             enable_caching=True,
             enable_kv_cache_events=True,
             dcp_world_size=DCP,
+            use_eagle=eagle,
         )
         self.flashkda = flashkda
+        self.eagle = eagle
         self.mla = self.mgr.coordinator.single_type_managers[MLA_GROUP]
         self.kda = self.mgr.coordinator.single_type_managers[KDA_GROUP]
         assert self.mla.block_size == MLA and self.kda.block_size == KDA
@@ -156,7 +159,8 @@ class Sim:
     def _split(self, req: Request, num_new: int, num_local: int) -> int:
         stub = SimpleNamespace(
             cache_config=SimpleNamespace(block_size=KDA),
-            use_eagle=False,
+            use_eagle=self.eagle,
+            use_eagle_block_drop=self.eagle,
             max_num_scheduled_tokens=CHUNK,
             scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
             mamba_partial_cache_hit=True,
@@ -396,6 +400,27 @@ def test_previous_turn_decoded_past_its_tail_block(retention):
         assert hit_f >= (MLA * 3 if retention is None else T_A)
 
 
+@pytest.mark.parametrize("eagle", [False, True])
+@pytest.mark.parametrize("past_block_end", [False, True])
+def test_extension_of_running_request_copies(eagle: bool, past_block_end: bool):
+    """E extends A's prompt while A is still decoding, either inside its tail
+    block or after crossing its end (block promoted). EAGLE-style trailing-block
+    dropping (DSpark included) lowers E's hit to R, below every key the block
+    carries, so a copy that requires the hit to equal the block's primary key
+    never fires and E would write over A's output KV even inside the tail
+    block. Without the alias."""
+    prompt_a = tokens(N_A, seed=51)
+    sim = Sim(alias=False, eagle=eagle)
+    req_a = sim.request(prompt_a)
+    sim.prefill(req_a)
+    sim.decode(req_a, tokens(MLA * 3 - N_A + 100 if past_block_end else 300, seed=52))
+    _, hit_e = sim.run(prompt_a + tokens(1_000, seed=53))
+    assert hit_e == (R_A if eagle else T_A)
+    sim.decode(req_a, tokens(100, seed=54))
+    sim.assert_own_kv_intact(req_a)
+    sim.finish(req_a)
+
+
 def test_hit_trimmed_by_kda_inside_block_copies():
     """MLA matches A's tail key T but KDA only has a state at R (the tail state
     was evicted): the hit ends at R inside A's block. The requester must copy,
@@ -465,8 +490,12 @@ def test_alias_registered_once_per_tail_and_dropped_on_eviction():
     "num_prompt", [24_576, 24_600, 25_000, 26_700, 30_000, 36_863, 37_000]
 )
 def test_alias_position_matches_retained_kda_state(num_prompt: int):
-    """Wherever the alias is registered, KDA retention 0 has a state there;
-    no alias on a block edge or at the tail itself."""
+    """The alias is registered exactly where the geometry allows (never on a
+    block edge or at the tail itself). Where retention 0 kept a KDA state at R
+    a follow-up resumes there; where it did not (sparse retention reserves the
+    FlashKDA checkpoint only on the prompt-end chunk, so a short final chunk
+    that starts above R leaves no state at R, e.g. 36,863 tokens), the alias
+    key is inert and the follow-up falls back below R with correct KV."""
     sim = Sim(alias=True)
     req, _ = sim.run(tokens(num_prompt, seed=num_prompt))
     alias = replay_boundary(num_prompt)
@@ -480,9 +509,12 @@ def test_alias_position_matches_retained_kda_state(num_prompt: int):
     )
     assert has_alias == expect
     if has_alias:
-        assert sim.mgr.block_pool.get_cached_block(
+        has_state = sim.mgr.block_pool.get_cached_block(
             req.block_hashes[alias // HASH - 1], [KDA_GROUP]
-        ), "alias without a KDA state"
+        )
+        prompt = tokens(num_prompt, seed=num_prompt)
+        _, hit_b = sim.run(prompt[: alias + 64] + tokens(500, seed=1))
+        assert (hit_b == alias) if has_state else (hit_b < alias)
 
 
 @pytest.mark.parametrize("alias", [False, True])
