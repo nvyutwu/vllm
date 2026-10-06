@@ -483,3 +483,55 @@ def test_alias_position_matches_retained_kda_state(num_prompt: int):
         assert sim.mgr.block_pool.get_cached_block(
             req.block_hashes[alias // HASH - 1], [KDA_GROUP]
         ), "alias without a KDA state"
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_prefix_lookup_detail_record(alias: bool, monkeypatch):
+    """VLLM_LOG_PREFIX_LOOKUP_DETAIL: per-group walks and the logged record
+    for the Conflux follow-up (KDA state at R; MLA key there only with the
+    alias)."""
+    import vllm.v1.core.sched.scheduler as sched_mod
+
+    prompt_a = tokens(N_A, seed=81)
+    sim = Sim(alias=alias)
+    sim.run(prompt_a)
+    req_b = sim.request(prompt_a[:DIVERGE] + tokens(2_000, seed=82))
+    detail = sim.mgr.prefix_lookup_detail(req_b)
+    assert detail == {
+        "full_attn_hit": R_A if alias else 2 * MLA,
+        "full_attn_whole_block_hit": 2 * MLA,
+        "full_attn_partial_hit": R_A if alias else None,
+        "mamba_state_hit": R_A,
+    }
+
+    logged: list[str] = []
+    monkeypatch.setattr(
+        sched_mod.logger, "info", lambda fmt, *args: logged.append(fmt % args)
+    )
+    stub = SimpleNamespace(
+        kv_cache_manager=sim.mgr,
+        _prefix_lookup_detail={},
+        connector=SimpleNamespace(
+            pop_prefix_lookup_debug=lambda rid: {"partial_probe_pending": True}
+        ),
+    )
+    _, hit, boundary = sim.mgr.get_computed_blocks(req_b)
+    req_b.shared_prefix_boundary = boundary
+    record = Scheduler._record_prefix_lookup(stub, req_b, hit, False)
+    Scheduler._record_connector_lookup(stub, req_b, record, 2 * MLA, hit % MLA, None)
+    Scheduler._record_connector_lookup(stub, req_b, record, 2 * MLA, hit % MLA, 0)
+    Scheduler._log_admitted_prefix_lookup(stub, req_b, hit, 0, False)
+    assert not stub._prefix_lookup_detail
+    (line,) = logged
+    assert line.startswith("PREFIX_LOOKUP_DETAIL ")
+    import json
+
+    rec = json.loads(line.split(" ", 1)[1])
+    assert rec["local_hit"] == hit == (R_A if alias else 0)
+    assert rec["lookups"] == 1 and rec["deferred"] == 1
+    assert rec["partial_tail_decision"] == (
+        "local_tail_kept" if alias else "no_local_tail"
+    )
+    assert rec["flags"]["mamba_state_without_full_attn_key"] is (not alias)
+    assert rec["flags"]["cpu_store_pending"] is True
+    assert rec["external_request_id"] == req_b.request_id

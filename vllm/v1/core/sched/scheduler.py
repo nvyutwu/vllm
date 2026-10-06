@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import json
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
+import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.ec_transfer.ec_connector.base import (
@@ -383,6 +385,12 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # VLLM_LOG_PREFIX_LOOKUP_DETAIL: per-request record of the first
+        # prefix-cache lookup, accumulated over retried lookups and logged as
+        # one JSON line when the request is admitted.
+        self._log_prefix_lookup_detail = envs.VLLM_LOG_PREFIX_LOOKUP_DETAIL
+        self._prefix_lookup_detail: dict[str, dict[str, Any]] = {}
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -464,6 +472,91 @@ class Scheduler(SchedulerInterface):
         # Stop at the earliest mandatory position strictly inside the chunk.
         end = min((s for s in stops if start < s < end), default=end)
         return max(end - start, 0)
+
+    def _record_prefix_lookup(
+        self, request: Request, num_local: int, hit_diverged: bool
+    ) -> dict[str, Any]:
+        """VLLM_LOG_PREFIX_LOOKUP_DETAIL: record this lookup attempt. Per-group
+        walks run before allocate_slots caches the request's own blocks."""
+        detail = self._prefix_lookup_detail.setdefault(
+            request.request_id,
+            {"first_lookup_ts": round(time.time(), 3), "lookups": 0, "deferred": 0},
+        )
+        detail["lookups"] += 1
+        detail.update(self.kv_cache_manager.prefix_lookup_detail(request))
+        detail["lookup_local_hit"] = num_local
+        detail["hit_diverged"] = hit_diverged
+        return detail
+
+    def _record_connector_lookup(
+        self,
+        request: Request,
+        detail: dict[str, Any],
+        lookup_from: int,
+        partial_tail: int,
+        ext_tokens: int | None,
+    ) -> None:
+        detail["connector_lookup_from"] = lookup_from
+        detail["connector_ext_tokens"] = ext_tokens
+        if ext_tokens is None:
+            detail["deferred"] += 1
+            decision = "deferred"
+        elif not partial_tail:
+            decision = "no_local_tail"
+        elif ext_tokens > partial_tail:
+            decision = "remote_superseded_local_tail"
+        else:
+            decision = "local_tail_kept"
+        detail["partial_tail_decision"] = decision
+        pop_debug = getattr(self.connector, "pop_prefix_lookup_debug", None)
+        if pop_debug is not None:
+            cpu = pop_debug(request.request_id)
+            detail["cpu"] = cpu if isinstance(cpu, dict) else None
+
+    def _log_admitted_prefix_lookup(
+        self,
+        request: Request,
+        num_local: int,
+        num_external: int,
+        load_kv_async: bool,
+    ) -> None:
+        detail = self._prefix_lookup_detail.pop(request.request_id, None)
+        if detail is None:
+            return
+        rid = request.request_id
+        full_attn = detail.get("full_attn_hit")
+        mamba = detail.get("mamba_state_hit")
+        cpu = detail.get("cpu") or {}
+        record = {
+            "request_id": rid,
+            # The engine appends "-<8 random chars>" to the caller's id.
+            "external_request_id": rid[:-9] if len(rid) > 9 and rid[-9] == "-" else rid,
+            "ts": round(time.time(), 3),
+            "num_prompt_tokens": request.num_prompt_tokens,
+            "num_tokens": request.num_tokens,
+            "num_preemptions": request.num_preemptions,
+            **detail,
+            "local_hit": num_local,
+            "external_tokens": num_external,
+            "load_kv_async": load_kv_async,
+            "shared_prefix_boundary": request.shared_prefix_boundary,
+            "flags": {
+                "full_attn_key_without_mamba_state": full_attn is not None
+                and full_attn > detail["lookup_local_hit"],
+                "mamba_state_without_full_attn_key": full_attn is not None
+                and mamba is not None
+                and mamba > full_attn,
+                "no_local_hit": num_local == 0,
+                "cpu_store_pending": bool(
+                    detail["deferred"] or cpu.get("partial_probe_pending")
+                ),
+            },
+        }
+        try:
+            line = json.dumps(record, separators=(",", ":"), default=str)
+        except (TypeError, ValueError) as e:  # diagnostics must not break scheduling
+            line = json.dumps({"request_id": rid, "error": repr(e)})
+        logger.info("PREFIX_LOOKUP_DETAIL %s", line)
 
     def _get_local_prefix_cache_hit(
         self, request: Request
@@ -857,6 +950,13 @@ class Scheduler(SchedulerInterface):
                         request.shared_prefix_boundary,
                         hit_diverged,
                     ) = self._get_local_prefix_cache_hit(request)
+                    lookup_detail = (
+                        self._record_prefix_lookup(
+                            request, num_new_local_computed_tokens, hit_diverged
+                        )
+                        if self._log_prefix_lookup_detail
+                        else None
+                    )
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -872,6 +972,14 @@ class Scheduler(SchedulerInterface):
                                 request, block_aligned_local
                             )
                         )
+                        if lookup_detail is not None:
+                            self._record_connector_lookup(
+                                request,
+                                lookup_detail,
+                                block_aligned_local,
+                                partial_tail,
+                                ext_tokens,
+                            )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1137,6 +1245,13 @@ class Scheduler(SchedulerInterface):
                     self.kv_cache_manager.record_prefix_cache_stats(
                         request, num_new_local_computed_tokens
                     )
+                    if self._log_prefix_lookup_detail:
+                        self._log_admitted_prefix_lookup(
+                            request,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                            load_kv_async,
+                        )
 
                 request = request_queue.pop_request()
                 if load_kv_async:
@@ -2498,6 +2613,7 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
 
         self._inflight_prefills.discard(request)
+        self._prefix_lookup_detail.pop(request.request_id, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         # EC Connector: mirror the KV hook. The contract requires firing

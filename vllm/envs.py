@@ -297,6 +297,7 @@ if TYPE_CHECKING:
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
+    VLLM_LOG_PREFIX_LOOKUP_DETAIL: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -2040,6 +2041,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # with quantization methods and attention backends.
     "VLLM_LOG_MODEL_INSPECTION": lambda: bool(
         int(os.getenv("VLLM_LOG_MODEL_INSPECTION", "0"))
+    ),
+    # Log one JSON line per admitted request describing its first prefix-cache
+    # lookup: per-group (uncapped) hits, the reconciled local hit, the KV
+    # connector's external hit and partial-tail decision ("PREFIX_LOOKUP_DETAIL").
+    "VLLM_LOG_PREFIX_LOOKUP_DETAIL": lambda: bool(
+        int(os.getenv("VLLM_LOG_PREFIX_LOOKUP_DETAIL", "0"))
     ),
     # Debug logging for --enable-mfu-metrics
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(

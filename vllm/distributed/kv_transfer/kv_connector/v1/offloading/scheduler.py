@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -379,6 +380,8 @@ class RequestOffloadState:
     partial_tail_boundary: int | None = None
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    # Outcome of the latest lookup (VLLM_LOG_PREFIX_LOOKUP_DETAIL only).
+    lookup_debug: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -536,6 +539,9 @@ def _create_req_context(req: Request) -> ReqContext:
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
+    # VLLM_LOG_PREFIX_LOOKUP_DETAIL: record each lookup's outcome per request.
+    _log_lookup_detail: bool = False
+
     def __init__(
         self,
         spec: OffloadingSpec,
@@ -592,6 +598,7 @@ class OffloadingConnectorScheduler:
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        self._log_lookup_detail = envs.VLLM_LOG_PREFIX_LOOKUP_DETAIL
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # GPU block IDs allocated in the current engine step
@@ -1011,12 +1018,23 @@ class OffloadingConnectorScheduler:
     def _lookup(self, req_status: RequestOffloadState) -> int | None:
         complete_hit = self._lookup_complete_chunks(req_status)
         req_status.partial_tail_boundary = None
+        debug: dict[str, Any] | None = None
+        if self._log_lookup_detail:
+            debug = req_status.lookup_debug = {
+                "lookup_from": req_status.num_locally_computed_tokens,
+                "complete_hit": complete_hit,
+                "full_attn_anchor_hit": None,
+                "partial_tail_boundary": None,
+                "partial_probe_pending": False,
+            }
         if complete_hit is None or not self.config.supports_partial_tail:
             return complete_hit
 
         anchor_hit = complete_hit
         if self._cow_source_groups:
             full_attention_hit = self._full_attention_complete_hit(req_status)
+            if debug is not None:
+                debug["full_attn_anchor_hit"] = full_attention_hit
             if full_attention_hit is None:
                 return None if complete_hit == 0 else complete_hit
             anchor_hit = max(complete_hit, full_attention_hit)
@@ -1057,11 +1075,25 @@ class OffloadingConnectorScheduler:
                         req_status.req, group_config, boundary, key
                     )
                 req_status.partial_tail_boundary = boundary
+                if debug is not None:
+                    debug["partial_tail_boundary"] = boundary
+                    debug["partial_probe_pending"] = pending
                 return boundary - local_tokens
 
+        if debug is not None:
+            debug["partial_probe_pending"] = pending
         if pending and complete_hit == 0:
             return None
         return complete_hit
+
+    def pop_lookup_debug(self, request_id: ReqId) -> dict[str, Any] | None:
+        """Latest lookup outcome for ``request_id`` (diagnostics only)."""
+        req_status = self._req_status.get(request_id)
+        if req_status is None or req_status.lookup_debug is None:
+            return None
+        debug = req_status.lookup_debug
+        req_status.lookup_debug = None
+        return debug
 
     def on_new_request(self, request: Request) -> None:
         """Called when a new request is added to the scheduler."""
@@ -1106,6 +1138,8 @@ class OffloadingConnectorScheduler:
                 "Delaying request %s since it still has in-flight transfers",
                 request.request_id,
             )
+            if self._log_lookup_detail:
+                req_status.lookup_debug = {"delayed_by_inflight_transfers": True}
             return None, False
 
         req_status.update_offload_keys()
@@ -1121,6 +1155,10 @@ class OffloadingConnectorScheduler:
                 _ConnectorMetricName.LOOKUP_SYNC_DELAY,
                 time.monotonic() - lookup_start,
             )
+            if req_status.lookup_debug is not None:
+                # None: a probed chunk or partial-tail row was still being
+                # stored (or the backend asked to retry).
+                req_status.lookup_debug["result"] = num_hit_tokens
             if num_hit_tokens is None:
                 if req_status.deferred_lookup_start_time is None:
                     req_status.deferred_lookup_start_time = lookup_start

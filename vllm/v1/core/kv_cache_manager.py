@@ -340,6 +340,54 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    def prefix_lookup_detail(self, request: Request) -> dict[str, int | None]:
+        """Read-only per-group view of a request's local prefix-cache hit, for
+        diagnostics (``VLLM_LOG_PREFIX_LOOKUP_DETAIL``). Each group is walked
+        on its own, not capped by the others:
+
+        - ``full_attn_whole_block_hit``: whole full-attention blocks only.
+        - ``full_attn_hit``: including a partial key inside the next block
+          (``full_attn_partial_hit`` when that is where it ends).
+        - ``mamba_state_hit``: the deepest Mamba state on the prompt.
+
+        Call before ``allocate_slots`` caches the request's own blocks.
+        """
+        detail: dict[str, int | None] = {}
+        coordinator = self.coordinator
+        if not self.prefix_cache_lookup_enabled(request) or not isinstance(
+            coordinator, HybridKVCacheCoordinator
+        ):
+            return detail
+        max_length = request.num_tokens - 1
+        _, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes, max_length
+        )
+        for spec, group_ids, manager_cls, _ in coordinator.attention_groups:
+            manager = coordinator.single_type_managers[group_ids[0]]
+            hit = per_group_hits[group_ids[0]]
+            if isinstance(spec, MambaSpec):
+                detail.setdefault("mamba_state_hit", hit)
+            elif isinstance(spec, AttentionSpec):
+                if "full_attn_hit" in detail:
+                    continue
+                _, whole = manager_cls.find_longest_cache_hit(
+                    block_hashes=request.block_hashes,
+                    max_length=max_length,
+                    kv_cache_group_ids=group_ids,
+                    block_pool=self.block_pool,
+                    kv_cache_spec=spec,
+                    drop_eagle_block=False,
+                    alignment_tokens=manager.block_size,
+                    dcp_world_size=manager.dcp_world_size,
+                    pcp_world_size=manager.pcp_world_size,
+                )
+                detail["full_attn_hit"] = hit
+                detail["full_attn_whole_block_hit"] = whole
+                detail["full_attn_partial_hit"] = (
+                    hit if hit % manager.block_size else None
+                )
+        return detail
+
     def allocate_slots(
         self,
         request: Request,
