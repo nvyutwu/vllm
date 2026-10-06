@@ -1221,6 +1221,9 @@ class KVCacheConfig:
     """
     prefix_cache_retention_interval: int | None = None
     """Resolved retention policy for local prefix-cache checkpoints."""
+    replay_boundary_alias: bool = False
+    """Key partial full-attention blocks at the Mamba replay boundary (see
+    ``CacheConfig.replay_boundary_alias``)."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
 

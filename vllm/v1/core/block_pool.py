@@ -183,6 +183,9 @@ class BlockPool:
         # Cache for block lookup
         self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
         self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+        # Keys registered without a KV event (engine-local lookup aliases), by
+        # block id; their removal emits no event either.
+        self.silent_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
 
         # To represent a placeholder block with block_id=0.
         # The ref_cnt of null_block is not maintained, needs special care to
@@ -288,8 +291,7 @@ class BlockPool:
                     blk.block_hash_num_tokens is not None
                     and blk.block_hash_num_tokens < num_hash_tokens
                 )
-                removed_hashes = self._remove_cached_block_hashes(blk)
-                self._emit_block_removed_events(removed_hashes)
+                self._remove_cached_block_hashes_with_events(blk)
             self._insert_block_hash(
                 block_hash_with_group_id,
                 blk,
@@ -449,6 +451,7 @@ class BlockPool:
         num_tokens: int,
         kv_cache_group_id: int,
         block_size: int,
+        emit_events: bool = True,
     ) -> BlockHashWithGroupId | None:
         """Register a partial prefix-cache entry for an existing block.
 
@@ -476,6 +479,10 @@ class BlockPool:
                 entry hash itself is always the prefix-chain hash at
                 ``num_tokens``; ``block_size`` is used to assert that the
                 entry is partial within the owning cache block.
+            emit_events: Publish ``BlockStored`` (and later ``BlockRemoved``)
+                KV events for a newly registered entry. ``False`` keeps the
+                entry an engine-local lookup alias that external consumers
+                never see.
 
         Returns:
             The hash key with group ID if a partial entry can be registered;
@@ -503,14 +510,18 @@ class BlockPool:
             and block.block_hash_num_tokens is not None
             and block.block_hash_num_tokens < num_hash_blocks * self.hash_block_size
         ):
-            removed_hashes = self._remove_cached_block_hashes(block)
-            self._emit_block_removed_events(removed_hashes)
+            self._remove_cached_block_hashes_with_events(block)
         self._insert_block_hash(
             block_hash_with_group_id,
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
-        if self.enable_kv_cache_events and not already_cached:
+        if not emit_events:
+            if not already_cached:
+                self.silent_block_hashes_by_block.setdefault(block.block_id, set()).add(
+                    block_hash_with_group_id
+                )
+        elif self.enable_kv_cache_events and not already_cached:
             parent_hash, block_start = self._get_partial_block_parent_hash_and_start(
                 request, num_tokens, block_size
             )
@@ -607,6 +618,19 @@ class BlockPool:
         block.reset_hash()
         return removed_hashes
 
+    def _remove_cached_block_hashes_with_events(
+        self,
+        block: KVCacheBlock,
+    ) -> list[BlockHashWithGroupId]:
+        """Remove every hash key of ``block`` and emit ``BlockRemoved`` for the
+        keys that were published (silent alias keys stay silent)."""
+        silent = self.silent_block_hashes_by_block.pop(block.block_id, None)
+        removed_hashes = self._remove_cached_block_hashes(block)
+        self._emit_block_removed_events(
+            [h for h in removed_hashes if h not in silent] if silent else removed_hashes
+        )
+        return removed_hashes
+
     def _emit_block_removed_events(
         self,
         block_hashes: list[BlockHashWithGroupId],
@@ -658,9 +682,12 @@ class BlockPool:
         assert dst_block.block_hash is None
         assert dst_block.block_id not in self.cached_block_hashes_by_block
         num_tokens = src_block.block_hash_num_tokens
+        silent = self.silent_block_hashes_by_block.pop(src_block.block_id, None)
         for block_hash in self._remove_cached_block_hashes(src_block):
             # `num_tokens` only applies to the first (primary) insertion.
             self._insert_block_hash(block_hash, dst_block, num_tokens=num_tokens)
+        if silent:
+            self.silent_block_hashes_by_block[dst_block.block_id] = silent
 
     def get_new_blocks(self, num_blocks: int) -> list[KVCacheBlock]:
         """Get new blocks from the free block pool.
@@ -709,13 +736,9 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
-        evicted_hashes = self._remove_cached_block_hashes(block)
-        if not evicted_hashes:
-            # The block doesn't have hash, eviction is not needed
-            return False
-
-        self._emit_block_removed_events(evicted_hashes)
-        return True
+        evicted_hashes = self._remove_cached_block_hashes_with_events(block)
+        # False if the block had no hash, i.e. eviction was not needed.
+        return bool(evicted_hashes)
 
     def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
         """Touch a block increases its reference count by 1, and may remove
@@ -804,6 +827,7 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self.silent_block_hashes_by_block.clear()
 
         # Remove all hashes from all blocks.
         for block in self.blocks:

@@ -128,6 +128,10 @@ class SingleTypeKVCacheManager(ABC):
         self._pending_boundary_state_offloads: list[
             tuple[str, int, KVCacheBlock, int]
         ] = []
+        # Mamba block size whose replay-boundary state full-attention managers
+        # alias (CacheConfig.replay_boundary_alias); set by the coordinator,
+        # 0 = off.
+        self.replay_alias_unit: int = 0
 
     @classmethod
     def _get_num_evictable_blocks(cls, blocks: Sequence[KVCacheBlock]):
@@ -705,6 +709,23 @@ class SingleTypeKVCacheManager(ABC):
 class FullAttentionManager(SingleTypeKVCacheManager):
     supports_fine_grained_hash_lookup: ClassVar[bool] = True
 
+    def _has_partial_local_hit(
+        self,
+        new_computed_blocks: Sequence[KVCacheBlock],
+        num_local_computed_tokens: int,
+    ) -> bool:
+        # A hit that ends inside a block always gets a private copy: the block
+        # may carry keys past the hit (a longer tail key, a replay-boundary
+        # alias, a full key after promotion, or a hit trimmed by another group),
+        # and the requester's continuation must not overwrite what they cover.
+        if num_local_computed_tokens % self.block_size == 0:
+            return False
+        block_idx = num_local_computed_tokens // self.block_size
+        return (
+            block_idx < len(new_computed_blocks)
+            and not new_computed_blocks[block_idx].is_null
+        )
+
     @classmethod
     def find_longest_cache_hit(
         cls,
@@ -843,6 +864,59 @@ class FullAttentionManager(SingleTypeKVCacheManager):
             num_tokens=boundary_tokens,
             kv_cache_group_id=self.kv_cache_group_id,
             block_size=self.block_size,
+        )
+        if self.replay_alias_unit:
+            self._cache_replay_boundary_alias(
+                request, blocks[block_idx], boundary_tokens
+            )
+
+    def _cache_replay_boundary_alias(
+        self,
+        request: Request,
+        block: KVCacheBlock,
+        tail_tokens: int,
+    ) -> None:
+        """Key the tail block at the replay-boundary Mamba block end as well.
+
+        Every Mamba retention policy keeps the state at the block that ends at
+        the prompt's replay boundary (``num_prompt_tokens - 1``, floored to the
+        hit alignment and then to the Mamba block), but the tail block is keyed
+        only at the prompt's last hash boundary. A follow-up that diverges
+        between the two can therefore not reach that state, and resumes at an
+        older one. The alias is a lookup key on the existing block, below its
+        primary key, so it never displaces or is displaced by the tail key;
+        hits through it copy the block (``_has_partial_local_hit``). It is not
+        published as a KV event.
+        """
+        if block.block_id in self.block_pool.silent_block_hashes_by_block:
+            # Already keyed: a block's keys are only ever dropped together.
+            return
+        replay_tokens = (
+            (request.num_prompt_tokens - 1)
+            // self.cache_hit_alignment_tokens
+            * self.cache_hit_alignment_tokens
+        )
+        alias_tokens = replay_tokens // self.replay_alias_unit * self.replay_alias_unit
+        if self.use_eagle:
+            # EAGLE drops one hash unit of the full-attention hit; key one unit
+            # past the state so the dropped hit lands on it.
+            alias_tokens += self.block_pool.hash_block_size
+        if (
+            alias_tokens % self.block_size == 0
+            or alias_tokens // self.block_size != tail_tokens // self.block_size
+            or block.block_hash_num_tokens is None
+            or block.block_hash_num_tokens <= alias_tokens
+        ):
+            # On a block edge (already a full-block key), outside the tail
+            # block, or not below the block's primary key.
+            return
+        self.block_pool.cache_partial_block(
+            request=request,
+            block=block,
+            num_tokens=alias_tokens,
+            kv_cache_group_id=self.kv_cache_group_id,
+            block_size=self.block_size,
+            emit_events=False,
         )
 
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
