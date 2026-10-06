@@ -661,6 +661,43 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
+        self._configure_replay_boundary_alias()
+
+    def _configure_replay_boundary_alias(self) -> None:
+        """``CacheConfig.replay_boundary_alias``: full-attention managers key a
+        prompt's partial tail block at the replay-boundary Mamba block end, so
+        a request diverging between that state and the prompt's tail can
+        resume on it. Needs fine-grained hits and one Mamba block size."""
+        if not self.kv_cache_config.replay_boundary_alias:
+            return
+        mamba_block_sizes = {
+            g.kv_cache_spec.block_size
+            for g in self.kv_cache_config.kv_cache_groups
+            if isinstance(g.kv_cache_spec, MambaSpec)
+            and g.kv_cache_spec.mamba_cache_mode == "align"
+        }
+        if not self.enable_partial_hash_hits or len(mamba_block_sizes) != 1:
+            logger.warning_once(
+                "replay_boundary_alias requested but it needs fine-grained "
+                "prefix-cache hits (mamba_cache_mode=align, prefix_match_unit "
+                "finer than the Mamba block) and a single Mamba block size "
+                "(got %s); disabling it.",
+                tuple(sorted(mamba_block_sizes)),
+            )
+            return
+        (mamba_block_size,) = mamba_block_sizes
+        for manager, group in zip(
+            self.single_type_managers, self.kv_cache_config.kv_cache_groups
+        ):
+            if group.kv_cache_spec.prefix_cacheable and isinstance(
+                group.kv_cache_spec, FullAttentionSpec
+            ):
+                manager.replay_alias_unit = mamba_block_size
+        logger.info(
+            "Replay-boundary alias enabled: partial full-attention blocks are "
+            "also keyed at the %d-token Mamba replay boundary.",
+            mamba_block_size,
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

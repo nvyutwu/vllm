@@ -162,6 +162,16 @@ class CacheConfig:
     retain periodic checkpoints at the specified interval, which must be a
     multiple of the scheduler block size. ``None`` retains checkpoints densely.
     Applies only to sliding-window and Mamba cache groups."""
+    replay_boundary_alias: bool = False
+    """Hybrid (full-attention + Mamba ``align``) prefix caching: also key each
+    prompt's partial full-attention block at the prompt's replay-boundary Mamba
+    block end, where every retention policy keeps the Mamba state. A follow-up
+    request that diverges shortly before the previous prompt's end then resumes
+    there instead of at an older state. The key is lookup metadata on the
+    existing block (no KV or state is stored, no KV event is emitted); a hit
+    through it copies the block before writing. Requires fine-grained hits
+    (``mamba_cache_mode="align"`` and a ``prefix_match_unit`` finer than the
+    Mamba block)."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
     (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
@@ -272,6 +282,7 @@ class CacheConfig:
             "enable_prefix_caching",
             "prefix_caching_hash_algo",
             "prefix_cache_retention_interval",
+            "replay_boundary_alias",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
             "mamba_page_size_padded",
