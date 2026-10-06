@@ -133,6 +133,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def pop_prefix_lookup_debug(self, request_id: str) -> dict[str, Any] | None:
+        """Latest offload-tier lookup outcome for ``request_id``, recorded only
+        under ``VLLM_LOG_PREFIX_LOOKUP_DETAIL``."""
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.pop_lookup_debug(request_id)
+
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
