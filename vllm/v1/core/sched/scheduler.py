@@ -488,6 +488,51 @@ class Scheduler(SchedulerInterface):
         detail["hit_diverged"] = hit_diverged
         return detail
 
+    def _group_prefix_hits(
+        self, request: Request, lookup_detail: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        """Per-group local hits for the request's first scheduled prefill, when
+        prefill stats are recorded: the full-attention prefix and the deepest
+        Mamba state, each walked on its own before reconciliation."""
+        if lookup_detail is not None:
+            return lookup_detail
+        if not request.prefill_stats or request.num_preemptions > 0:
+            return None
+        return self.kv_cache_manager.prefix_lookup_detail(request)
+
+    def _full_attention_external_end(self, request: Request, lookup_from: int) -> int:
+        """End of the prefix the connector's tier holds for every full-attention
+        group (ignoring recurrent state), or 0 when the connector cannot say."""
+        get_hit = getattr(self.connector, "get_full_attention_external_hit", None)
+        if get_hit is None:
+            return 0
+        hit = get_hit(request.request_id)
+        return 0 if hit is None else lookup_from + hit
+
+    @staticmethod
+    def _found_by_group(
+        group_hits: dict[str, Any] | None,
+        full_attention_external_end: int,
+        num_local_tokens: int,
+        num_external_tokens: int,
+    ) -> tuple[int, int, int | None]:
+        """Prefix found by the full-attention groups in any tier and in the local
+        tier, and the deepest recurrent state found (None without recurrent
+        state). Each is at least the prefix reused from that scope, which every
+        group holds."""
+        hits = group_hits or {}
+        num_reused = num_local_tokens + num_external_tokens
+        local_full_attention = max(hits.get("full_attn_hit") or 0, num_local_tokens)
+        full_attention = max(
+            local_full_attention, full_attention_external_end, num_reused
+        )
+        mamba = hits.get("mamba_state_hit")
+        return (
+            full_attention,
+            local_full_attention,
+            None if mamba is None else max(mamba, num_reused),
+        )
+
     def _record_connector_lookup(
         self,
         request: Request,
@@ -957,6 +1002,8 @@ class Scheduler(SchedulerInterface):
                         if self._log_prefix_lookup_detail
                         else None
                     )
+                    group_hits = self._group_prefix_hits(request, lookup_detail)
+                    full_attention_external_end = 0
 
                     # Get externally-cached tokens if using a KVConnector.
                     if self.connector is not None:
@@ -988,6 +1035,13 @@ class Scheduler(SchedulerInterface):
                             request_queue.pop_request()
                             step_skipped_waiting.prepend_request(request)
                             continue
+
+                        if group_hits is not None:
+                            full_attention_external_end = (
+                                self._full_attention_external_end(
+                                    request, block_aligned_local
+                                )
+                            )
 
                         if partial_tail and ext_tokens > partial_tail:
                             # Remote strictly exceeds the full local hit: drop the
@@ -1047,11 +1101,24 @@ class Scheduler(SchedulerInterface):
                     # Track first scheduled prefill, not post-preemption repeat prefills
                     if request.prefill_stats and request.num_preemptions <= 0:
                         assert num_computed_tokens <= request.num_prompt_tokens
+                        (
+                            full_attention_hit,
+                            local_full_attention_hit,
+                            mamba_state_hit,
+                        ) = self._found_by_group(
+                            group_hits,
+                            full_attention_external_end,
+                            num_new_local_computed_tokens,
+                            num_external_computed_tokens,
+                        )
                         request.prefill_stats.set(
                             num_prompt_tokens=request.num_prompt_tokens,
                             num_local_cached_tokens=num_new_local_computed_tokens,
                             num_external_cached_tokens=num_external_computed_tokens,
                             num_external_lookup_tokens=connector_prefix_cache_queries,
+                            num_full_attention_hit_tokens=full_attention_hit,
+                            num_local_full_attention_hit_tokens=local_full_attention_hit,
+                            num_mamba_state_hit_tokens=mamba_state_hit,
                         )
                 else:
                     # KVTransfer: WAITING reqs have num_computed_tokens > 0

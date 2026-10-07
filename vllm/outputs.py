@@ -127,6 +127,11 @@ class RequestOutput:
         num_local_cached_tokens: Tokens reused from the local GPU cache.
         num_external_cached_tokens: Tokens loaded from an external cache.
         num_external_lookup_tokens: Tokens presented to the external cache lookup.
+        num_full_attention_hit_tokens: Prefix found by the full-attention groups
+            in any tier, before hybrid reconciliation with recurrent state.
+        num_local_full_attention_hit_tokens: The same, local tier only.
+        num_mamba_state_hit_tokens: Deepest recurrent (Mamba) state found on the
+            prompt.
         num_cache_creation_tokens: Prompt tokens currently counted as local
             prefix-cache writes for this request.
         kv_transfer_params: The params for remote K/V transfer.
@@ -151,6 +156,9 @@ class RequestOutput:
         num_local_cached_tokens: int | None = None,
         num_external_cached_tokens: int | None = None,
         num_external_lookup_tokens: int | None = None,
+        num_full_attention_hit_tokens: int | None = None,
+        num_local_full_attention_hit_tokens: int | None = None,
+        num_mamba_state_hit_tokens: int | None = None,
         kv_transfer_params: dict[str, Any] | None = None,
         ec_transfer_params: dict[str, Any] | None = None,
         # Forward compatibility, code that uses args added in new release can
@@ -175,6 +183,9 @@ class RequestOutput:
         self.num_local_cached_tokens = num_local_cached_tokens
         self.num_external_cached_tokens = num_external_cached_tokens
         self.num_external_lookup_tokens = num_external_lookup_tokens
+        self.num_full_attention_hit_tokens = num_full_attention_hit_tokens
+        self.num_local_full_attention_hit_tokens = num_local_full_attention_hit_tokens
+        self.num_mamba_state_hit_tokens = num_mamba_state_hit_tokens
         self.num_cache_creation_tokens = num_cache_creation_tokens
         self.kv_transfer_params = kv_transfer_params
         self.ec_transfer_params = ec_transfer_params
@@ -189,6 +200,11 @@ class RequestOutput:
         self.num_local_cached_tokens = next_output.num_local_cached_tokens
         self.num_external_cached_tokens = next_output.num_external_cached_tokens
         self.num_external_lookup_tokens = next_output.num_external_lookup_tokens
+        self.num_full_attention_hit_tokens = next_output.num_full_attention_hit_tokens
+        self.num_local_full_attention_hit_tokens = (
+            next_output.num_local_full_attention_hit_tokens
+        )
+        self.num_mamba_state_hit_tokens = next_output.num_mamba_state_hit_tokens
         self.num_cache_creation_tokens = next_output.num_cache_creation_tokens
 
         for next_completion in next_output.outputs:
@@ -231,6 +247,10 @@ class RequestOutput:
             f"num_local_cached_tokens={self.num_local_cached_tokens}, "
             f"num_external_cached_tokens={self.num_external_cached_tokens}, "
             f"num_external_lookup_tokens={self.num_external_lookup_tokens}, "
+            f"num_full_attention_hit_tokens={self.num_full_attention_hit_tokens}, "
+            "num_local_full_attention_hit_tokens="
+            f"{self.num_local_full_attention_hit_tokens}, "
+            f"num_mamba_state_hit_tokens={self.num_mamba_state_hit_tokens}, "
             f"num_cache_creation_tokens={self.num_cache_creation_tokens})"
         )
 

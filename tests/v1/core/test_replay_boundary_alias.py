@@ -535,3 +535,55 @@ def test_prefix_lookup_detail_record(alias: bool, monkeypatch):
     assert rec["flags"]["mamba_state_without_full_attn_key"] is (not alias)
     assert rec["flags"]["cpu_store_pending"] is True
     assert rec["external_request_id"] == req_b.request_id
+
+
+@pytest.mark.parametrize("alias", [False, True])
+def test_prefill_stats_report_hits_found_per_group(alias: bool):
+    """F4 telemetry: each group's own hit is reported next to the reconciled
+    reuse. The Conflux follow-up finds two whole MLA blocks and the KDA state at
+    R; without the alias no MLA key sits at R, so nothing is reused locally."""
+    prompt_a = tokens(N_A, seed=91)
+    sim = Sim(alias=alias)
+    sim.run(prompt_a)
+    req_b = sim.request(prompt_a[:DIVERGE] + tokens(2_000, seed=92))
+    stub = SimpleNamespace(kv_cache_manager=sim.mgr, connector=None)
+    group_hits = Scheduler._group_prefix_hits(stub, req_b, None)
+    _, reused, _ = sim.mgr.get_computed_blocks(req_b)
+
+    assert reused == (R_A if alias else 0)
+    local_full_attention = R_A if alias else 2 * MLA
+    assert Scheduler._found_by_group(group_hits, 0, reused, 0) == (
+        local_full_attention,
+        local_full_attention,
+        R_A,
+    )
+    assert Scheduler._found_by_group(group_hits, 3 * MLA, 0, R_A) == (
+        3 * MLA,
+        local_full_attention,
+        R_A,
+    )
+
+
+def test_found_by_group_without_stats_or_recurrent_state():
+    req = SimpleNamespace(prefill_stats=None, num_preemptions=0)
+    assert Scheduler._group_prefix_hits(SimpleNamespace(), req, None) is None
+    assert Scheduler._found_by_group(None, 0, 4096, 0) == (4096, 4096, None)
+    assert Scheduler._found_by_group({}, 8192, 0, 4096) == (8192, 0, None)
+
+
+def test_full_attention_external_end_uses_the_connector_lookup():
+    req = SimpleNamespace(request_id="r")
+    with_hit = SimpleNamespace(
+        connector=SimpleNamespace(get_full_attention_external_hit=lambda rid: 1536)
+    )
+    unknown = SimpleNamespace(
+        connector=SimpleNamespace(get_full_attention_external_hit=lambda rid: None)
+    )
+    assert Scheduler._full_attention_external_end(with_hit, req, MLA) == MLA + 1536
+    assert Scheduler._full_attention_external_end(unknown, req, MLA) == 0
+    assert (
+        Scheduler._full_attention_external_end(
+            SimpleNamespace(connector=None), req, MLA
+        )
+        == 0
+    )
