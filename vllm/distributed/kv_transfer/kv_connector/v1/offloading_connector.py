@@ -133,6 +133,12 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         self.connector_scheduler.on_new_request(request)
 
+    def get_full_attention_external_hit(self, request_id: str) -> int | None:
+        """Tokens beyond the local hit that the offload tier holds for every
+        full-attention group, from the latest lookup of ``request_id``."""
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_full_attention_hit(request_id)
+
     def pop_prefix_lookup_debug(self, request_id: str) -> dict[str, Any] | None:
         """Latest offload-tier lookup outcome for ``request_id``, recorded only
         under ``VLLM_LOG_PREFIX_LOOKUP_DETAIL``."""

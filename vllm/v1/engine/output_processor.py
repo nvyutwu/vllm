@@ -178,6 +178,9 @@ class RequestState:
         self.num_local_cached_tokens = 0
         self.num_external_cached_tokens = 0
         self.num_external_lookup_tokens = 0
+        self.num_full_attention_hit_tokens: int | None = None
+        self.num_local_full_attention_hit_tokens: int | None = None
+        self.num_mamba_state_hit_tokens: int | None = None
         self.num_cache_creation_tokens = 0
         # Per-sequence spec-decode accumulator; arrives once (on finish) via
         # EngineCoreOutput, then attached to this sequence's CompletionOutput.
@@ -394,6 +397,11 @@ class RequestState:
             num_local_cached_tokens=self.num_local_cached_tokens,
             num_external_cached_tokens=self.num_external_cached_tokens,
             num_external_lookup_tokens=self.num_external_lookup_tokens,
+            num_full_attention_hit_tokens=self.num_full_attention_hit_tokens,
+            num_local_full_attention_hit_tokens=(
+                self.num_local_full_attention_hit_tokens
+            ),
+            num_mamba_state_hit_tokens=self.num_mamba_state_hit_tokens,
             num_cache_creation_tokens=self.num_cache_creation_tokens,
             metrics=self.stats,
         )
@@ -690,6 +698,16 @@ class OutputProcessor:
                     )
                     req_state.num_external_lookup_tokens = (
                         engine_core_output.prefill_stats.num_external_lookup_tokens
+                    )
+                    group_hits = engine_core_output.prefill_stats
+                    req_state.num_full_attention_hit_tokens = (
+                        group_hits.num_full_attention_hit_tokens
+                    )
+                    req_state.num_local_full_attention_hit_tokens = (
+                        group_hits.num_local_full_attention_hit_tokens
+                    )
+                    req_state.num_mamba_state_hit_tokens = (
+                        group_hits.num_mamba_state_hit_tokens
                     )
                     req_state.num_cache_creation_tokens = (
                         engine_core_output.prefill_stats.num_cache_creation_tokens

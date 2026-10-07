@@ -382,6 +382,9 @@ class RequestOffloadState:
     finished_signaled: bool = False
     # Outcome of the latest lookup (VLLM_LOG_PREFIX_LOOKUP_DETAIL only).
     lookup_debug: dict[str, Any] | None = None
+    # Tokens beyond the local hit that the offload tier holds for every
+    # full-attention group, ignoring recurrent groups (latest lookup).
+    full_attention_hit: int | None = None
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -1033,6 +1036,7 @@ class OffloadingConnectorScheduler:
         anchor_hit = complete_hit
         if self._cow_source_groups:
             full_attention_hit = self._full_attention_complete_hit(req_status)
+            req_status.full_attention_hit = full_attention_hit
             if debug is not None:
                 debug["full_attn_anchor_hit"] = full_attention_hit
             if full_attention_hit is None:
@@ -1085,6 +1089,12 @@ class OffloadingConnectorScheduler:
         if pending and complete_hit == 0:
             return None
         return complete_hit
+
+    def get_full_attention_hit(self, request_id: ReqId) -> int | None:
+        """Tokens beyond the local hit that the offload tier holds for every
+        full-attention group, from the latest lookup of ``request_id``."""
+        req_status = self._req_status.get(request_id)
+        return None if req_status is None else req_status.full_attention_hit
 
     def pop_lookup_debug(self, request_id: ReqId) -> dict[str, Any] | None:
         """Latest lookup outcome for ``request_id`` (diagnostics only)."""
@@ -1146,6 +1156,7 @@ class OffloadingConnectorScheduler:
         req_status.num_locally_computed_tokens = num_computed_tokens
 
         num_hit_tokens: int | None
+        req_status.full_attention_hit = None
         if request.skip_reading_prefix_cache:
             num_hit_tokens = 0
         else:
@@ -1164,6 +1175,10 @@ class OffloadingConnectorScheduler:
                     req_status.deferred_lookup_start_time = lookup_start
             else:
                 self._maybe_observe_lookup_async_delay(req_status)
+        if num_hit_tokens is not None:
+            req_status.full_attention_hit = max(
+                num_hit_tokens, req_status.full_attention_hit or 0
+            )
         req_status.update_num_hit_chunks(num_computed_tokens + (num_hit_tokens or 0))
 
         self._touch(req_status)

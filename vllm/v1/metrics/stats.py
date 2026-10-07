@@ -267,6 +267,13 @@ class PrefillStats:
         num_external_cached_tokens: Tokens to be prefilled from external KV transfer.
         num_external_lookup_tokens: Tokens presented to the external cache lookup.
         num_cache_creation_tokens: Tokens computed and written to the prefix cache.
+        num_full_attention_hit_tokens: Prefix found by the full-attention groups in
+            any tier (local and external), before a hybrid model reconciles it with
+            its recurrent state. None when not measured.
+        num_local_full_attention_hit_tokens: The same, local tier only.
+        num_mamba_state_hit_tokens: Deepest recurrent (Mamba) state found on the
+            prompt (local tier, or the reused prefix when deeper). None for models
+            without recurrent state.
     """
 
     num_prompt_tokens: int = 0
@@ -276,6 +283,9 @@ class PrefillStats:
     num_external_cached_tokens: int = 0
     num_external_lookup_tokens: int = 0
     num_cache_creation_tokens: int = 0
+    num_full_attention_hit_tokens: int | None = None
+    num_local_full_attention_hit_tokens: int | None = None
+    num_mamba_state_hit_tokens: int | None = None
 
     def set(
         self,
@@ -283,6 +293,9 @@ class PrefillStats:
         num_local_cached_tokens: int,
         num_external_cached_tokens: int,
         num_external_lookup_tokens: int = 0,
+        num_full_attention_hit_tokens: int | None = None,
+        num_local_full_attention_hit_tokens: int | None = None,
+        num_mamba_state_hit_tokens: int | None = None,
     ):
         num_cached_tokens = num_local_cached_tokens + num_external_cached_tokens
         assert num_cached_tokens <= num_prompt_tokens
@@ -293,6 +306,9 @@ class PrefillStats:
         self.num_local_cached_tokens = num_local_cached_tokens
         self.num_external_cached_tokens = num_external_cached_tokens
         self.num_external_lookup_tokens = num_external_lookup_tokens
+        self.num_full_attention_hit_tokens = num_full_attention_hit_tokens
+        self.num_local_full_attention_hit_tokens = num_local_full_attention_hit_tokens
+        self.num_mamba_state_hit_tokens = num_mamba_state_hit_tokens
 
     def finalize(self, num_cached_tokens: int) -> None:
         assert num_cached_tokens >= 0
