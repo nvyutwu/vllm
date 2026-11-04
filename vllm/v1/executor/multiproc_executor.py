@@ -331,7 +331,9 @@ class MultiprocExecutor(Executor):
             inherited_fds is None
             and self.local_world_size > 1
             and not current_platform.is_cpu()
-            and not self.parallel_config.numa_bind
+            # numa_bind=None is auto mode: binding is decided per worker launch and
+            # may still wrap the executable, so only an explicit False is safe.
+            and self.parallel_config.numa_bind is False
         )
 
     def _start_workers_concurrently(
