@@ -378,6 +378,9 @@ def get_hisparse_kv_cache_config(
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
         ),
+        replay_boundary_alias=getattr(
+            vllm_config.cache_config, "replay_boundary_alias", False
+        ),
     )
 
 

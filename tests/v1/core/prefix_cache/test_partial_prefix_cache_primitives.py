@@ -166,11 +166,11 @@ def test_cache_partial_block_kv_cache_events():
     assert stored_event.block_hashes == [
         kv_cache_utils.maybe_convert_block_hash(req.block_hashes[1])
     ]
-    assert stored_event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
-        req.block_hashes[0]
-    )
-    assert stored_event.token_ids == req.all_token_ids[hash_block_size:]
-    assert stored_event.block_size == 4
+    # The partial tail lies inside the first physical block, so it has no
+    # published parent and spans the block from its start.
+    assert stored_event.parent_block_hash is None
+    assert stored_event.token_ids == list(req.all_token_ids)
+    assert stored_event.block_size == hash_block_size * 2
     assert stored_event.group_idx == kv_cache_group_id
     assert stored_event.session_id == "agent-session-partial"
 
@@ -197,8 +197,9 @@ def test_cache_partial_block_kv_cache_events():
 def test_cache_partial_block_event_keeps_every_mm_feature():
     """The event window can reach into more than one multimodal feature.
 
-    ``cache_partial_block`` builds the ``BlockStored`` extra keys over
-    ``[(num_hash_blocks - 1) * hash_block_size, num_tokens)``. Starting that
+    ``cache_partial_block`` builds the ``BlockStored`` extra keys over the
+    window from the start of the block holding the entry to
+    ``num_tokens``. Starting that
     scan at the last feature drops any earlier one that also reaches into the
     window, so two requests differing only in that feature would be published
     under the same key.
@@ -296,11 +297,13 @@ def test_partial_block_replacement_emits_remove_then_store_events():
     assert stored_event.block_hashes == [
         kv_cache_utils.maybe_convert_block_hash(partial_hash_10)
     ]
+    # Parented on the last full physical block (6 tokens), whose hash the
+    # full-block event published; the fine 8-token boundary never was.
     assert stored_event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
-        boundary_hash(req, hash_block_size, 8)
+        boundary_hash(req, hash_block_size, block_size)
     )
-    assert stored_event.token_ids == req.all_token_ids[8:10]
-    assert stored_event.block_size == hash_block_size
+    assert stored_event.token_ids == req.all_token_ids[block_size:10]
+    assert stored_event.block_size == 10 - block_size
     assert stored_event.group_idx == kv_cache_group_id
     assert pool.get_cached_block(partial_hash_8, [kv_cache_group_id]) is None
     assert pool.get_cached_block(partial_hash_10, [kv_cache_group_id]) == [blocks[1]]
@@ -533,3 +536,49 @@ def test_partial_block_promotes_to_direct_full_block_hash(dcp_world_size: int):
     )
     assert pool.get_cached_block(promoted_full_hash, [kv_cache_group_id]) == [blocks[1]]
     assert pool.get_cached_block(partial_hash, [kv_cache_group_id]) is None
+
+
+def test_block_aligned_partial_event_describes_the_whole_block():
+    """A partial entry at a block boundary must not parent on its own hash."""
+    hash_block_size = 2
+    block_size = 6
+    kv_cache_group_id = 0
+    req = make_request("0", list(range(12)), hash_block_size, sha256)
+    pool = BlockPool(
+        num_gpu_blocks=3,
+        enable_caching=True,
+        hash_block_size=hash_block_size,
+        enable_kv_cache_events=True,
+    )
+    blocks = pool.get_new_blocks(2)
+    pool.cache_full_blocks(
+        request=req,
+        blocks=blocks,
+        num_cached_blocks=0,
+        num_full_blocks=1,
+        block_size=block_size,
+        kv_cache_group_id=kv_cache_group_id,
+    )
+    pool.take_events()
+
+    assert pool.cache_partial_block(
+        request=req,
+        block=blocks[1],
+        num_tokens=2 * block_size,
+        kv_cache_group_id=kv_cache_group_id,
+        block_size=block_size,
+    )
+    events = pool.take_events()
+    assert len(events) == 1
+    stored_event = events[0]
+    assert isinstance(stored_event, BlockStored)
+    assert stored_event.block_hashes == [
+        kv_cache_utils.maybe_convert_block_hash(
+            boundary_hash(req, hash_block_size, 2 * block_size)
+        )
+    ]
+    assert stored_event.parent_block_hash == kv_cache_utils.maybe_convert_block_hash(
+        boundary_hash(req, hash_block_size, block_size)
+    )
+    assert stored_event.token_ids == req.all_token_ids[block_size : 2 * block_size]
+    assert stored_event.block_size == block_size

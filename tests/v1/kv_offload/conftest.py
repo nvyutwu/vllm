@@ -33,6 +33,8 @@ def make_offloading_config(
     data_parallel_size: int = 1,
     data_parallel_rank_local: int | None = None,
     is_parallelism_agnostic: bool = False,
+    local_world_size: int | None = None,
+    executor_backend: str | None = None,
     replicated_layout: bool = False,
     extra_config: dict[str, Any] | None = None,
 ) -> OffloadingConfig:
@@ -69,6 +71,8 @@ def make_offloading_config(
             data_parallel_size=data_parallel_size,
             data_parallel_rank_local=data_parallel_rank_local,
             is_parallelism_agnostic=is_parallelism_agnostic,
+            local_world_size=local_world_size,
+            executor_backend=executor_backend,
         ),
         replicated_layout=replicated_layout,
     )

@@ -268,9 +268,17 @@ def _make_partial_tail_scheduler(
     eagle: bool = False,
     cache_hit_alignment_tokens: int | None = 4,
     manager: OffloadingManager | None = None,
+    dcp_size: int = 1,
+    extra_config: dict[str, Any] | None = None,
 ) -> OffloadingConnectorScheduler:
-    vllm_config = _make_vllm_config(extra_config={"self_describing_kv_events": True})
-    vllm_config.cache_config.prefix_match_unit = None if recurrent_only else 4
+    vllm_config = _make_vllm_config(
+        extra_config={"self_describing_kv_events": True, **(extra_config or {})},
+        tensor_parallel_size=dcp_size,
+        decode_context_parallel_size=dcp_size,
+    )
+    vllm_config.cache_config.prefix_match_unit = (
+        None if recurrent_only else max(4, dcp_size)
+    )
     vllm_config.speculative_config = None
     vllm_config.kv_events_config = KVEventsConfig(
         enable_kv_cache_events=True, publisher="null"
@@ -321,6 +329,201 @@ def _make_real_partial_tail_request(
     )
     scheduler.on_new_request(request)
     return request
+
+
+def _make_dcp_tail_request(
+    scheduler: OffloadingConnectorScheduler, request_id: str, num_tokens: int = 238
+) -> Request:
+    init_none_hash(sha256)
+    request = Request(
+        request_id=request_id,
+        prompt_token_ids=list(range(num_tokens)),
+        sampling_params=SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=get_request_block_hasher(8, sha256),
+    )
+    scheduler.on_new_request(request)
+    return request
+
+
+@pytest.mark.parametrize("source", ["valid", "null", "short", "capped"])
+@pytest.mark.cpu_test
+def test_dcp_partial_tail_store_maps_each_groups_physical_block(source: str):
+    """DCP attention pages cover 128 tokens; recurrent pages still cover 16."""
+    manager = CPUOffloadingManager(num_chunks=32)
+    scheduler = _make_partial_tail_scheduler(manager=manager, dcp_size=8)
+    request = _make_dcp_tail_request(scheduler, "producer")
+    attention_blocks = (
+        [11] if source == "short" else [11, 0 if source == "null" else 12]
+    )
+    scheduler._req_status[request.request_id].update_block_id_groups(
+        (
+            attention_blocks,
+            [0] * 14 + [21],
+        )
+    )
+    request.num_computed_tokens = 200 if source == "capped" else 238
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"producer": [(1, 98, 224), (1, 99, 232)]},
+    )
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+    tails = [
+        job
+        for job in jobs.values()
+        if isinstance(job.src_spec, GPULoadStoreSpec)
+        and job.src_spec.group_sizes == [1, 1]
+    ]
+    if source != "valid":
+        assert not tails
+        return
+    assert len(tails) == 1
+    src = tails[0].src_spec
+    assert isinstance(src, GPULoadStoreSpec)
+    assert src.block_ids.tolist() == [12, 99]
+    assert src.block_indices == [1, 14]
+
+
+@pytest.mark.parametrize("min_tail,stored", [(0, True), (232, True), (233, False)])
+@pytest.mark.cpu_test
+def test_dcp_partial_tail_store_respects_min_partial_tail_tokens(
+    min_tail: int, stored: bool
+):
+    """The gate compares the absolute tail boundary, not the remainder past the
+    last complete chunk, and counts every skip."""
+    manager = CPUOffloadingManager(num_chunks=32)
+    scheduler = _make_partial_tail_scheduler(
+        manager=manager,
+        dcp_size=8,
+        extra_config={"min_partial_tail_tokens": min_tail},
+    )
+    assert scheduler.config.min_partial_tail_tokens == min_tail
+    request = _make_dcp_tail_request(scheduler, "producer")
+    scheduler._req_status[request.request_id].update_block_id_groups(
+        ([11, 12], [0] * 14 + [21])
+    )
+    request.num_computed_tokens = 238
+    output = SchedulerOutput.make_empty()
+    output.kv_connector_block_state = KVConnectorBlockState(
+        req_ids=set(),
+        resolve_block_ids={}.__getitem__,
+        boundary_state_offloads={"producer": [(1, 98, 224), (1, 99, 232)]},
+    )
+    jobs = scheduler._build_partial_tail_store_jobs(output)
+    tails = [
+        job
+        for job in jobs.values()
+        if isinstance(job.src_spec, GPULoadStoreSpec)
+        and job.src_spec.group_sizes == [1, 1]
+    ]
+    assert len(tails) == (1 if stored else 0)
+    skipped = scheduler._connector_stats._values.get(
+        "vllm:kv_offload_store_skipped_short_partial_tail", {}
+    ).get((), 0)
+    assert skipped == (0 if stored else 1)
+
+
+@pytest.mark.parametrize("tail,local_tokens", [(104, 0), (232, 0), (232, 128)])
+@pytest.mark.parametrize("limit", [None, 100, 232])
+@pytest.mark.cpu_test
+def test_dcp_partial_tail_lookup_keeps_anchor_and_legacy_windows(
+    tail: int, local_tokens: int, limit: int | None
+):
+    """A longer attention-only hit must not hide an earlier recurrent tail."""
+    manager = CPUOffloadingManager(num_chunks=32)
+    scheduler = _make_partial_tail_scheduler(manager=manager, dcp_size=8)
+    request = _make_dcp_tail_request(scheduler, "consumer")
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    keys = [state.group_states[0].offload_keys[0]] + [
+        scheduler._make_boundary_key(request, group.group_idx, tail, state.req_context)
+        for group in scheduler.config.kv_group_configs
+    ]
+    stored = manager.prepare_store(keys, state.req_context)
+    assert stored is not None
+    manager.complete_store(stored.keys_to_store, state.req_context)
+    new_tokens = tail - local_tokens
+    expected_hit = new_tokens if limit is None or new_tokens <= limit else 0
+    assert scheduler.get_num_new_matched_tokens(request, local_tokens, limit) == (
+        expected_hit,
+        bool(expected_hit),
+    )
+    if not expected_hit:
+        assert state.partial_tail_boundary is None
+        return
+    assert state.partial_tail_boundary == tail
+    attn_count = (tail + 127) // 128
+    recurrent_count = (tail + 15) // 16
+    attention_blocks = [KVCacheBlock(31 + i) for i in range(attn_count)]
+    if local_tokens:
+        attention_blocks[0].set_block_hash(
+            make_block_hash_with_group_id(request.block_hashes[15], 0), 128
+        )
+    scheduler.update_state_after_alloc(
+        request,
+        KVCacheBlocks(
+            (
+                attention_blocks,
+                [KVCacheBlock(0, is_null=True)] * (recurrent_count - 1)
+                + [KVCacheBlock(41)],
+            )
+        ),
+        num_external_tokens=new_tokens,
+    )
+    [load] = scheduler._current_batch_load_jobs.values()
+    assert isinstance(load.dst_spec, GPULoadStoreSpec)
+    first_attention = local_tokens // 128
+    assert load.dst_spec.block_ids.tolist() == list(
+        range(31 + first_attention, 31 + attn_count)
+    ) + [41]
+    assert load.dst_spec.block_indices == [first_attention, recurrent_count - 1]
+    duplicate = _make_dcp_tail_request(scheduler, "duplicate")
+    assert scheduler.get_num_new_matched_tokens(duplicate, local_tokens) == (
+        None,
+        False,
+    )
+
+
+@pytest.mark.cpu_test
+def test_dcp_partial_tail_eagle_stays_disabled():
+    scheduler = _make_partial_tail_scheduler(dcp_size=8, eagle=True)
+    assert not scheduler.config.supports_partial_tail
+
+
+class _CountingCPUOffloadManager(CPUOffloadingManager):
+    def __init__(self, num_chunks: int):
+        super().__init__(num_chunks=num_chunks)
+        self.lookup_calls = 0
+
+    def lookup(self, key: OffloadKey, req_context: ReqContext) -> LookupResult:
+        self.lookup_calls += 1
+        return super().lookup(key, req_context)
+
+
+@pytest.mark.cpu_test
+def test_dcp_partial_tail_miss_probes_at_most_two_windows():
+    manager = _CountingCPUOffloadManager(num_chunks=64)
+    scheduler = _make_partial_tail_scheduler(manager=manager, dcp_size=8)
+    request = _make_dcp_tail_request(scheduler, "long", num_tokens=4096 + 110)
+    state = scheduler._req_status[request.request_id]
+    state.update_offload_keys()
+    stored = manager.prepare_store(
+        state.group_states[0].offload_keys, state.req_context
+    )
+    assert stored is not None
+    manager.complete_store(stored.keys_to_store, state.req_context)
+    before = manager.lookup_calls
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    total_calls = manager.lookup_calls - before
+    before = manager.lookup_calls
+    scheduler._lookup_complete_chunks(state)
+    scheduler._lookup_complete_chunks(
+        state, lookup_groups=scheduler._full_attention_groups
+    )
+    complete_calls = manager.lookup_calls - before
+    assert total_calls - complete_calls <= 2 * (128 // 8 - 1) * 2
 
 
 def test_create_req_context_preserves_kv_hints():

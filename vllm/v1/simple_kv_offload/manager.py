@@ -1143,9 +1143,18 @@ class SimpleCPUOffloadScheduler:
                 cpu_block,
                 num_tokens=gpu_block.block_hash_num_tokens,
             )
-            secondary_hashes = self._gpu_block_pool.cached_block_hashes_by_block.get(
+            # Engine-local alias keys (replay_boundary_alias) stay on the GPU
+            # tier: they are never published, so they are not offloaded either.
+            silent = self._gpu_block_pool.silent_block_hashes_by_block.get(
                 gpu_block_id, ()
             )
+            secondary_hashes = [
+                h
+                for h in self._gpu_block_pool.cached_block_hashes_by_block.get(
+                    gpu_block_id, ()
+                )
+                if h not in silent
+            ]
             for block_hash in secondary_hashes:
                 self.cpu_block_pool._insert_block_hash(
                     block_hash, cpu_block, num_tokens=None

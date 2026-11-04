@@ -53,6 +53,9 @@ class _ConnectorMetricName:
     LOOKUP_SYNC_DELAY = "vllm:kv_offload_lookup_sync_delay_seconds"
     LOOKUP_ASYNC_DELAY = "vllm:kv_offload_lookup_async_delay_seconds"
     ALLOCATION_FAILURE = "vllm:kv_offload_allocation_failure"
+    STORE_SKIPPED_SHORT_PARTIAL_TAIL = (
+        "vllm:kv_offload_store_skipped_short_partial_tail"
+    )
 
 
 class _TransferType:
@@ -142,6 +145,14 @@ def get_connector_metric_definitions() -> dict[str, OffloadingMetricMetadata]:
             documentation=(
                 "Number of KV offload store allocation attempts that failed."
             ),
+        ),
+        _ConnectorMetricName.STORE_SKIPPED_SHORT_PARTIAL_TAIL: (
+            OffloadingCounterMetadata(
+                documentation=(
+                    "Number of partial-tail hand-offs skipped because their "
+                    "boundary is shorter than min_partial_tail_tokens."
+                ),
+            )
         ),
     }
 

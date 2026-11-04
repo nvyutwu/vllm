@@ -621,6 +621,52 @@ def test_register_kv_caches(backend):
             assert actual.mapping is not None
 
 
+@pytest.mark.cpu_test
+def test_register_packed_mla_preserves_internal_padding_bytes_on_cpu():
+    """A transfer must preserve whole packed pages, including per-layer padding."""
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=3,
+        dtype=torch.uint8,
+        state_content_bytes=3,
+        page_size_padded=64,
+    )
+    packed_stride = 2 * spec.page_size_bytes
+    backing = torch.arange(NUM_BLOCKS * packed_stride, dtype=torch.int64).to(
+        torch.uint8
+    )
+    layers = ["mla", "indexer"]
+    kv_config = KVCacheConfig(
+        num_blocks=NUM_BLOCKS,
+        kv_cache_tensors=[
+            KVCacheTensor(
+                size=backing.numel(),
+                layers=layers,
+                layer_stride=spec.page_size_bytes,
+                block_stride=packed_stride,
+            )
+        ],
+        kv_cache_groups=[KVCacheGroupSpec([layer], spec) for layer in layers],
+    )
+    caches = {
+        layer: backing.as_strided(
+            (NUM_BLOCKS, 1, 16, 3),
+            (packed_stride, 48, 3, 1),
+            storage_offset=i * spec.page_size_bytes,
+        )
+        for i, layer in enumerate(layers)
+    }
+    worker, external_spec = _make_worker(kv_config)
+    worker.register_kv_caches(caches)
+    canonical = external_spec.get_worker.call_args[0][0]
+    [region] = canonical.tensors
+    assert region.page_size_bytes == packed_stride
+    assert region.tensor.shape == (NUM_BLOCKS, packed_stride)
+    assert torch.equal(region.tensor.view(torch.uint8), backing.reshape(NUM_BLOCKS, -1))
+    assert canonical.group_data_refs == [[CanonicalKVCacheRef(0, packed_stride)]] * 2
+
+
 def test_register_packed_kv_caches_skips_scratch_group():
     attn_spec = FullAttentionSpec(
         block_size=BLOCK_SIZE,

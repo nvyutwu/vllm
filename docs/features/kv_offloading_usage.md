@@ -499,3 +499,26 @@ with no GPU-local prefix, or with a chunk-aligned prefix, can still reuse CPU KV
 ## Further Reading
 
 - [vLLM blog: KV Offloading Connector](https://vllm.ai/blog/2026-01-08-kv-offloading-connector) — motivation, architecture (DMA-based async transfer), and benchmarks (TTFT and throughput).
+
+## Native CPU cache across nodes
+
+For the native `OffloadingConnector`, `kv_offloading_size` is a per-node
+budget for each data-parallel replica. Local workers share this budget.
+With eight tensor-parallel workers across two four-GPU nodes, each node has
+four worker slots; it does not reserve eight slots in each node-local region.
+Logical ranks wrap by `local_world_size`, independent of CUDA device remapping.
+
+Use the multiprocessing executor with `--nnodes`. Native CPU offload currently
+rejects pipeline/prefill context parallelism and unrecognized multi-worker
+launchers rather than guessing their shared-memory geometry. Native secondary
+tiers remain single-node: their scheduler cannot access remote CPU shards.
+
+DCP partial tails can combine a full-attention page with the exact recurrent
+CoW state at a hash boundary. This requires one physical block per offload
+chunk, hash boundaries divisible by DCP size, and recurrent block sizes that
+divide the attention page. DCP with EAGLE or other windowed groups remains
+unsupported. Lookup probes at most the attention-anchor and original hit
+windows; a longer sibling prefix does not hide an earlier tail. Missing CoW
+sources, null blocks and boundaries past computed/offload limits are skipped.
+CPU scheduler coverage does not replace exact cold/replay model qualification
+on the selected image and DCP topology before enabling offload in serving.

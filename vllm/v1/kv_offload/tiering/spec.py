@@ -337,6 +337,15 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
         self.secondary_tier_configs = self.extra_config.get("secondary_tiers", [])
         if not isinstance(self.secondary_tier_configs, list):
             raise ValueError("secondary_tiers must be a list of tier configurations")
+        if (
+            self.secondary_tier_configs
+            and self.local_world_size != config.parallel.world_size
+        ):
+            raise ValueError(
+                "Native secondary tiers do not support multi-node replicas: "
+                "the scheduler cannot access remote CPU cache shards. "
+                "Use CPUOffloadingSpec for multi-node CPU-only offloading."
+            )
 
         # Pause between tier-poll rounds for tiers that need servicing
         # between engine steps. Zero or negative disables the thread, which
@@ -542,7 +551,11 @@ class TieringOffloadingSpec(CPUOffloadingSpec):
     def create_worker(self, kv_caches: CanonicalKVCaches) -> CPUOffloadingWorker:
         if self.secondary_tier_configs and self.config.parallel.world_size > 1:
             _reject_workers_across_nodes()
-        rank = 0 if self.replicated_layout else self.config.parallel.rank
+        rank = (
+            0
+            if self.replicated_layout
+            else self.config.parallel.rank % self.local_world_size
+        )
         worker_mmap = SharedOffloadRegion(
             engine_id=self._engine_id,
             num_chunks=self.num_chunks,
