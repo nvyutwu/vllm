@@ -824,6 +824,7 @@ class EngineArgs:
         CacheConfig.enable_mamba_shared_prefix_checkpoint
     )
     evict_superseded_mamba_states: bool = CacheConfig.evict_superseded_mamba_states
+    publish_unresumable_removals: bool = CacheConfig.publish_unresumable_removals
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
 
@@ -1458,6 +1459,10 @@ class EngineArgs:
         cache_group.add_argument(
             "--evict-superseded-mamba-states",
             **cache_kwargs["evict_superseded_mamba_states"],
+        )
+        cache_group.add_argument(
+            "--publish-unresumable-removals",
+            **cache_kwargs["publish_unresumable_removals"],
         )
         cache_group.add_argument(
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
@@ -2342,6 +2347,7 @@ class EngineArgs:
                 self.enable_mamba_shared_prefix_checkpoint
             ),
             evict_superseded_mamba_states=self.evict_superseded_mamba_states,
+            publish_unresumable_removals=self.publish_unresumable_removals,
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
             kv_offloading_size=self.kv_offloading_size,

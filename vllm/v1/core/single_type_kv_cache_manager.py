@@ -2079,35 +2079,17 @@ class MambaManager(SingleTypeKVCacheManager):
             ]
         return super().pop_blocks_for_free(request_id)
 
-    def evict_superseded_states_first(self, request: Request) -> None:
-        """Evict first the states a finished request resumed from that a
-        deeper cached state on its own tokens supersedes, e.g. the previous
-        turn's state once a conversation's next turn has cached its own.
+    def pop_hit_states(self, request_id: str) -> list[KVCacheBlock]:
+        """Pop the cached states ``request_id`` resumed from (recorded with
+        ``evict_superseded_states``) that still hold the hash they were hit
+        under. ``KVCacheManager`` decides demotion jointly for every state
+        group, so the groups of one state are never split.
         """
-        hits = self._hit_states.pop(request.request_id, None)
+        hits = self._hit_states.pop(request_id, None)
         if not hits:
-            return
+            return []
         blocks = self.block_pool.blocks
-        hit_blocks = [blocks[i] for i, h in hits.items() if blocks[i].block_hash == h]
-        if not hit_blocks:
-            return
-        _, latest = self.find_longest_cache_hit(
-            block_hashes=request.block_hashes,
-            max_length=request.num_tokens,
-            kv_cache_group_ids=[self.kv_cache_group_id],
-            block_pool=self.block_pool,
-            kv_cache_spec=self.kv_cache_spec,
-            drop_eagle_block=False,
-            alignment_tokens=self.cache_hit_alignment_tokens,
-        )
-        # States up to a shared-prefix junction can serve other requests.
-        self.block_pool.prioritize_eviction(
-            block
-            for block in hit_blocks
-            if request.shared_prefix_boundary
-            < (block.block_hash_num_tokens or 0)
-            < latest
-        )
+        return [blocks[i] for i, h in hits.items() if blocks[i].block_hash == h]
 
     def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
         """Get the number of tokens whose mamba state are not needed anymore. Mamba only

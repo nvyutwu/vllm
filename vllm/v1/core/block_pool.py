@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+from typing import Any, Protocol
 
 from vllm.distributed.kv_events import (
     MEDIUM_GPU,
@@ -31,6 +31,21 @@ from vllm.v1.core.kv_cache_utils import (
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class CachedBlockListener(Protocol):
+    """Observer of prefix-cache keys (``--publish-unresumable-removals``)."""
+
+    def on_cached(self, request: Request, block_hash: BlockHashWithGroupId) -> None: ...
+
+    def on_evicted(
+        self,
+        block: KVCacheBlock,
+        block_hashes: list[BlockHashWithGroupId],
+        num_tokens: int | None,
+    ) -> None: ...
+
+    def flush(self) -> None: ...
 
 
 class BlockHashToBlockMap:
@@ -82,6 +97,13 @@ class BlockHashToBlockMap:
             return block_id in blocks
         self._unexpected_blocks_type(blocks)
         return False
+
+    def num_blocks(self, key: BlockHashWithGroupId) -> int:
+        """Number of blocks the key maps to."""
+        blocks = self._cache.get(key)
+        if blocks is None:
+            return 0
+        return len(blocks) if isinstance(blocks, dict) else 1
 
     def insert(self, key: BlockHashWithGroupId, block: KVCacheBlock) -> None:
         """Inserts the KVCacheBlock to the cache"""
@@ -204,6 +226,13 @@ class BlockPool:
         # Referenced cached blocks that ``free_blocks`` puts at the front of
         # the free queue; see ``prioritize_eviction``.
         self._evict_first_block_ids: set[int] = set()
+        # ``--publish-unresumable-removals``: told about newly cached keys and
+        # real evictions (reuse by ``get_new_blocks``, ``evict_blocks``).
+        self.cached_block_listener: CachedBlockListener | None = None
+        # Cached blocks whose key already had a ``BlockRemoved`` published
+        # while the data stayed cached (it could not be resumed). Their later
+        # removal publishes nothing more. {block_id: key}
+        self.unpublished_block_hashes: dict[int, BlockHashWithGroupId] = {}
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -306,6 +335,8 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
+            if self.cached_block_listener is not None:
+                self.cached_block_listener.on_cached(request, block_hash_with_group_id)
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -566,6 +597,8 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
+        if self.cached_block_listener is not None:
+            self.cached_block_listener.on_cached(request, block_hash_with_group_id)
         if not emit_events:
             if not already_cached:
                 self.silent_block_hashes_by_block.setdefault(block.block_id, set()).add(
@@ -681,10 +714,68 @@ class BlockPool:
         keys that were published (silent alias keys stay silent)."""
         silent = self.silent_block_hashes_by_block.pop(block.block_id, None)
         removed_hashes = self._remove_cached_block_hashes(block)
-        self._emit_block_removed_events(
+        published = (
             [h for h in removed_hashes if h not in silent] if silent else removed_hashes
         )
+        if self.unpublished_block_hashes:
+            unpublished = self.unpublished_block_hashes.pop(block.block_id, None)
+            if unpublished is not None:
+                # Its BlockRemoved went out when it became unresumable.
+                published = [h for h in published if h != unpublished]
+        self._emit_block_removed_events(published)
         return removed_hashes
+
+    def unpublish_block_hash(self, block: KVCacheBlock) -> None:
+        """Publish ``BlockRemoved`` for ``block``'s primary key while its data
+        stays cached, e.g. a full-attention block no cached state can resume
+        through. Its eventual eviction publishes nothing more; see
+        ``republish_block_hash`` for the reverse."""
+        assert block.block_hash is not None
+        assert block.block_id not in self.unpublished_block_hashes
+        self.unpublished_block_hashes[block.block_id] = block.block_hash
+        self._emit_block_removed_events([block.block_hash])
+
+    def republish_block_hash(
+        self, request: Request, block: KVCacheBlock, block_size: int
+    ) -> None:
+        """Publish ``BlockStored`` again for a full block whose key was
+        unpublished, from ``request``, whose tokens it holds."""
+        key = self.unpublished_block_hashes.pop(block.block_id)
+        assert key == block.block_hash and block.block_hash_num_tokens is not None
+        if not self.enable_kv_cache_events:
+            return
+        end = block.block_hash_num_tokens
+        start = end - block_size
+        row = start // block_size
+        block_hashes = resolve_block_hashes(
+            request.block_hashes, self.hash_block_size, block_size
+        )
+        assert block_hashes[row] == get_block_hash(key)
+        parent = maybe_convert_block_hash(block_hashes[row - 1]) if row else None
+        curr_mm_idx = 0
+        mm_features = request.mm_features
+        if start > 0 and mm_features:
+            last_mm_pos = mm_features[-1].mm_position
+            if last_mm_pos.offset + last_mm_pos.length > start:
+                curr_mm_idx, _ = get_mm_features_in_window(mm_features, start, end)
+        extra_keys, _ = self._generate_event_extra_keys(
+            request, start, end, curr_mm_idx
+        )
+        self.kv_event_queue.append(
+            self._build_block_stored_event(
+                request,
+                block_hashes=[maybe_convert_block_hash(get_block_hash(key))],
+                parent_block_hash=parent,
+                start_token_idx=start,
+                end_token_idx=end,
+                block_size=block_size,
+                kv_cache_group_id=get_group_id(key),
+                extra_keys_list=[extra_keys],
+                lookahead_token_ids=[self._lookahead_token_ids(request, end)]
+                if self.num_hash_lookahead_tokens
+                else None,
+            )
+        )
 
     def _emit_block_removed_events(
         self,
@@ -767,7 +858,7 @@ class BlockPool:
         # In order to only iterate the list once, we duplicated code a bit
         if self.enable_caching:
             for block in ret:
-                self._maybe_evict_cached_block(block)
+                self._maybe_evict_cached_block(block, notify=True)
                 assert block.ref_cnt == 0
                 block.ref_cnt += 1
                 if self.metrics_collector:
@@ -778,6 +869,8 @@ class BlockPool:
                 block.ref_cnt += 1
                 if self.metrics_collector:
                     self.metrics_collector.on_block_allocated(block)
+        if self.cached_block_listener is not None:
+            self.cached_block_listener.flush()
         return ret
 
     def _notify_reuse(self, blocks: Iterable[KVCacheBlock]) -> None:
@@ -807,12 +900,16 @@ class BlockPool:
                 released.append(block)
         self.free_block_queue.append_n(released)
 
-    def _maybe_evict_cached_block(self, block: KVCacheBlock) -> bool:
+    def _maybe_evict_cached_block(
+        self, block: KVCacheBlock, notify: bool = False
+    ) -> bool:
         """If a block is cached in `cached_block_hash_to_block`, we reset its hash
         metadata and evict it from the cache.
 
         Args:
             block: The block to evict.
+            notify: Report the eviction to ``cached_block_listener`` (a real
+                eviction, not a re-key of a block its request still writes).
 
         Returns:
             True if the block is evicted, False otherwise.
@@ -822,7 +919,10 @@ class BlockPool:
         if self.metrics_collector:
             self.metrics_collector.on_block_evicted(block)
 
+        num_tokens = block.block_hash_num_tokens
         evicted_hashes = self._remove_cached_block_hashes_with_events(block)
+        if notify and evicted_hashes and self.cached_block_listener is not None:
+            self.cached_block_listener.on_evicted(block, evicted_hashes, num_tokens)
         # False if the block had no hash, i.e. eviction was not needed.
         return bool(evicted_hashes)
 
@@ -930,7 +1030,9 @@ class BlockPool:
                 f"only report block IDs that were allocated by the scheduler."
             )
             block = self.blocks[block_id]
-            self._maybe_evict_cached_block(block)
+            self._maybe_evict_cached_block(block, notify=True)
+        if self.cached_block_listener is not None:
+            self.cached_block_listener.flush()
 
     def reset_prefix_cache(self) -> bool:
         """Reset prefix cache. This function may be used in RLHF
@@ -955,6 +1057,7 @@ class BlockPool:
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
         self.silent_block_hashes_by_block.clear()
+        self.unpublished_block_hashes.clear()
         if self._reuse_watchers:
             self._notify_reuse(
                 [self.blocks[block_id] for block_id in list(self._reuse_watchers)]

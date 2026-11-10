@@ -332,6 +332,14 @@ class CacheConfig:
     until reused, but a branch that resumes from one misses sooner. States up to
     a detected shared-prefix junction are kept. Off by default; only takes
     effect with prefix caching enabled."""
+    publish_unresumable_removals: bool = False
+    """Hybrid (full-attention + Mamba ``align``) prefix caching with KV cache
+    events: publish ``BlockRemoved`` for a full-attention block as soon as no
+    cached state at or above it can resume through it (its states were
+    evicted), while its data stays cached until reused, and ``BlockStored``
+    again if a new state makes it resumable. A KV-event router then credits a
+    worker only with blocks a follow-up can actually reuse. Eviction order and
+    outputs are unchanged. Off by default."""
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM logical history length B for Mamba2. Triton uses B physical
     rows and FlashInfer uses B+T, where T is the target verification length.
@@ -435,6 +443,7 @@ class CacheConfig:
             "prefix_match_unit",
             "enable_mamba_shared_prefix_checkpoint",
             "evict_superseded_mamba_states",
+            "publish_unresumable_removals",
             "mamba_page_size_padded",
             "skip_page_size_padded",
             "user_specified_block_size",

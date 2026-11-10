@@ -14,8 +14,19 @@ from vllm.v1.core.kv_cache_coordinator import (
     get_kv_cache_coordinator,
 )
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
-from vllm.v1.core.kv_cache_utils import KVCacheBlock, KVCacheBlockCopy, trim_null_head
-from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+from vllm.v1.core.kv_cache_utils import (
+    BlockHash,
+    KVCacheBlock,
+    KVCacheBlockCopy,
+    get_block_hash,
+    get_group_id,
+    trim_null_head,
+)
+from vllm.v1.core.single_type_kv_cache_manager import (
+    FullAttentionManager,
+    MambaManager,
+)
+from vllm.v1.core.unresumable_rows import UnresumableRowPublisher
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CrossAttentionSpec,
@@ -148,6 +159,7 @@ class KVCacheManager:
         watermark: float = 0.0,
         enable_mamba_shared_prefix_checkpoint: bool = False,
         evict_superseded_mamba_states: bool = False,
+        publish_unresumable_removals: bool = False,
     ) -> None:
         self.max_model_len = max_model_len
         # When unset, fall back to `max_model_len` so the recycling-aware cap
@@ -196,12 +208,69 @@ class KVCacheManager:
             for manager in self.coordinator.single_type_managers:
                 if isinstance(manager, MambaManager):
                     manager.shared_prefix_checkpoint = True
-        self.evict_superseded_mamba_states = evict_superseded_mamba_states
-        for manager in self.coordinator.single_type_managers:
-            if isinstance(manager, MambaManager):
-                manager.evict_superseded_states = evict_superseded_mamba_states
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
         self.block_pool = self.coordinator.block_pool
+        # Prefix-cacheable Mamba "align" groups: together they hold one resume
+        # state per position (a hit needs every one of them).
+        self.state_managers: tuple[MambaManager, ...] = (
+            tuple(
+                manager
+                for manager, group in zip(
+                    self.coordinator.single_type_managers,
+                    kv_cache_config.kv_cache_groups,
+                )
+                if isinstance(manager, MambaManager)
+                and manager.mamba_cache_mode == "align"
+                and group.kv_cache_spec.prefix_cacheable
+            )
+            if enable_caching
+            else ()
+        )
+        self.state_group_ids = [m.kv_cache_group_id for m in self.state_managers]
+        self.evict_superseded_mamba_states = evict_superseded_mamba_states and bool(
+            self.state_managers
+        )
+        for manager in self.state_managers:
+            manager.evict_superseded_states = self.evict_superseded_mamba_states
+        # Junction guard for ``evict_superseded_mamba_states``: states that
+        # other requests resume from are never demoted, even when a request
+        # hits them directly (``shared_prefix_boundary == 0``). Keyed by the
+        # prefix hash of the state's position, shared by all state groups.
+        # States cached at a detected shared-prefix junction (a shared system
+        # prompt, a compaction point).
+        self._junction_states: set[BlockHash] = set()
+        # First request seen resuming from each state, and states that two or
+        # more distinct requests resumed from.
+        self._state_first_hitter: dict[BlockHash, str] = {}
+        self._multi_hit_states: set[BlockHash] = set()
+        self._state_mark_limit = max(4096, 4 * kv_cache_config.num_blocks)
+        self.unresumable_rows: UnresumableRowPublisher | None = None
+        if publish_unresumable_removals:
+            row_managers = [
+                manager
+                for manager, group in zip(
+                    self.coordinator.single_type_managers,
+                    kv_cache_config.kv_cache_groups,
+                )
+                if isinstance(manager, FullAttentionManager)
+                and group.kv_cache_spec.prefix_cacheable
+                and not manager.retains_longer_hit
+            ]
+            if (
+                enable_kv_cache_events
+                and self.state_managers
+                and row_managers
+                and isinstance(self.coordinator, HybridKVCacheCoordinator)
+            ):
+                self.unresumable_rows = UnresumableRowPublisher(
+                    self.coordinator, row_managers, self.state_group_ids
+                )
+            else:
+                logger.warning(
+                    "publish_unresumable_removals needs KV cache events, prefix "
+                    "caching and a hybrid full-attention + Mamba 'align' model; "
+                    "disabling it."
+                )
         self.retained_hit_group_ids = tuple(
             manager.kv_cache_group_id
             for manager in self.coordinator.single_type_managers
@@ -639,10 +708,12 @@ class KVCacheManager:
             # Cannot allocate new blocks
             return None
 
+        hit_blocks = None
         if (
             new_computed_block_list is not self.empty_kv_cache_blocks.blocks
             or num_external_computed_tokens > 0
         ):
+            hit_blocks = new_computed_block_list
             # Append the new computed blocks to the request blocks until now to
             # avoid the case where the new blocks cannot be allocated.
             self.coordinator.allocate_new_computed_blocks(
@@ -652,6 +723,8 @@ class KVCacheManager:
                 num_external_computed_tokens=num_external_computed_tokens,
                 skip_zeroing_group_ids=skip_zeroing_group_ids,
             )
+            if self.evict_superseded_mamba_states:
+                self._note_state_hit(request, new_computed_block_list)
 
         new_blocks = self.coordinator.allocate_new_blocks(
             request.request_id,
@@ -675,6 +748,7 @@ class KVCacheManager:
             request.num_tokens,
         )
         self.coordinator.cache_blocks(request, num_tokens_to_cache)
+        self._after_cache_blocks(request, hit_blocks)
 
         return self.create_kv_cache_blocks(new_blocks)
 
@@ -688,6 +762,8 @@ class KVCacheManager:
 
         """
         self._evict_superseded_mamba_states_first(request)
+        if self.unresumable_rows is not None:
+            self.unresumable_rows.on_request_freed(request)
         self.coordinator.free(request.request_id)
 
     def remove_skipped_blocks(
@@ -723,14 +799,147 @@ class KVCacheManager:
 
         """
         self._evict_superseded_mamba_states_first(request)
+        if self.unresumable_rows is not None:
+            self.unresumable_rows.on_request_freed(request)
         return self.coordinator.pop_blocks_for_free(request.request_id)
 
     def _evict_superseded_mamba_states_first(self, request: Request) -> None:
+        """Demote the states a finished request resumed from that a deeper
+        complete state on its own tokens supersedes (upstream #64975), with a
+        junction guard. A state is kept at normal LRU rank when it is
+
+        - at or below this request's shared-prefix junction,
+        - on the periodic retention grid (an intended fork point),
+        - cached at a detected shared-prefix junction (``_junction_states``),
+          even when this request hit it directly, or
+        - resumed from by two or more distinct requests.
+
+        The decision is taken once per position for all state groups, so the
+        groups of one state are demoted together or not at all.
+        """
         # A preempted request resumes from its states.
-        if self.evict_superseded_mamba_states and request.is_finished():
-            for manager in self.coordinator.single_type_managers:
-                if isinstance(manager, MambaManager):
-                    manager.evict_superseded_states_first(request)
+        if not self.evict_superseded_mamba_states or not request.is_finished():
+            return
+        by_position: dict[int, list[KVCacheBlock]] = {}
+        for manager in self.state_managers:
+            for block in manager.pop_hit_states(request.request_id):
+                by_position.setdefault(block.block_hash_num_tokens or 0, []).append(
+                    block
+                )
+        num_groups = len(self.state_managers)
+        candidates = {
+            position: blocks
+            for position, blocks in by_position.items()
+            if position > request.shared_prefix_boundary
+            and len({get_group_id(b.block_hash) for b in blocks}) == num_groups
+            and not self._is_kept_state(position, blocks)
+        }
+        if not candidates:
+            return
+        latest = self._deepest_complete_state(request)
+        demoted = [
+            block
+            for position, blocks in sorted(candidates.items())
+            if position < latest
+            for block in blocks
+        ]
+        if demoted:
+            self.block_pool.prioritize_eviction(demoted)
+
+    def _is_kept_state(self, position: int, blocks: list[KVCacheBlock]) -> bool:
+        interval = self.coordinator.retention_interval
+        if interval and position % interval == 0:
+            return True
+        assert blocks[0].block_hash is not None
+        key = get_block_hash(blocks[0].block_hash)
+        return key in self._junction_states or key in self._multi_hit_states
+
+    def _deepest_complete_state(self, request: Request) -> int:
+        """Deepest position on ``request``'s tokens where every state group
+        holds a cached state."""
+        latest: int | None = None
+        managers = self.state_managers
+        if all(m.kv_cache_spec == managers[0].kv_cache_spec for m in managers):
+            lookups = [(managers[0], self.state_group_ids)]
+        else:
+            # Different state specs: bound by the shallowest group.
+            lookups = [(m, [m.kv_cache_group_id]) for m in managers]
+        for manager, group_ids in lookups:
+            _, hit = manager.find_longest_cache_hit(
+                block_hashes=request.block_hashes,
+                max_length=request.num_tokens,
+                kv_cache_group_ids=group_ids,
+                block_pool=self.block_pool,
+                kv_cache_spec=manager.kv_cache_spec,
+                drop_eagle_block=False,
+                alignment_tokens=manager.cache_hit_alignment_tokens,
+            )
+            latest = hit if latest is None else min(latest, hit)
+        return latest or 0
+
+    def _note_state_hit(
+        self, request: Request, new_computed_blocks: Sequence[Sequence[KVCacheBlock]]
+    ) -> None:
+        """Count distinct requests resuming from each state."""
+        hit = new_computed_blocks[self.state_group_ids[0]]
+        if not hit or hit[-1].is_null or hit[-1].block_hash is None:
+            return
+        key = get_block_hash(hit[-1].block_hash)
+        first = self._state_first_hitter.setdefault(key, request.request_id)
+        if first != request.request_id:
+            self._multi_hit_states.add(key)
+        self._maybe_prune_state_marks()
+
+    def _note_junction_states(self, request: Request) -> None:
+        """Mark the states cached at ``request``'s shared-prefix junction: the
+        exact junction and the state-block end at or below it, which is where
+        sparse retention keeps it."""
+        boundary = request.shared_prefix_boundary
+        if not boundary:
+            return
+        hash_block_size = self.block_pool.hash_block_size
+        state_block_size = self.state_managers[0].block_size
+        for position in {boundary, boundary // state_block_size * state_block_size}:
+            index = position // hash_block_size - 1
+            if (
+                position <= 0
+                or position % hash_block_size
+                or index >= len(request.block_hashes)
+            ):
+                continue
+            key = request.block_hashes[index]
+            if key in self._junction_states:
+                continue
+            if self.block_pool.get_cached_block(key, self.state_group_ids):
+                self._junction_states.add(key)
+                self._maybe_prune_state_marks()
+
+    def _maybe_prune_state_marks(self) -> None:
+        """Forget marks of states that are no longer cached, once the marks
+        outgrow a multiple of the pool size."""
+        num_marks = (
+            len(self._junction_states)
+            + len(self._state_first_hitter)
+            + len(self._multi_hit_states)
+        )
+        if num_marks <= self._state_mark_limit:
+            return
+        group_ids = self.state_group_ids[:1]
+
+        def cached(key: BlockHash) -> bool:
+            return self.block_pool.get_cached_block(key, group_ids) is not None
+
+        self._junction_states = {k for k in self._junction_states if cached(k)}
+        self._multi_hit_states = {k for k in self._multi_hit_states if cached(k)}
+        self._state_first_hitter = {
+            k: v for k, v in self._state_first_hitter.items() if cached(k)
+        }
+        num_marks = (
+            len(self._junction_states)
+            + len(self._state_first_hitter)
+            + len(self._multi_hit_states)
+        )
+        self._state_mark_limit = max(self._state_mark_limit, 2 * num_marks)
 
     def evict_blocks(self, block_ids: set[int]) -> None:
         """Evict blocks from the prefix cache by their block IDs.
@@ -753,6 +962,8 @@ class KVCacheManager:
         """
         if not self.coordinator.reset_prefix_cache():
             return False
+        if self.unresumable_rows is not None:
+            self.unresumable_rows.reset()
         if self.log_stats:
             assert self.prefix_cache_stats is not None
             self.prefix_cache_stats.reset = True
@@ -860,6 +1071,24 @@ class KVCacheManager:
         """
         if self.enable_caching:
             self.coordinator.cache_blocks(request, num_computed_tokens)
+            self._after_cache_blocks(request)
+
+    def _after_cache_blocks(
+        self,
+        request: Request,
+        hit_blocks: Sequence[Sequence[KVCacheBlock]] | None = None,
+    ) -> None:
+        """Bookkeeping after ``request``'s blocks were (possibly) cached.
+
+        Args:
+            request: The request.
+            hit_blocks: The prefix-cache blocks it just resumed from, per group.
+
+        """
+        if self.evict_superseded_mamba_states:
+            self._note_junction_states(request)
+        if self.unresumable_rows is not None:
+            self.unresumable_rows.observe(request, hit_blocks)
 
     def create_kv_cache_blocks(
         self, blocks: tuple[list[KVCacheBlock], ...]

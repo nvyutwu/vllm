@@ -389,8 +389,11 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
-            evict_superseded_mamba_states=(
-                self.cache_config.evict_superseded_mamba_states
+            evict_superseded_mamba_states=getattr(
+                self.cache_config, "evict_superseded_mamba_states", False
+            ),
+            publish_unresumable_removals=getattr(
+                self.cache_config, "publish_unresumable_removals", False
             ),
         )
         # Mamba managers already account for their speculative state blocks.
