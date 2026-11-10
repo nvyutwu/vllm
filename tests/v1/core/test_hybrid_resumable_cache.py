@@ -708,3 +708,62 @@ def test_flags_compose():
     assert _removed_since(sim, mark) == set()
     sim.evict_state(a, tip)
     assert _removed_since(sim, mark) == set()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end invariant: router credit never exceeds what vLLM can resume
+# ---------------------------------------------------------------------------
+def router_credit_rows(index: set, sim: Sim, req: Request) -> int:
+    """Rows a router credits ``req``'s prefix with: the longest run of its
+    full-row hashes from row 0 present in the router's index."""
+    k = 0
+    while k < sim.num_full_rows(req) and sim.row_hash(req, k) in index:
+        k += 1
+    return k
+
+
+def actual_resume(sim: Sim, toks: list[int]) -> int:
+    """What vLLM resumes a follow-up of this conversation from, now."""
+    probe = sim.request(toks + tokens(16, 999))
+    return sim.mgr.get_computed_blocks(probe)[1]
+
+
+@pytest.mark.parametrize("geo", GEOMETRIES)
+@pytest.mark.parametrize("publish", [True, False])
+def test_router_credit_never_exceeds_resume_point(geo: Geometry, publish: bool):
+    """Four independent conversations (distinct prefixes, so no row is
+    shared); KDA states are then evicted one random (position, group subset)
+    at a time. After every eviction the router's view, replayed from the
+    event stream, must credit each conversation with no more rows than vLLM
+    can resume from (counting the row holding the resume point), and, with
+    nothing shared, with no fewer. Without the flag the first check fails:
+    the router keeps crediting rows whose states are gone."""
+    sim = Sim(geo, publish=publish)
+    R = sim.R
+    rng = random.Random(7)
+    convs = []
+    for i in range(4):
+        n = rng.randrange(3, 6) * R + rng.randrange(200, 4000)
+        req, _ = sim.run(tokens(n, 300 + i), decode=tokens(30, 400 + i))
+        convs.append((req, list(req.all_token_ids)))
+    over = 0
+    for _ in range(40):
+        req, toks = rng.choice(convs)
+        states = sim.states(req)
+        if not states:
+            continue
+        pos = rng.choice(states)
+        groups = tuple(sorted(rng.sample(KDA_GROUPS, rng.randrange(1, 4))))
+        sim.evict_state(req, pos, groups=groups)
+        index, missing = router_replay(sim.events, R)
+        assert missing == 0
+        for r, t in convs:
+            credit = router_credit_rows(index, sim, r)
+            resume = actual_resume(sim, t)
+            ceiling = cdiv(resume, R)
+            if publish:
+                assert credit <= ceiling, (r.request_id, credit, resume)
+                assert credit >= resume // R, (r.request_id, credit, resume)
+            over += credit > ceiling
+    if not publish:
+        assert over > 0, "scenario never produced a dead row"
