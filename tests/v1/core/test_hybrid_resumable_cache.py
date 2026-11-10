@@ -767,3 +767,123 @@ def test_router_credit_never_exceeds_resume_point(geo: Geometry, publish: bool):
             over += credit > ceiling
     if not publish:
         assert over > 0, "scenario never produced a dead row"
+
+
+# ---------------------------------------------------------------------------
+# Content check: no hit ever reads another prefix's KV or state
+# ---------------------------------------------------------------------------
+class ContentSim(Sim):
+    """``Sim`` plus a shadow model of what every physical block holds (as in
+    ``test_replay_boundary_alias``): each MLA slot and each KDA state block
+    records the identity of the prefix it was computed from; copy-on-write
+    copies apply before a step's writes, as on the worker. Every prefix-cache
+    hit is checked against the requester's own prefix."""
+
+    def __init__(self, geo: Geometry, **kwargs):
+        super().__init__(geo, **kwargs)
+        self.kv: dict[int, dict[int, int]] = {}
+        self.state: dict[int, int] = {}
+        self._ids: dict[str, list[int]] = {}
+        self.mla = self.mgr.coordinator.single_type_managers[MLA_GROUP]
+        self.kda = [self.mgr.coordinator.single_type_managers[g] for g in KDA_GROUPS]
+
+    def prefix_ids(self, req: Request) -> list[int]:
+        ids = self._ids.setdefault(req.request_id, [0])
+        for tok in req.all_token_ids[len(ids) - 1 :]:
+            ids.append(hash((ids[-1], tok)))
+        return ids
+
+    def admit(self, req: Request) -> int:
+        hit = super().admit(req)
+        self.check_hit(req, self._pending[0], hit)
+        return hit
+
+    def check_hit(self, req: Request, blocks, hit: int) -> None:
+        ids = self.prefix_ids(req)
+        mla_blocks = blocks.blocks[MLA_GROUP]
+        for pos in range(hit):
+            got = self.kv.get(mla_blocks[pos // self.R].block_id, {}).get(pos % self.R)
+            assert got == ids[pos + 1], (
+                f"{req.request_id}: MLA position {pos} of a {hit}-token hit "
+                "holds another prefix's KV"
+            )
+        if hit:
+            for g in KDA_GROUPS:
+                block = blocks.blocks[g][(hit - 1) // self.geo.kda]
+                assert self.state.get(block.block_id) == ids[hit], (
+                    f"{req.request_id}: KDA group {g} state for a {hit}-token "
+                    "hit is another prefix's"
+                )
+
+    def _step(self, req, num_new, num_local=0, computed_blocks=None) -> None:
+        self.mgr.new_step_starts()
+        start = req.num_computed_tokens + num_local
+        out = self.mgr.allocate_slots(req, num_new, num_local, computed_blocks)
+        assert out is not None, req.request_id
+        req.status = RequestStatus.RUNNING
+        copies, retained = self.mgr.take_kv_cache_block_copies()
+        for copy in copies:
+            if copy.src_block_id in self.state:
+                self.state[copy.dst_block_id] = self.state[copy.src_block_id]
+            self.kv[copy.dst_block_id] = dict(self.kv.get(copy.src_block_id, {}))
+        self._write(req, start, start + num_new)
+        self.pool.free_blocks(retained)
+        req.num_computed_tokens = start + num_new
+        self.drain()
+
+    def _write(self, req: Request, start: int, end: int) -> None:
+        from vllm.model_executor.layers.mamba.checkpoint import (
+            compute_mamba_prefill_checkpoints,
+        )
+
+        ids = self.prefix_ids(req)
+        mla_blocks = self.mla.req_to_blocks[req.request_id]
+        for pos in range(start, end):
+            block = mla_blocks[pos // self.R]
+            assert not block.is_null
+            self.kv.setdefault(block.block_id, {})[pos % self.R] = ids[pos + 1]
+        (offset,), (col,) = compute_mamba_prefill_checkpoints(
+            [end],
+            [end - start],
+            hash_block_size=HASH,
+            mamba_block_size=self.geo.kda,
+            checkpoint_alignment=16,
+            drop_eagle_block=self.geo.eagle,
+            cache_hit_alignment_tokens=HASH,
+        )
+        for manager in self.kda:
+            blocks = manager.req_to_blocks[req.request_id]
+            running = blocks[cdiv(end, self.geo.kda) - 1]
+            assert not running.is_null
+            self.state[running.block_id] = ids[end]
+            if col >= 0 and not blocks[col].is_null:
+                self.state[blocks[col].block_id] = ids[start + offset]
+
+
+@pytest.mark.parametrize("geo", GEOMETRIES)
+def test_hits_read_only_own_prefix_with_both_flags(geo: Geometry):
+    """Multi-turn sessions sharing a system prompt, a fork, a regenerate and
+    forced KDA evictions under a small pool, with both flags on: every hit
+    reads only its own prefix's KV and states, and hit lengths match the run
+    without the flags."""
+
+    def workload(sim: ContentSim) -> list[int]:
+        R = sim.R
+        system = tokens(R + 700, 500)
+        convs = [system + tokens(2 * R + 300 * i, 510 + i) for i in range(4)]
+        for turn in range(3):
+            for i in range(4):
+                req, _ = sim.run(convs[i], decode=tokens(40, 600 + 10 * i + turn))
+                convs[i] = list(req.all_token_ids) + tokens(R // 2, 700 + 10 * i + turn)
+            # Kill one session's deepest state (one group) to create dead rows.
+            states = sim.states(req)
+            if states:
+                sim.evict_state(req, max(states), groups=(KDA_GROUPS[turn % 3],))
+        fork = convs[0][: 2 * R + 900] + tokens(R, 800)
+        sim.run(fork)
+        sim.run(convs[1][: len(convs[1]) - R // 2])  # regenerate a turn
+        return sim.hits
+
+    off = workload(ContentSim(geo, publish=False, num_blocks=260))
+    on = workload(ContentSim(geo, publish=True, evict_superseded=True, num_blocks=260))
+    assert on == off
