@@ -35,6 +35,7 @@ from vllm.v1.core.kv_cache_utils import (
     maybe_convert_block_hash,
 )
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.unresumable_rows import UnresumableRowPublisher
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     KVCacheGroupSpec,
@@ -887,3 +888,264 @@ def test_hits_read_only_own_prefix_with_both_flags(geo: Geometry):
     off = workload(ContentSim(geo, publish=False, num_blocks=260))
     on = workload(ContentSim(geo, publish=True, evict_superseded=True, num_blocks=260))
     assert on == off
+
+
+# ---------------------------------------------------------------------------
+# P4a cost: lookups only when the resume point can have moved
+# ---------------------------------------------------------------------------
+class EveryStepPublisher(UnresumableRowPublisher):
+    """Reference: the first P4a version, which ran the hybrid lookup after
+    every cache step of a chain with dead rows and on every evaluation."""
+
+    def _check_new_hashes(self, chain) -> None:
+        chain.dirty = True
+
+    def _evaluate(self, chain, upper) -> None:
+        resume = None
+        for group_id, rows in chain.rows.items():
+            block_size = self.row_block_size[group_id]
+            last = len(rows)
+            if upper is not None:
+                last = min(last, cdiv(upper, block_size))
+            if last <= 0:
+                continue
+            if resume is None:
+                resume = self.resume_point(chain.block_hashes)
+            first = cdiv(resume, block_size)
+            for row in range(last - 1, first - 1, -1):
+                block, key = rows[row]
+                if not self._may_die(chain, block, key):
+                    continue
+                self.block_pool.unpublish_block_hash(block)
+                self.dead_rows[block.block_id] = (chain, group_id, row)
+                chain.dead.add(block.block_id)
+
+
+def use_reference_publisher(sim: Sim) -> None:
+    old = sim.mgr.unresumable_rows
+    assert old is not None
+    sim.mgr.unresumable_rows = EveryStepPublisher(
+        old.coordinator, old.row_managers, sorted(old.state_group_ids)
+    )
+
+
+class Driver:
+    """Interleaves many requests on one ``Sim`` from a seeded RNG: multi-turn
+    sessions (some sharing a system prompt), forks, identical concurrent
+    prompts, decode across state blocks and rows, preemption, forced KDA
+    evictions and pool pressure. Allocation failure finishes the request, so
+    the workload depends only on the seed and the cache's decisions."""
+
+    def __init__(self, sim: Sim, seed: int):
+        self.sim = sim
+        self.rng = random.Random(seed)
+        R = sim.R
+        system = tokens(R + 500, seed * 7 + 1)
+        self.sessions = [
+            (system if i % 2 else []) + tokens(R // 2 + 400 * i, seed * 7 + 2 + i)
+            for i in range(5)
+        ]
+        self.active: list[tuple[Request, int, int]] = []  # req, session, decode left
+        self.done = 0
+
+    def _start(self) -> None:
+        rng, R = self.rng, self.sim.R
+        kind = rng.random()
+        s = rng.randrange(len(self.sessions))
+        base = self.sessions[s]
+        if kind < 0.15 and self.active:
+            # Identical copy of a running request's prompt.
+            other = rng.choice(self.active)[0]
+            toks = list(other.prompt_token_ids)
+            s = -1
+        elif kind < 0.3 and len(base) > R:
+            toks = base[: rng.randrange(R // 2, len(base))] + tokens(
+                rng.randrange(300, R), rng.randrange(1 << 30)
+            )
+            s = -1
+        else:
+            toks = base + tokens(rng.randrange(200, R), rng.randrange(1 << 30))
+        req = self.sim.request(toks)
+        self.active.append((req, s, rng.choice([5, 200, 1300, 2 * R // 3])))
+
+    def _finish(self, i: int) -> None:
+        req, s, _ = self.active.pop(i)
+        self.sim.finish(req)
+        if s >= 0:
+            self.sessions[s] = list(req.all_token_ids)
+        self.done += 1
+
+    def _try_step(self, req: Request, num_new: int, num_local=0, blocks=None) -> bool:
+        sim = self.sim
+        sim.mgr.new_step_starts()
+        start = req.num_computed_tokens + num_local
+        out = sim.mgr.allocate_slots(req, num_new, num_local, blocks)
+        if out is None:
+            return False
+        req.status = RequestStatus.RUNNING
+        _, retained = sim.mgr.take_kv_cache_block_copies()
+        sim.pool.free_blocks(retained)
+        req.num_computed_tokens = start + num_new
+        sim.drain()
+        return True
+
+    def _advance(self, i: int) -> None:
+        sim = self.sim
+        req, s, left = self.active[i]
+        if req.num_computed_tokens < req.num_tokens:
+            local, blocks = 0, None
+            if req.num_computed_tokens == 0:
+                local = sim.admit(req)
+                blocks = sim._pending[0]
+            remaining = req.num_tokens - req.num_computed_tokens - local
+            num_new = sim._split(req, min(remaining, sim.R), local)
+            ok = num_new > 0 and self._try_step(req, num_new, local, blocks)
+        elif left > 0:
+            n = min(left, self.rng.choice([1, 1, 1, 64]))
+            ok = True
+            for tok in tokens(n, self.rng.randrange(1 << 30)):
+                req.append_output_token_ids(tok)
+                if not self._try_step(req, 1):
+                    ok = False
+                    break
+            self.active[i] = (req, s, left - n)
+        else:
+            self._finish(i)
+            return
+        if not ok:
+            self._finish(i)
+
+    def _preempt(self, i: int) -> None:
+        req = self.active[i][0]
+        if req.num_computed_tokens == 0:
+            return
+        req.status = RequestStatus.PREEMPTED
+        self.sim.mgr.free(req)
+        self.sim.drain()
+        req.status = RequestStatus.WAITING
+        req.num_computed_tokens = 0
+
+    def _evict(self) -> None:
+        sim, rng = self.sim, self.rng
+        req = rng.choice(self.active)[0]
+        states = sim.states(req)
+        if states:
+            pos = rng.choice(states)
+            groups = tuple(sorted(rng.sample(KDA_GROUPS, rng.randrange(1, 4))))
+            sim.evict_state(req, pos, groups=groups)
+
+    def run(self, num_ops: int) -> None:
+        rng = self.rng
+        for _ in range(num_ops):
+            x = rng.random()
+            if len(self.active) < 2 or (x < 0.08 and len(self.active) < 6):
+                self._start()
+            elif x < 0.12:
+                self._preempt(rng.randrange(len(self.active)))
+            elif x < 0.18:
+                self._evict()
+            else:
+                self._advance(rng.randrange(len(self.active)))
+        while self.active:
+            self._finish(0)
+
+
+@pytest.mark.parametrize("geo", GEOMETRIES)
+@pytest.mark.parametrize("seed", range(6))
+def test_events_equal_every_step_reference(geo: Geometry, seed: int):
+    """The incremental publisher emits exactly the events (same blocks, same
+    order) and gives exactly the hits of the reference that runs the lookup
+    after every step, on interleaved random workloads, with fewer lookups."""
+
+    def run(reference: bool, publish: bool = True):
+        sim = Sim(geo, publish=publish, evict_superseded=bool(seed % 2), num_blocks=300)
+        if reference:
+            use_reference_publisher(sim)
+        driver = Driver(sim, seed)
+        driver.run(700)
+        return sim, driver
+
+    new, d_new = run(False)
+    ref, d_ref = run(True)
+    assert d_new.done == d_ref.done
+    assert new.hits == ref.hits
+    assert new.events == ref.events
+    assert removed_rows(new.events), "workload never killed a row"
+    # Unknown removals a router sees come only from duplicate keys, as
+    # without the flag (two blocks holding one key each publish removed).
+    off, _ = run(False, publish=False)
+    assert off.hits == new.hits
+    assert router_replay(new.events, new.R)[1] == router_replay(off.events, off.R)[1]
+    assert new.mgr.unresumable_rows.num_lookups < ref.mgr.unresumable_rows.num_lookups
+
+
+@pytest.mark.parametrize("geo", GEOMETRIES)
+def test_decode_with_dead_rows_runs_no_lookup(geo: Geometry):
+    """A running request whose resumed-from state is evicted has dead rows.
+    Its following decode steps run no hybrid lookup until a key on its path
+    is cached; the reference runs one every step."""
+    for reference in (False, True):
+        sim = Sim(geo)
+        if reference:
+            use_reference_publisher(sim)
+        R = sim.R
+        toks = tokens(4 * R + 3000, 20)
+        sim.run(toks)
+        req = sim.request(toks + tokens(R // 4, 21))
+        hit = sim.prefill(req)
+        assert hit > 3 * R
+        for pos in [p for p in sim.states(req) if p > R]:
+            sim.evict_state(req, pos)
+        pub = sim.mgr.unresumable_rows
+        assert pub.chains[req.request_id].dead
+        # Stay inside one state block: no new key gets cached.
+        if -req.num_tokens % geo.kda < 200:
+            sim.decode(req, tokens(-req.num_tokens % geo.kda + 1, 23))
+            assert pub.chains[req.request_id].dead
+        steps = min(geo.kda // 2, -req.num_tokens % geo.kda - 1)
+        assert steps >= 200
+        before = pub.num_lookups
+        sim.decode(req, tokens(steps, 22))
+        lookups = pub.num_lookups - before
+        if reference:
+            assert lookups == steps
+        else:
+            assert lookups == 0
+        sim.finish(req)
+
+
+@pytest.mark.parametrize("geo", GEOMETRIES)
+def test_lookups_bounded_by_keys_cached_on_path(geo: Geometry):
+    """Decode across many state blocks with dead rows: at most one lookup per
+    step that cached a key on the request's path."""
+    sim = Sim(geo)
+    R = sim.R
+    toks = tokens(3 * R + 1000, 30)
+    sim.run(toks)
+    req = sim.request(toks + tokens(200, 31))
+    sim.prefill(req)
+    for pos in [p for p in sim.states(req) if p > R // 2]:
+        sim.evict_state(req, pos)
+    pub = sim.mgr.unresumable_rows
+    assert pub.chains[req.request_id].dead
+    num_cached = 0
+    on_cached = pub.on_cached
+
+    def counting_on_cached(*args):
+        nonlocal num_cached
+        num_cached += 1
+        on_cached(*args)
+
+    pub.on_cached = counting_on_cached  # type: ignore[method-assign]
+    cached_steps = 0
+    lookups = 0
+    for tok in tokens(3 * R, 32):
+        before_cached, before = num_cached, pub.num_lookups
+        req.append_output_token_ids(tok)
+        sim._step(req, 1)
+        assert pub.num_lookups - before <= 1
+        lookups += pub.num_lookups - before
+        cached_steps += num_cached != before_cached
+    assert lookups <= cached_steps
+    assert 100 * lookups < 3 * R
+    sim.finish(req)

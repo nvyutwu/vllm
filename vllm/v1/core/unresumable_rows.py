@@ -28,8 +28,18 @@ When a chain is evaluated:
   rows; a running one only the rows below the evicted state, which lost their
   cover (rows it is still filling are not dead yet);
 - when its request is freed (finished or preempted): all owned rows;
-- after each of its request's cache steps, if it has dead rows: rows below the
-  new ``H`` are published again.
+- after a cache step of its request, if it has dead rows and ``H`` may have
+  grown since it was last computed: rows below the new ``H`` are published
+  again.
+
+Cost. ``H`` only grows when a key on the chain's path is added to the cache
+(a key not cached before; re-registering a cached key changes nothing),
+or when the request's hash list grows over keys that are already cached. So a
+chain with dead rows is marked dirty when ``on_cached`` adds a key at a
+position of its path, or when ``observe`` sees new hashes of its own that are
+cached; only a dirty chain runs the hybrid lookup. A decode step that caches
+nothing costs O(1) per request. An evaluation first collects the rows that
+could die and skips the lookup when there are none.
 
 Shared rows. Only the evaluated chain's own rows are walked; rows another
 request touched since belong to that request's chain and are skipped, and so
@@ -49,6 +59,7 @@ from vllm.v1.core.kv_cache_utils import (
     KVCacheBlock,
     get_block_hash,
     get_group_id,
+    make_block_hash_with_group_id,
 )
 from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
 from vllm.v1.request import Request
@@ -60,7 +71,15 @@ _SWEEP_INTERVAL = 256
 
 
 class _Chain:
-    __slots__ = ("block_hashes", "dead", "rows", "running")
+    __slots__ = (
+        "block_hashes",
+        "dead",
+        "dirty",
+        "finished",
+        "num_hashes",
+        "rows",
+        "running",
+    )
 
     def __init__(self, block_hashes: Sequence[BlockHash]) -> None:
         # The request's own hash list (not a copy); it outlives the request
@@ -71,6 +90,14 @@ class _Chain:
         # Block ids of this chain's rows whose BlockRemoved was published.
         self.dead: set[int] = set()
         self.running = True
+        # Freed for good (not preempted): never observed again.
+        self.finished = False
+        # ``dead`` is non-empty and a key on the chain's path was added since
+        # ``H`` was last computed, so ``H`` may have grown.
+        self.dirty = False
+        # ``len(block_hashes)`` when ``H`` was last computed (or new hashes
+        # were last checked); hashes past it may cover cached keys.
+        self.num_hashes = 0
 
 
 class UnresumableRowPublisher:
@@ -97,13 +124,31 @@ class UnresumableRowPublisher:
         self.state_owner: dict[BlockHash, _Chain] = {}
         # Evicted states awaiting ``flush``: prefix hash -> position.
         self._evicted_states: dict[BlockHash, int | None] = {}
+        # Chains that have dead rows and may be observed again (running or
+        # preempted); pruned lazily.
+        self._watched: set[_Chain] = set()
+        self._group_ids = tuple(range(len(coordinator.kv_cache_config.kv_cache_groups)))
+        self._hash_block_size = self.block_pool.hash_block_size
         self._num_frees = 0
+        # Hybrid lookups run (``resume_point``); for tests and debugging.
+        self.num_lookups = 0
         self.block_pool.cached_block_listener = self
 
     # -- block pool hooks --------------------------------------------------
-    def on_cached(self, request: Request, block_hash: BlockHashWithGroupId) -> None:
+    def on_cached(
+        self,
+        request: Request,
+        block_hash: BlockHashWithGroupId,
+        num_tokens: int | None = None,
+        added: bool = True,
+    ) -> None:
+        key = get_block_hash(block_hash)
         if get_group_id(block_hash) in self.state_group_ids:
-            self.state_owner[get_block_hash(block_hash)] = self._chain(request)
+            self.state_owner[key] = self._chain(request)
+        # A key already cached (re-registered, or a duplicate block) leaves
+        # every resume point unchanged.
+        if added and self._watched:
+            self._mark_dirty(key, num_tokens)
 
     def on_evicted(
         self,
@@ -184,13 +229,21 @@ class UnresumableRowPublisher:
         for block, block_size in revived:
             self._republish(request, block, block_size)
         if chain.dead:
-            self._revive(chain, request)
+            if not chain.dirty:
+                self._check_new_hashes(chain)
+            if chain.dirty:
+                self._revive(chain, request)
+        else:
+            chain.num_hashes = len(chain.block_hashes)
 
     def on_request_freed(self, request: Request) -> None:
         chain = self.chains.get(request.request_id)
         if chain is None or chain.block_hashes is not request.block_hashes:
             return
         chain.running = False
+        if request.is_finished():
+            chain.finished = True
+            self._watched.discard(chain)
         self._evaluate(chain, upper=None)
         if not self._owns_rows(chain):
             del self.chains[request.request_id]
@@ -204,6 +257,7 @@ class UnresumableRowPublisher:
         self.dead_rows.clear()
         self.state_owner.clear()
         self._evicted_states.clear()
+        self._watched.clear()
 
     # -- internals ---------------------------------------------------------
     def _chain(self, request: Request) -> _Chain:
@@ -216,6 +270,7 @@ class UnresumableRowPublisher:
         """Tokens a request with these block hashes would resume from now."""
         if not block_hashes:
             return 0
+        self.num_lookups += 1
         _, hit_length, _ = self.coordinator.find_longest_cache_hit(
             list(block_hashes), len(block_hashes) * self.block_pool.hash_block_size
         )
@@ -223,33 +278,59 @@ class UnresumableRowPublisher:
 
     def _evaluate(self, chain: _Chain, upper: int | None) -> None:
         """Publish ``BlockRemoved`` for ``chain``'s owned rows that start at or
-        above its resume point (and, if ``upper`` is set, below ``upper``)."""
-        resume = None
+        above its resume point (and, if ``upper`` is set, below ``upper``).
+
+        Rows that cannot die (already dead, re-keyed, owned by another chain
+        or duplicated) are filtered first; the hybrid lookup runs only if some
+        row could die."""
+        candidates: list[tuple[int, list[int]]] = []
         for group_id, rows in chain.rows.items():
             block_size = self.row_block_size[group_id]
             last = len(rows)
             if upper is not None:
                 last = min(last, cdiv(upper, block_size))
-            if last <= 0:
-                continue
-            if resume is None:
-                resume = self.resume_point(chain.block_hashes)
-            first = cdiv(resume, block_size)
+            live = [
+                row
+                for row in range(last - 1, -1, -1)
+                if self._may_die(chain, *rows[row])
+            ]
+            if live:
+                candidates.append((group_id, live))
+        if not candidates:
+            return
+        had_dead = bool(chain.dead)
+        resume = self.resume_point(chain.block_hashes)
+        for group_id, live in candidates:
+            rows = chain.rows[group_id]
+            first = cdiv(resume, self.row_block_size[group_id])
             # Deepest first, as LRU removes a chain.
-            for row in range(last - 1, first - 1, -1):
-                block, key = rows[row]
-                if (
-                    block.block_id in self.dead_rows
-                    or block.block_hash != key
-                    or self.row_owner.get(block.block_id) is not chain
-                    or self._has_other_holder(key)
-                ):
-                    continue
+            for row in live:
+                if row < first:
+                    break
+                block, _ = rows[row]
                 self.block_pool.unpublish_block_hash(block)
                 self.dead_rows[block.block_id] = (chain, group_id, row)
                 chain.dead.add(block.block_id)
+        if chain.dead and not chain.finished:
+            if not had_dead:
+                # ``H`` is fresh: every dead row starts at or above it.
+                chain.dirty = False
+                chain.num_hashes = len(chain.block_hashes)
+            self._watched.add(chain)
+
+    def _may_die(
+        self, chain: _Chain, block: KVCacheBlock, key: BlockHashWithGroupId
+    ) -> bool:
+        return not (
+            block.block_id in self.dead_rows
+            or block.block_hash != key
+            or self.row_owner.get(block.block_id) is not chain
+            or self._has_other_holder(key)
+        )
 
     def _revive(self, chain: _Chain, request: Request) -> None:
+        chain.dirty = False
+        chain.num_hashes = len(chain.block_hashes)
         resume = self.resume_point(chain.block_hashes)
         revive = []
         for block_id in chain.dead:
@@ -259,6 +340,37 @@ class UnresumableRowPublisher:
         for _, group_id, block_id in sorted(revive):
             block = self.block_pool.blocks[block_id]
             self._republish(request, block, self.row_block_size[group_id])
+
+    def _mark_dirty(self, key: BlockHash, num_tokens: int | None) -> None:
+        """A key was cached: mark watched chains whose path holds it."""
+        index = None if num_tokens is None else num_tokens // self._hash_block_size - 1
+        stale = []
+        for chain in self._watched:
+            if chain.finished or not chain.dead:
+                stale.append(chain)
+            elif not chain.dirty:
+                hashes = chain.block_hashes
+                if index is None or (0 <= index < len(hashes) and hashes[index] == key):
+                    chain.dirty = True
+        for chain in stale:
+            self._watched.discard(chain)
+
+    def _check_new_hashes(self, chain: _Chain) -> None:
+        """Mark ``chain`` dirty if hashes it gained since ``H`` was computed
+        name keys already cached (e.g. by an identical request ahead)."""
+        hashes = chain.block_hashes
+        num_hashes = len(hashes)
+        if num_hashes <= chain.num_hashes:
+            return
+        cached = self.block_pool.cached_block_hash_to_block
+        for index in range(chain.num_hashes, num_hashes):
+            block_hash = hashes[index]
+            for group_id in self._group_ids:
+                key = make_block_hash_with_group_id(block_hash, group_id)
+                if cached.get_one_block(key) is not None:
+                    chain.dirty = True
+                    return
+        chain.num_hashes = num_hashes
 
     def _republish(
         self, request: Request, block: KVCacheBlock, block_size: int

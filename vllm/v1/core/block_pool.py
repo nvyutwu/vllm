@@ -36,7 +36,13 @@ logger = init_logger(__name__)
 class CachedBlockListener(Protocol):
     """Observer of prefix-cache keys (``--publish-unresumable-removals``)."""
 
-    def on_cached(self, request: Request, block_hash: BlockHashWithGroupId) -> None: ...
+    def on_cached(
+        self,
+        request: Request,
+        block_hash: BlockHashWithGroupId,
+        num_tokens: int | None,
+        added: bool,
+    ) -> None: ...
 
     def on_evicted(
         self,
@@ -322,6 +328,11 @@ class BlockPool:
             block_hash_with_group_id = make_block_hash_with_group_id(
                 block_hash, kv_cache_group_id
             )
+            listener = self.cached_block_listener
+            added = listener is not None and (
+                self.cached_block_hash_to_block.get_one_block(block_hash_with_group_id)
+                is None
+            )
             if blk.block_hash is not None:
                 # The only valid case where a "new full block" already has a
                 # hash is partial->full promotion of the same cache block.
@@ -335,8 +346,10 @@ class BlockPool:
                 blk,
                 num_tokens=num_hash_tokens,
             )
-            if self.cached_block_listener is not None:
-                self.cached_block_listener.on_cached(request, block_hash_with_group_id)
+            if listener is not None:
+                listener.on_cached(
+                    request, block_hash_with_group_id, num_hash_tokens, added
+                )
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
@@ -577,6 +590,12 @@ class BlockPool:
         block_hash_with_group_id = make_block_hash_with_group_id(
             block_hash, kv_cache_group_id
         )
+        listener = self.cached_block_listener
+        # The key was absent before this call (a new prefix-cache entry).
+        added = listener is not None and (
+            self.cached_block_hash_to_block.get_one_block(block_hash_with_group_id)
+            is None
+        )
         already_cached = block.block_hash == block_hash_with_group_id or (
             self.cached_block_hash_to_block.contain(
                 block_hash_with_group_id, block.block_id
@@ -597,8 +616,13 @@ class BlockPool:
             block,
             num_tokens=num_hash_blocks * self.hash_block_size,
         )
-        if self.cached_block_listener is not None:
-            self.cached_block_listener.on_cached(request, block_hash_with_group_id)
+        if listener is not None:
+            listener.on_cached(
+                request,
+                block_hash_with_group_id,
+                num_hash_blocks * self.hash_block_size,
+                added,
+            )
         if not emit_events:
             if not already_cached:
                 self.silent_block_hashes_by_block.setdefault(block.block_id, set()).add(
