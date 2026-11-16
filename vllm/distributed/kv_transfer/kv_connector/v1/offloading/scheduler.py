@@ -227,6 +227,10 @@ class _StoreJobSink:
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
+    # VLLM_LOG_PREFIX_LOOKUP_DETAIL: record each lookup's outcome per request.
+    # A class default too, for schedulers built without __init__ (tests).
+    _log_lookup_detail: bool = False
+
     def __init__(
         self,
         spec: OffloadingSpec,
