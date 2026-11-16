@@ -117,6 +117,10 @@ class CachingMetrics:
         return self.aggregated_query_hit / self.aggregated_query_total
 
 
+PREFIX_CACHE_STATE_GAP_TIERS = ("local", "external", "combined")
+PREFIX_CACHE_STATE_GAP_CAUSES = ("missing_grid_state", "past_last_grid_state")
+
+
 @dataclass
 class PrefixCacheStats(BaseCacheStats):
     """Stores prefix cache hit statistics.
@@ -134,6 +138,33 @@ class PrefixCacheStats(BaseCacheStats):
     """The `hits` number for preempted requests."""
     hits_by_source: dict[CacheHitSource, int] = field(default_factory=dict)
     """`hits` split by the cache tier that supplied them (connector stats only)."""
+    state_gap_tokens: dict[str, int] = field(default_factory=dict)
+    """Hybrid models: tokens that full-attention KV matched past the resume
+    point because a lagging group (Mamba state / sliding window) had nothing
+    there. Keyed ``"<tier>/<cause>"``, see :meth:`record_state_gap`."""
+    state_gap_requests: dict[str, int] = field(default_factory=dict)
+    """Requests with a non-zero state gap, keyed like ``state_gap_tokens``."""
+    state_gap_samples: dict[str, list[int]] = field(default_factory=dict)
+    """Per-request non-zero state gaps, keyed by tier."""
+
+    def record_state_gap(self, tier: str, cause: str, num_tokens: int) -> None:
+        """Record one admitted request's state gap for ``tier``.
+
+        ``tier`` is ``local`` (device prefix cache), ``external`` (KV
+        connector) or ``combined`` (deepest full-attention match in either,
+        against the final resume point). ``cause`` is ``missing_grid_state``
+        when a retention-grid position lies inside the gap (retention would
+        keep that state, but it was not there: evicted, or never stored, e.g.
+        a prefill of the same prefix still in flight), else
+        ``past_last_grid_state`` (the gap is above the last grid position:
+        retention spacing, or a lost junction / prompt-tail state).
+        """
+        if num_tokens <= 0:
+            return
+        key = f"{tier}/{cause}"
+        self.state_gap_tokens[key] = self.state_gap_tokens.get(key, 0) + num_tokens
+        self.state_gap_requests[key] = self.state_gap_requests.get(key, 0) + 1
+        self.state_gap_samples.setdefault(tier, []).append(num_tokens)
 
     def record(
         self,

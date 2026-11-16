@@ -565,6 +565,15 @@ class KVConnectorBase_V1(ABC):
             return {}
         return {self._cache_hit_source: num_external_tokens}
 
+    def get_external_full_attention_hit_end(self, request: "Request") -> int | None:
+        """Hybrid models, metrics only: the token position the full-attention
+        groups' external hit reached at the latest
+        :meth:`get_num_new_matched_tokens` lookup, before lagging groups
+        (Mamba state / sliding window) narrowed it. ``None`` if not tracked or
+        no full-attention tokens were found.
+        """
+        return None
+
     @abstractmethod
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int

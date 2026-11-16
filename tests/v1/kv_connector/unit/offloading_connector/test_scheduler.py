@@ -962,6 +962,33 @@ def test_no_shared_prefix_junction_when_sparse_group_hits():
     assert request.shared_prefix_boundary == 0
 
 
+def test_full_attention_hit_end_before_mamba_narrowing():
+    """Full attention holds every chunk but no Mamba state is offloaded: the
+    hit is 0 and the full-attention end is reported for the state-gap
+    metric."""
+    scheduler = _make_sparse_retention_scheduler()
+    request = _make_partial_tail_request(scheduler)
+    request.shared_prefix_boundary = 0
+    scheduler.manager.lookup.side_effect = _hybrid_lookup(set())
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    end = scheduler.get_external_full_attention_hit_end(request)
+    assert end is not None and end >= 16
+
+    # Every group hits: no gap beyond the loaded tokens.
+    scheduler.manager.lookup.side_effect = None
+    scheduler.manager.lookup.return_value = LookupResult.HIT
+    tokens, _ = scheduler.get_num_new_matched_tokens(request, 0)
+    assert tokens == 28
+    end = scheduler.get_external_full_attention_hit_end(request)
+    assert end is None or end <= tokens
+
+    # A skipped lookup clears it.
+    request.skip_reading_external_kv = True
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (0, False)
+    assert scheduler.get_external_full_attention_hit_end(request) is None
+
+
 def test_max_load_tokens_rounds_down_without_partial_tail():
     scheduler = _make_partial_tail_scheduler()
     scheduler.config = scheduler.config._replace(supports_partial_tail=False)

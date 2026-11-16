@@ -364,6 +364,7 @@ class KVCacheManager:
         # disabled or the request is marked as skipping kv cache read
         # (which happens when the request requires prompt logprobs
         # or calls a pooling model with all pooling).
+        request.local_full_attention_hit_end = 0
         if not self.prefix_cache_lookup_enabled(request):
             return self.empty_kv_cache_blocks, 0, 0
 
@@ -397,6 +398,7 @@ class KVCacheManager:
         shared_prefix_boundary = (
             num_new_computed_tokens + num_uncached if num_uncached else 0
         )
+        request.local_full_attention_hit_end = num_new_computed_tokens + num_uncached
 
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
@@ -446,6 +448,7 @@ class KVCacheManager:
             return *self.get_computed_blocks(request, max_cache_hit_length), False
 
         num_local = per_group_hits[fa_group_id]
+        request.local_full_attention_hit_end = num_local
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local

@@ -28,9 +28,12 @@ from vllm.v1.metrics.perf import PerfMetricsLogging, PerfMetricsProm
 from vllm.v1.metrics.prometheus import unregister_vllm_metrics
 from vllm.v1.metrics.stats import (
     KV_FETCH_STAGES,
+    PREFIX_CACHE_STATE_GAP_CAUSES,
+    PREFIX_CACHE_STATE_GAP_TIERS,
     CachingMetrics,
     IterationStats,
     MultiModalCacheStats,
+    PrefixCacheStats,
     PromptTokenStats,
     SchedulerStats,
 )
@@ -822,6 +825,18 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         request_tokens_buckets = histogram_buckets(
             "request_tokens", max_model_len=max_model_len, overrides=custom_buckets
         )
+
+        #
+        # Hybrid prefix cache: full-attention matches past the resume point.
+        # Registered for hybrid models only (no other model records them).
+        #
+        self.counter_prefix_cache_state_gap_tokens: Counter | None = None
+        self.counter_prefix_cache_state_gap_requests: Counter | None = None
+        self.histogram_prefix_cache_state_gap: Histogram | None = None
+        if vllm_config.model_config.is_hybrid:
+            self._init_prefix_cache_state_gap_metrics(
+                labelnames, per_engine_labelvalues, request_tokens_buckets
+            )
         iteration_tokens_buckets = histogram_buckets(
             "iteration_tokens", overrides=custom_buckets
         )
@@ -1135,6 +1150,79 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             metrics_info["engine"] = str(engine_index)
             info_gauge.labels(**metrics_info).set(1)
 
+    def _init_prefix_cache_state_gap_metrics(
+        self,
+        labelnames: list[str],
+        per_engine_labelvalues: dict[int, list[object]],
+        buckets: list[float],
+    ) -> None:
+        self.counter_prefix_cache_state_gap_tokens = self._counter_cls(
+            name="vllm:prefix_cache_state_gap_tokens",
+            documentation=(
+                "Hybrid models: prompt tokens whose full-attention KV was "
+                "matched past the resume point because a lagging group "
+                "(Mamba state / sliding window) had nothing there. tier: "
+                "local (device prefix cache), external (KV connector) or "
+                "combined (deepest match in either, against the final resume "
+                "point). cause: missing_grid_state (a retention-grid position "
+                "lies inside the gap but its state was absent: evicted or not "
+                "yet stored) or past_last_grid_state (gap above the last grid "
+                "position)."
+            ),
+            labelnames=labelnames + ["tier", "cause"],
+        )
+        self.counter_prefix_cache_state_gap_requests = self._counter_cls(
+            name="vllm:prefix_cache_state_gap_requests",
+            documentation=(
+                "Hybrid models: admitted requests with a non-zero "
+                "vllm:prefix_cache_state_gap_tokens, by tier and cause."
+            ),
+            labelnames=labelnames + ["tier", "cause"],
+        )
+        self.histogram_prefix_cache_state_gap = self._histogram_cls(
+            name="vllm:prefix_cache_state_gap_tokens_per_request",
+            documentation=(
+                "Hybrid models: per-request non-zero state gap in tokens, by tier."
+            ),
+            buckets=buckets,
+            labelnames=labelnames + ["tier"],
+        )
+        # Export zero-valued series up front so rate() works from the start.
+        for labelvalues in per_engine_labelvalues.values():
+            for tier in PREFIX_CACHE_STATE_GAP_TIERS:
+                self.histogram_prefix_cache_state_gap.labels(*labelvalues, tier)
+                for cause in PREFIX_CACHE_STATE_GAP_CAUSES:
+                    self.counter_prefix_cache_state_gap_tokens.labels(
+                        *labelvalues, tier, cause
+                    )
+                    self.counter_prefix_cache_state_gap_requests.labels(
+                        *labelvalues, tier, cause
+                    )
+
+    def _observe_prefix_cache_state_gaps(
+        self, stats: PrefixCacheStats, labelvalues: list[object]
+    ) -> None:
+        if (
+            self.counter_prefix_cache_state_gap_tokens is None
+            or self.counter_prefix_cache_state_gap_requests is None
+            or self.histogram_prefix_cache_state_gap is None
+        ):
+            return
+        for key, num_tokens in stats.state_gap_tokens.items():
+            tier, cause = key.split("/", 1)
+            self.counter_prefix_cache_state_gap_tokens.labels(
+                *labelvalues, tier, cause
+            ).inc(num_tokens)
+        for key, num_requests in stats.state_gap_requests.items():
+            tier, cause = key.split("/", 1)
+            self.counter_prefix_cache_state_gap_requests.labels(
+                *labelvalues, tier, cause
+            ).inc(num_requests)
+        for tier, samples in stats.state_gap_samples.items():
+            histogram = self.histogram_prefix_cache_state_gap.labels(*labelvalues, tier)
+            for num_tokens in samples:
+                histogram.observe(num_tokens)
+
     def record(
         self,
         scheduler_stats: SchedulerStats | None,
@@ -1175,6 +1263,10 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
             self.counter_prompt_tokens_cached_by_source.labels(
                 *labelvalues, CacheHitSource.DEVICE.value
             ).inc(scheduler_stats.prefix_cache_stats.hits)
+
+            self._observe_prefix_cache_state_gaps(
+                scheduler_stats.prefix_cache_stats, labelvalues
+            )
 
             connector_stats = scheduler_stats.connector_prefix_cache_stats
             if connector_stats is not None:

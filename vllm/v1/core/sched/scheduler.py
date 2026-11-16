@@ -820,6 +820,55 @@ class Scheduler(SchedulerInterface):
         )
         return blocks, num_local, shared_prefix_boundary, False
 
+    def _record_prefix_state_gaps(
+        self, request: Request, num_local: int, num_external: int
+    ) -> None:
+        """Hybrid models: record, per cache tier, how far full-attention KV
+        matched past the resume point (a lagging Mamba-state / sliding-window
+        group had nothing there). Metrics only; called at admission."""
+        stats = self.kv_cache_manager.prefix_cache_stats
+        if (
+            stats is None
+            or request.num_preemptions > 0
+            or not self.kv_cache_manager.prefix_cache_lookup_enabled(request)
+        ):
+            return
+        interval: int | None = getattr(
+            self.kv_cache_manager.coordinator, "retention_interval", 0
+        )
+        resume = num_local + num_external
+
+        def record(tier: str, matched_end: int, resume_point: int) -> None:
+            if matched_end <= resume_point:
+                return
+            # Retention would keep every grid state, so a grid position inside
+            # the gap means that state was absent: evicted, or never stored
+            # (for example a prefill of the same prefix still in flight). Above
+            # the last grid position the gap is retention spacing or a lost
+            # junction / prompt-tail state.
+            # Interval None keeps states densely; 0 keeps no periodic states.
+            if interval is None:
+                grid = matched_end
+            elif interval == 0:
+                grid = 0
+            else:
+                grid = matched_end // interval * interval
+            cause = (
+                "missing_grid_state" if grid > resume_point else "past_last_grid_state"
+            )
+            stats.record_state_gap(tier, cause, matched_end - resume_point)
+
+        local_end = max(request.local_full_attention_hit_end, num_local)
+        record("local", local_end, num_local)
+        external_end = (
+            self.connector.get_external_full_attention_hit_end(request)
+            if self.connector is not None
+            else None
+        )
+        if external_end is not None:
+            record("external", external_end, resume)
+        record("combined", max(local_end, external_end or 0), resume)
+
     def _reserve_prefill_lookahead(
         self,
         request: Request,
@@ -1716,6 +1765,11 @@ class Scheduler(SchedulerInterface):
                 if did_prefix_cache_lookup:
                     self.kv_cache_manager.record_prefix_cache_stats(
                         request, num_new_local_computed_tokens
+                    )
+                    self._record_prefix_state_gaps(
+                        request,
+                        num_new_local_computed_tokens,
+                        num_external_computed_tokens,
                     )
                     if self._log_prefix_lookup_detail:
                         try:

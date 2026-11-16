@@ -408,6 +408,9 @@ class RequestOffloadState:
     finished_signaled: bool = False
     # Outcome of the latest lookup (VLLM_LOG_PREFIX_LOOKUP_DETAIL only).
     lookup_debug: dict[str, Any] | None = None
+    # Full-attention hit end (token position) at the latest lookup, before
+    # sliding-window / Mamba groups narrowed it; None if none was proven.
+    full_attention_hit_end: int | None = None
     # A load for this request failed; all its later lookups, including after
     # preemption, skip the offloaded cache so a faulting load is not retried.
     load_failed: bool = False
@@ -1179,6 +1182,12 @@ class OffloadingConnectorScheduler:
         num_hit_tokens = self._lookup_partial_tail_hit(
             req_status, complete_hit, max_num_new_tokens
         )
+        req_status.full_attention_hit_end = (
+            full_attention_hit_boundary
+            if full_attention_hit_boundary
+            and full_attention_hit_boundary > req_status.num_locally_computed_tokens
+            else None
+        )
         if self._log_lookup_detail:
             req_status.lookup_debug = {
                 "lookup_from": req_status.num_locally_computed_tokens,
@@ -1473,6 +1482,7 @@ class OffloadingConnectorScheduler:
 
         req_status.update_offload_keys()
         req_status.num_locally_computed_tokens = num_computed_tokens
+        req_status.full_attention_hit_end = None
 
         num_hit_tokens: int | None
         if request.skip_reading_external_kv or req_status.load_failed:
@@ -1520,6 +1530,10 @@ class OffloadingConnectorScheduler:
         self._current_batch_sync_load_bytes += num_bytes
         self._current_batch_sync_loads.add(req_id)
         return True
+
+    def get_external_full_attention_hit_end(self, request: Request) -> int | None:
+        req_status = self._req_status.get(request.request_id)
+        return None if req_status is None else req_status.full_attention_hit_end
 
     def get_external_cache_hit_sources(
         self,
