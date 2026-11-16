@@ -7,6 +7,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -196,6 +197,11 @@ class _StoreJobSink:
             )
         return output
 
+    def record_skipped_short_partial_tail(self) -> None:
+        self._scheduler._connector_stats.increase_counter(
+            _ConnectorMetricName.STORE_SKIPPED_SHORT_PARTIAL_TAIL
+        )
+
     def add_job(
         self,
         req_id: ReqId,
@@ -265,6 +271,8 @@ class OffloadingConnectorScheduler:
         )
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # VLLM_LOG_PREFIX_LOOKUP_DETAIL: record each lookup's outcome per request.
+        self._log_lookup_detail = envs.VLLM_LOG_PREFIX_LOOKUP_DETAIL
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         # Requests loading synchronously in the current engine step
         self._current_batch_sync_loads: set[ReqId] = set()
@@ -731,11 +739,30 @@ class OffloadingConnectorScheduler:
         num_hit_tokens = self._lookup_partial_tail_hit(
             req_status, complete_hit, full_attention_hit_boundary, max_num_new_tokens
         )
+        if self._log_lookup_detail:
+            req_status.lookup_debug = {
+                "lookup_from": req_status.num_locally_computed_tokens,
+                "complete_hit": complete_hit,
+                "full_attn_hit_boundary": full_attention_hit_boundary,
+                "partial_tail_boundary": req_status.partial_tail_boundary,
+                # None: a probed chunk or partial-tail row was still being
+                # stored or loaded (or the backend asked to retry).
+                "result": num_hit_tokens,
+            }
         if num_hit_tokens is not None and full_attention_hit_boundary is not None:
             self._maybe_register_shared_prefix_junction(
                 req_status, full_attention_hit_boundary, num_hit_tokens
             )
         return num_hit_tokens
+
+    def pop_lookup_debug(self, request_id: ReqId) -> dict[str, Any] | None:
+        """Latest lookup outcome for `request_id` (diagnostics only)."""
+        req_status = self._req_status.get(request_id)
+        if req_status is None or req_status.lookup_debug is None:
+            return None
+        debug = req_status.lookup_debug
+        req_status.lookup_debug = None
+        return debug
 
     def _lookup_partial_tail_hit(
         self,
@@ -957,6 +984,8 @@ class OffloadingConnectorScheduler:
                 "Delaying request %s since it still has in-flight transfers",
                 request.request_id,
             )
+            if self._log_lookup_detail:
+                req_status.lookup_debug = {"delayed_by_inflight_transfers": True}
             return None, False
 
         if request.resumable and self.use_lookahead_block_hashes:

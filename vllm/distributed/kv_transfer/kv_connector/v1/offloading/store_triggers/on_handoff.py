@@ -163,6 +163,12 @@ class OnHandoffStoreHandler(StoreTriggerHandler):
             entries = [entry for entry in entries if entry[2] == boundary]
             if not entries:
                 continue
+            # Gate on the absolute hand-off boundary, not the remainder past the
+            # last complete chunk: a long prompt with a short remainder still
+            # needs its row.
+            if boundary < self._config.min_partial_tail_tokens:
+                sink.record_skipped_short_partial_tail()
+                continue
             group_states = {
                 group.group_idx: state
                 for group, state in zip(

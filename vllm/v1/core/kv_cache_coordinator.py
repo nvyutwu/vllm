@@ -3,6 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 
+from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_down
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
@@ -10,6 +11,7 @@ from vllm.v1.core.kv_cache_utils import (
     BlockHash,
     KVCacheBlock,
     eagle_proof_margin,
+    is_mamba_align_group,
     partial_hash_hits_enabled,
 )
 from vllm.v1.core.single_type_kv_cache_manager import (
@@ -25,6 +27,8 @@ from vllm.v1.kv_cache_interface import (
     prefix_lookup_groups,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 def _validate_prefix_cache_retention_interval(
@@ -697,6 +701,42 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         for manager in self.single_type_managers:
             manager.cache_hit_alignment_tokens = cache_hit_alignment_tokens
         self.verify_and_split_kv_cache_groups()
+        self._configure_replay_boundary_alias()
+
+    def _configure_replay_boundary_alias(self) -> None:
+        """`CacheConfig.replay_boundary_alias`: full-attention managers key a
+        prompt's partial tail block at the replay-boundary Mamba block end, so
+        a request diverging between that state and the prompt's tail can
+        resume on it. Needs fine-grained hits and one Mamba block size."""
+        if not self.kv_cache_config.replay_boundary_alias:
+            return
+        mamba_block_sizes = {
+            g.block_size
+            for g in self.kv_cache_config.kv_cache_groups
+            if is_mamba_align_group(g)
+        }
+        if not self.enable_partial_hash_hits or len(mamba_block_sizes) != 1:
+            logger.warning_once(
+                "replay_boundary_alias requested but it needs fine-grained "
+                "prefix-cache hits (mamba_cache_mode=align, prefix_match_unit "
+                "finer than the Mamba block) and a single Mamba block size "
+                "(got %s); disabling it.",
+                tuple(sorted(mamba_block_sizes)),
+            )
+            return
+        (mamba_block_size,) = mamba_block_sizes
+        # The manager class, not the spec class: a full-attention group may
+        # hold several layer layouts (e.g. MLA + indexer).
+        for manager, group in zip(
+            self.single_type_managers, self.kv_cache_config.kv_cache_groups
+        ):
+            if group.prefix_cacheable and isinstance(manager, FullAttentionManager):
+                manager.replay_alias_unit = mamba_block_size
+        logger.info(
+            "Replay-boundary alias enabled: partial full-attention blocks are "
+            "also keyed at the %d-token Mamba replay boundary.",
+            mamba_block_size,
+        )
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

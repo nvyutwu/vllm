@@ -52,6 +52,10 @@ class StoreJobSink(Protocol):
         """Make a store job, and let the scheduler track it."""
         ...
 
+    def record_skipped_short_partial_tail(self) -> None:
+        """Count a partial-tail store skipped by min_partial_tail_tokens."""
+        ...
+
 
 class StoreTriggerHandler(ABC):
     """Makes the store jobs of one StoreTrigger.

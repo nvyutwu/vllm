@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.events import (
@@ -104,6 +104,9 @@ class SchedulerOffloadConfig(NamedTuple):
     retention_interval: int | None = None
     dcp_world_size: int = 1
     sync_load_budget_bytes: int = 0
+    # Shortest prompt tail (absolute boundary, in tokens) stored as a partial
+    # tail. 0 keeps every partial tail.
+    min_partial_tail_tokens: int = 0
     # KV bytes per token on one worker, summed over the offloaded groups.
     kv_bytes_per_token: int = 0
 
@@ -313,6 +316,9 @@ class SchedulerOffloadConfig(NamedTuple):
             sync_load_budget_bytes=int(
                 spec.extra_config.get("sync_load_budget_bytes", 0)
             ),
+            min_partial_tail_tokens=(
+                spec.min_partial_tail_tokens if supports_partial_tail else 0
+            ),
             kv_bytes_per_token=sum(
                 kv_cache_config.kv_cache_groups[g.group_id].page_size_bytes
                 // g.tokens_per_block
@@ -368,6 +374,8 @@ class RequestOffloadState:
     load_key_ranges: list[tuple[int, int, OffloadKey]] = field(default_factory=list)
     # True once on_request_finished has been signaled to the manager.
     finished_signaled: bool = False
+    # Outcome of the latest lookup (VLLM_LOG_PREFIX_LOOKUP_DETAIL only).
+    lookup_debug: dict[str, Any] | None = None
     # A load for this request failed; all its later lookups, including after
     # preemption, skip the offloaded cache so a faulting load is not retried.
     load_failed: bool = False

@@ -606,6 +606,9 @@ def get_kv_cache_config_from_groups(
             prefix_cache_retention_interval=(
                 vllm_config.cache_config.prefix_cache_retention_interval
             ),
+            replay_boundary_alias=getattr(
+                vllm_config.cache_config, "replay_boundary_alias", False
+            ),
         )
 
     if vllm_config.attention_config.hisparse_config is not None:
@@ -674,6 +677,9 @@ def get_kv_cache_config_from_groups(
         kv_cache_groups=kv_cache_groups,
         prefix_cache_retention_interval=(
             vllm_config.cache_config.prefix_cache_retention_interval
+        ),
+        replay_boundary_alias=getattr(
+            vllm_config.cache_config, "replay_boundary_alias", False
         ),
     )
 
@@ -1687,6 +1693,9 @@ class DefaultKVCacheConfigBuilder(KVCacheConfigBuilder):
                 kv_cache_groups=kv_cache_groups,
                 prefix_cache_retention_interval=(
                     vllm_config.cache_config.prefix_cache_retention_interval
+                ),
+                replay_boundary_alias=getattr(
+                    vllm_config.cache_config, "replay_boundary_alias", False
                 ),
             )
         bytes_per_block = _pool_bytes_per_block(vllm_config, kv_cache_groups)
