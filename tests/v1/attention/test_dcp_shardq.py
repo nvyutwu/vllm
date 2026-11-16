@@ -1123,14 +1123,14 @@ def _layer_worker(rank, world, init_file, cache_dtype, kernel):
                 layer, indexer = attn.mla_attn.mla_attn, attn.dsa_indexer
                 assert layer.use_shardq
                 assert indexer.k_cache.shardq_layer_name == layer.layer_name
-                spec = layer.get_kv_cache_spec(config)
+                spec = layer.get_kv_cache_config(config).spec
                 assert spec.block_size == LAYER_BLOCK
                 builder = FlashInferMLASparseTRTLLMBackend.get_builder_cls()(
                     spec, [layer.layer_name], config, device
                 )
                 # The indexer builder sees its 64-token kernel blocks.
                 index_spec = dataclasses.replace(
-                    indexer.k_cache.get_kv_cache_spec(config), block_size=PAGE
+                    indexer.k_cache.get_kv_cache_config(config).spec, block_size=PAGE
                 )
                 index_builder = DeepseekV32IndexerMetadataBuilder(
                     index_spec,
@@ -1449,13 +1449,13 @@ def _profile_worker(rank, world, init_file, cache_dtype, kernel):
                 attn = _dsa_layer(config, topk_buffer)
                 layer, indexer = attn.mla_attn.mla_attn, attn.dsa_indexer
                 assert layer.use_shardq
-                spec = layer.get_kv_cache_spec(config)
+                spec = layer.get_kv_cache_config(config).spec
                 builder = FlashInferMLASparseTRTLLMBackend.get_builder_cls()(
                     spec, [layer.layer_name], config, device
                 )
                 # The indexer builder sees its 64-token kernel blocks.
                 index_spec = dataclasses.replace(
-                    indexer.k_cache.get_kv_cache_spec(config), block_size=PAGE
+                    indexer.k_cache.get_kv_cache_config(config).spec, block_size=PAGE
                 )
                 index_builder = DeepseekV32IndexerMetadataBuilder(
                     index_spec,
